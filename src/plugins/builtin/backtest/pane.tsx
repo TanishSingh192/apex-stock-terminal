@@ -1,0 +1,301 @@
+import { useCallback, useMemo, useRef, type ReactNode } from "react";
+import {
+  Button,
+  ChartTableHeader,
+  CompositeChart,
+  DataTableView,
+  EmptyState,
+  PaneStatusBody,
+  QueryBar,
+  usePaneFooter,
+  usePaneNoticeFooter,
+  usePaneTabs,
+  usePaneTicker,
+  type ChartStripSpec,
+  type DataTableColumn,
+  type SelectControl,
+} from "../../../components";
+import { scalarPoint, staticSeries } from "../../../components/chart/static/series";
+import { barsPerYearLabel } from "../../../market-data/bars-per-year";
+import { instrumentFromTicker } from "../../../market-data/request-types";
+import { useAsyncResource } from "../../../react/async-resource";
+import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
+import { usePaneInstanceId, usePaneSettingValue, usePluginAppActions, usePluginPaneState } from "../../../public/react";
+import { useThemeColors } from "../../../theme/theme-context";
+import type { PaneProps } from "../../../types/plugin";
+import { Box, useUiCapabilities } from "../../../ui";
+import { FILL_REST } from "../../../components/ui/fill";
+import { useAutoRefresh } from "../../../react/auto-refresh";
+import { loadBacktestHistory } from "./client";
+import type { BacktestTrade } from "./engine";
+import { backtestEquityCsv } from "./export";
+import { formatStat, formatTradePrice, PRICE_RETURN_NOTE, SUMMARY_ROWS, type SummaryRow } from "./format";
+import { BACKTEST_PRESETS, DEFAULT_PRESET, lookbackYears, resolveRules, strategyPreset } from "./presets";
+import { backtestPriceUnit, backtestReport } from "./report";
+import { parseRule } from "./rules";
+import { continuationNote, runHistoryBacktest, type HistoryBacktestResult } from "./window";
+
+const TABS = [{ value: "summary", label: "Summary" }, { value: "trades", label: "Trades" }];
+// Growth multiples on a log axis keep a 140x run and a flat decade readable together.
+const PANELS = [{ id: "main", height: 0.72, scale: "log" as const }, { id: "drawdown", label: "Drawdown", height: 0.28 }];
+const multiple = (value: number) => `\u00d7${value >= 10 ? value.toFixed(0) : value >= 1 ? value.toFixed(1) : value.toFixed(2)}`;
+const STRATEGY_OPTIONS = [...BACKTEST_PRESETS.map((preset) => ({ value: preset.id, label: preset.label })), { value: "custom", label: "Custom rules" }];
+const SUMMARY_COLUMNS: DataTableColumn[] = [
+  { id: "metric", label: "Metric", width: 23, align: "left" },
+  { id: "strategy", label: "Strategy", width: 10, align: "right" },
+  { id: "benchmark", label: "Buy & hold", width: 10, align: "right" },
+];
+const TRADE_COLUMNS: DataTableColumn[] = [
+  { id: "entryDate", label: "Entry", width: 11, align: "left" },
+  { id: "entryPrice", label: "Entry px", width: 10, align: "right" },
+  { id: "exitDate", label: "Exit", width: 11, align: "left" },
+  { id: "exitPrice", label: "Exit px", width: 10, align: "right" },
+  { id: "returnPct", label: "Return", width: 9, align: "right" },
+  { id: "sessions", label: "Sessions", width: 9, align: "right" },
+];
+const SUMMARY_WIDTH = SUMMARY_COLUMNS.reduce((sum, column) => sum + column.width + 1, 4);
+const LOOKBACK_FILTER_OPTIONS = [
+  { value: "5", label: "5Y" },
+  { value: "10", label: "10Y" },
+  { value: "max", label: "Max" },
+];
+/**
+ * The metrics sit beside the chart once the chart keeps this many columns. The
+ * rule reads the body width, which is two cells narrower in the terminal than
+ * on the desktop, so both renderers pick the same layout at a pane's default size.
+ */
+const MIN_WIDE_CHART_COLS = 60;
+/** Legend, axis and two panels: below this the drawdown panel has no rows to speak of. */
+const EQUITY_CHART_MIN_ROWS = 8;
+
+function readRules(preset: string, entryText: string, exitText: string) {
+  const rules = resolveRules(preset, entryText, exitText);
+  try {
+    return { ...rules, entry: parseRule(rules.entry), exit: parseRule(rules.exit), error: null };
+  } catch (error) {
+    return { ...rules, entry: null, exit: null, error: error instanceof Error ? error.message : "Invalid rule" };
+  }
+}
+
+export function BacktestPane({ width, height, focused }: PaneProps) {
+  const colors = useThemeColors();
+  const paneId = usePaneInstanceId();
+  const { openPaneSettings } = usePluginAppActions();
+  const { symbol, ticker, financials, error: identityError } = usePaneTicker();
+  // Rules typed in settings, or by `shot BT --entry ... --exit ...`, with no strategy chosen are tested as custom rules.
+  const [chosenPreset, setPreset] = usePaneSettingValue<string | null>("preset", null);
+  const [typedEntry] = usePaneSettingValue<string | null>("entry", null);
+  const [typedExit] = usePaneSettingValue<string | null>("exit", null);
+  const preset = strategyPreset(chosenPreset, typedEntry ?? "", typedExit ?? "");
+  // Custom starts from the default preset's rules until one is typed.
+  const entryText = typedEntry ?? DEFAULT_PRESET.entry;
+  const exitText = typedExit ?? DEFAULT_PRESET.exit;
+  const [lookback, setLookback] = usePaneSettingValue("lookback", "10");
+  const [costText] = usePaneSettingValue<string | number>("cost", "5");
+  // Set by `shot BT --end` and `--include-partial`; the pane has no control for them.
+  const [endText] = usePaneSettingValue<string>("end", "");
+  const [includePartial] = usePaneSettingValue<boolean>("includePartial", false);
+  const [view, setView] = usePluginPaneState("backtest:view", "summary");
+  const [selectedTrade, setSelectedTrade] = usePluginPaneState("backtest:trade", 0);
+  const strategyControl = useRef<SelectControl>(null);
+  const instrument = instrumentFromTicker(ticker, symbol);
+  const instrumentKey = JSON.stringify(instrument);
+  const loader = useCallback((force: boolean) => loadBacktestHistory(instrument!, { forceRefresh: force }), [instrumentKey]);
+  const history = useAsyncResource(instrument ? loader : null);
+  useAutoRefresh(history.updatedAt, history.load);
+
+  const rules = useMemo(() => readRules(preset, entryText, exitText), [preset, entryText, exitText]);
+  const ruleStrings = resolveRules(preset, entryText, exitText);
+  const costBps = Math.min(100, Math.max(0, Number(costText) || 0));
+  const runWindow = useMemo(() => ({ end: typeof endText === "string" ? endText.trim() || null : null, includePartial: includePartial === true }),
+    [endText, includePartial]);
+  const run = useMemo((): { result: HistoryBacktestResult | null; error: string | null } => {
+    if (!history.data || !rules.entry || !rules.exit) return { result: null, error: null };
+    try {
+      const options = { lookbackYears: lookbackYears(lookback), costBps, ...runWindow };
+      return { result: runHistoryBacktest(history.data, rules.entry, rules.exit, options), error: null };
+    } catch (error) {
+      return { result: null, error: error instanceof Error ? error.message : "Backtest failed" };
+    }
+  }, [history.data, rules, lookback, costBps, runWindow]);
+  const result = run.result;
+  const continuation = instrument ? continuationNote(instrument.symbol, instrument.exchange) : null;
+  // Export CSV writes the daily curve `fn BT --csv --equity` prints for this run, whichever table is in view;
+  // the table reads it when the export runs. Without a run the table's own rows export.
+  const exportCsv = result && symbol ? () => {
+    const quote = financials?.quote ?? (ticker?.metadata.currency ? { currency: ticker.metadata.currency } : null);
+    return backtestEquityCsv(backtestReport({
+      symbol, exchange: instrument?.exchange ?? null, rules: ruleStrings, costBps, window: runWindow,
+      unit: backtestPriceUnit(symbol, quote), result, equity: true,
+    }), symbol);
+  } : undefined;
+
+  const series = useMemo(() => {
+    if (!result) return [];
+    const points = (pick: (row: HistoryBacktestResult["equity"][number]) => number) =>
+      result.equity.map((row) => scalarPoint(new Date(row.date), pick(row)));
+    // Buy-and-hold first so the strategy line draws on top where they coincide.
+    return [
+      staticSeries(points((row) => row.benchmark), { id: "benchmark", label: "Buy & hold", color: colors.textMuted, calendarSpaced: true }),
+      staticSeries(points((row) => row.strategy), { id: "strategy", label: "Strategy", color: colors.positive, calendarSpaced: true }),
+      { ...staticSeries(points((row) => row.drawdownPct), { id: "drawdown", label: "Strategy drawdown", color: colors.negative, calendarSpaced: true }), panelId: "drawdown" },
+    ];
+  }, [result, colors]);
+
+  const strip = useMemo((): ChartStripSpec | null => {
+    const values = result?.equity.map((row) => row.strategy) ?? [];
+    const last = values.at(-1);
+    return last == null || values.length < 2 ? null
+      : { label: "Strategy", values, value: multiple(last), color: colors.positive };
+  }, [result, colors]);
+
+  const edit = () => openPaneSettings(paneId);
+  const cycleView = () => setView(view === "summary" ? "trades" : "summary");
+  const chooseStrategy = () => strategyControl.current?.open();
+  // The footer hints bind e, v and s in both views and every load state; only
+  // the reload is the pane's own key.
+  usePaneRefreshKey(() => void history.reload(), { focused });
+
+  const notices = [identityError, history.error, rules.error, run.error, ...(result?.warnings ?? []), ...(result && continuation ? [continuation] : [])]
+    .filter((value): value is string => !!value);
+  usePaneNoticeFooter({ registrationId: "backtest-notices", notices: [...new Set(notices)], focused });
+  usePaneFooter("backtest", () => ({
+    info: [
+      ...(history.loading ? [{ id: "loading", parts: [{ text: "loading history", tone: "muted" as const }] }] : []),
+      // The metric column reads "Price return"; what that leaves out is said here, once,
+      // and kept as the row narrows: the session count and bar rate give way first.
+      ...(result ? [{ id: "window", parts: [{
+        text: `${result.start} to ${result.end} · ${result.sessions} sessions · ${barsPerYearLabel(result.barsPerYear)} · ${PRICE_RETURN_NOTE}`, tone: "muted" as const,
+      }], variants: [
+        [{ text: `${result.start} to ${result.end} · ${PRICE_RETURN_NOTE}`, tone: "muted" as const }],
+        [{ text: PRICE_RETURN_NOTE, tone: "muted" as const }],
+      ] }] : []),
+    ],
+    hints: [
+      { id: "edit", key: "e", label: "dit rules", onPress: edit },
+      { id: "view", key: "v", label: "iew", onPress: cycleView },
+      ...(symbol ? [{ id: "strategy", key: "s", label: "trategy", onPress: chooseStrategy }] : []),
+    ],
+  }), [history.loading, result, view, paneId, symbol]);
+
+  const { strip: tabStrip, rows: tabRows } = usePaneTabs(symbol ? { tabs: TABS, activeValue: view, onSelect: setView, focused, dense: true } : null);
+  const { nativePaneChrome } = useUiCapabilities();
+  if (!symbol) return <EmptyState title="Select a ticker." hint="Open BT with a symbol, for example BT AAPL." />;
+  const bodyHeight = Math.max(4, height - 1 - tabRows);
+  const wide = width - SUMMARY_WIDTH - 1 >= MIN_WIDE_CHART_COLS;
+  const summaryTable = (tableWidth: number, tableHeight: number, before?: ReactNode) => (
+    <DataTableView<SummaryRow, DataTableColumn>
+      focused={false}
+      rootWidth={tableWidth}
+      rootHeight={tableHeight}
+      rootBefore={before}
+      columns={SUMMARY_COLUMNS}
+      items={SUMMARY_ROWS}
+      getItemKey={(row) => row.id}
+      selection={{ kind: "none" }}
+      sortColumnId={null}
+      sortDirection="asc"
+      exportCsv={exportCsv}
+      emptyStateTitle="No statistics"
+      renderCell={(row, column) => {
+        if (column.id === "metric") return { text: row.paneLabel ?? row.label };
+        const value = column.id === "strategy" ? row.strategy(result!) : row.benchmark?.(result!) ?? null;
+        const text = formatStat(value);
+        const signed = value?.kind === "signed" && value.value != null && value.value !== 0;
+        return { text, color: signed ? (value!.value! > 0 ? colors.positive : colors.negative) : undefined };
+      }}
+    />
+  );
+  const chart = (chartWidth: number, chartHeight: number) => (
+    <CompositeChart
+      series={series}
+      panels={PANELS}
+      width={chartWidth}
+      height={chartHeight}
+      showLegend
+      showTimeAxis
+      focused={focused && view !== "trades"}
+      navigable={focused && view !== "trades"}
+      formatAxisValue={(value, domain) => domain.seriesIds.includes("drawdown") ? `${value.toFixed(0)}%` : multiple(value)}
+      formatValue={(value, series) => series.id === "drawdown" ? `${value.toFixed(1)}%` : multiple(value)}
+      remoteKind="backtest-equity"
+    />
+  );
+  return (
+    // On the desktop the pane's box fills the pane by flex, so what fills it
+    // follows the pane's frame by CSS, the chart beside the metrics too.
+    <Box width={width} flexDirection="column" {...(nativePaneChrome ? FILL_REST : { height })}>
+      {tabStrip}
+      <QueryBar
+        width={width}
+        filters={[{
+          id: "strategy",
+          label: "Strategy",
+          controlRef: strategyControl,
+          value: STRATEGY_OPTIONS.some((option) => option.value === preset) ? preset : "custom",
+          options: STRATEGY_OPTIONS,
+          onChange: (value: string) => setPreset(value),
+        }, {
+          id: "lookback",
+          label: "Lookback",
+          inline: true,
+          value: LOOKBACK_FILTER_OPTIONS.some((option) => option.value === String(lookback)) ? String(lookback) : "10",
+          options: LOOKBACK_FILTER_OPTIONS,
+          onChange: (value: string) => setLookback(value),
+        }]}
+        // Cost first: the Strategy filter already names a preset's rules, so a
+        // narrow bar should cut the rule text rather than the cost.
+        meta={`${costBps} bp/side · entry ${ruleStrings.entry} · exit ${ruleStrings.exit}`}
+      />
+      <PaneStatusBody
+        loading={history.loading && !history.data}
+        error={!history.data ? history.error : null}
+        empty={!result}
+        emptyTitle={rules.error ?? run.error ?? "No backtest yet."}
+        actions={rules.error ? <Button label="Edit rules" compact onPress={edit} /> : undefined}
+        subject="price history"
+      >
+        {!result ? null : view === "trades" ? (
+          <DataTableView<BacktestTrade, DataTableColumn>
+            focused={focused}
+            rootWidth={width}
+            rootHeight={bodyHeight}
+            columns={TRADE_COLUMNS}
+            items={[...result.trades].reverse()}
+            getItemKey={(trade) => trade.entryDate}
+            selection={{ kind: "index", selectedIndex: selectedTrade, onChange: setSelectedTrade }}
+            sortColumnId={null}
+            sortDirection="desc"
+            exportCsv={exportCsv}
+            renderCell={(trade, column) => ({
+              text: column.id === "entryDate" ? trade.entryDate
+                : column.id === "entryPrice" ? formatTradePrice(trade.entryPrice, symbol ?? "")
+                  : column.id === "exitDate" ? (trade.open ? "open" : trade.exitDate!)
+                    : column.id === "exitPrice" ? formatTradePrice(trade.exitPrice, symbol ?? "")
+                      : column.id === "returnPct" ? (Math.abs(trade.returnPct) < 0.05 ? "0.0%" : `${trade.returnPct > 0 ? "+" : ""}${trade.returnPct.toFixed(1)}%`)
+                        : String(trade.sessions),
+              color: column.id === "returnPct" ? (Math.abs(trade.returnPct) < 0.05 ? undefined : trade.returnPct > 0 ? colors.positive : colors.negative)
+                : trade.open && column.id === "exitDate" ? colors.textMuted : undefined,
+            })}
+            emptyStateTitle="No trades in this window."
+          />
+        ) : wide ? (
+          // The desktop's query bar is taller than a row: the chart and the
+          // metrics take what is left under it, down to the pane footer.
+          <Box flexDirection="row" width={width} {...(nativePaneChrome ? FILL_REST : { height: bodyHeight })}>
+            {chart(width - SUMMARY_WIDTH - 1, bodyHeight)}
+            <Box width={1} />
+            {summaryTable(SUMMARY_WIDTH, bodyHeight)}
+          </Box>
+        ) : (
+          // Stacked, the kit sizes the chart over the metrics: a short pane
+          // keeps the metrics' first rows and shows the strategy as a strip.
+          summaryTable(width, bodyHeight, (
+            <ChartTableHeader width={width} height={bodyHeight} tableRows={SUMMARY_ROWS.length}
+              chart={{ render: (size) => chart(size.width, size.height), minRows: EQUITY_CHART_MIN_ROWS, strip }} />
+          ))
+        )}
+      </PaneStatusBody>
+    </Box>
+  );
+}

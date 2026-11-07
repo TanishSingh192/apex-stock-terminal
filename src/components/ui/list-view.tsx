@@ -1,0 +1,403 @@
+import { useThemeColors } from "../../theme/theme-context";
+import { Box, ScrollBox, Text, useUiHost } from "../../ui";
+import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { TextAttributes, type ScrollBoxRenderable } from "../../ui";
+import { hoverBg } from "../../theme/colors";
+import { t } from "../../i18n";
+import { useRemoteUiNode } from "../../remote/semantic-tree";
+import { resolveRemoteItemIndex } from "../../remote/semantic-helpers";
+import { observeScrollBoxContentSize, observeScrollBoxViewportSize } from "../../renderers/opentui/scrollbox-layout";
+import { isPlainKey, type KeyboardModifierEventLike } from "../../utils/keyboard";
+
+export interface ListViewItem {
+  id: string;
+  label: string;
+  description?: string;
+  detail?: string;
+  category?: string;
+  /** `heading` draws a muted group label; pair it with `disabled: true`. */
+  kind?: string;
+  right?: string;
+  checked?: boolean;
+  current?: boolean;
+  disabled?: boolean;
+  /** Tints the label, e.g. a status in its tone; the words carry the meaning. */
+  color?: string;
+  /**
+   * Artwork before the label on the desktop and the web, such as a broker's
+   * logo (`LogoMark`). It is decoration: the terminal does not draw it, and
+   * automation and screen readers read only `label`.
+   */
+  leading?: ReactNode;
+}
+
+export interface ListRowState {
+  selected: boolean;
+  hovered: boolean;
+  disabled: boolean;
+}
+
+export interface ListViewProps {
+  items: ListViewItem[];
+  selectedIndex: number;
+  scrollIndex?: number;
+  onSelect?: (index: number) => void;
+  onActivate?: (item: ListViewItem, index: number) => void;
+  renderRow?: (item: ListViewItem, state: ListRowState, index: number) => ReactNode;
+  getRowBackgroundColor?: (item: ListViewItem, state: ListRowState, index: number) => string | undefined;
+  showSelectedDescription?: boolean;
+  /**
+   * Desktop and web: every row sets its `description` on a second line under
+   * its label, and is two rows tall unless `rowHeight` says otherwise. The
+   * terminal keeps one line per row, with `detail` at its end.
+   */
+  rowDescriptions?: boolean;
+  emptyMessage?: string;
+  bgColor?: string;
+  selectedBgColor?: string;
+  hoverBgColor?: string;
+  rowGap?: number;
+  rowHeight?: number;
+  surface?: "framed" | "plain";
+  /**
+   * Desktop and web: how the chosen row shows. `frame`, the default, rings it
+   * in the accent as well as filling it (a list a dialog's keyboard walks);
+   * `fill` fills it alone, as the command bar's and a table's rows do.
+   */
+  selection?: "frame" | "fill";
+  height?: number;
+  flexGrow?: number;
+  scrollable?: boolean;
+  selectOnHover?: boolean;
+  autoScrollToIndex?: boolean;
+  /**
+   * The rows are checkboxes (ToggleList). A focused desktop row toggles on
+   * Space and leaves Enter to the surface around the list, the way a checkbox
+   * leaves Enter to its dialog's default button.
+   */
+  checkboxRows?: boolean;
+  onMouseScroll?: (event: any) => void;
+  remoteRole?: string;
+  remoteLabel?: string;
+  remoteScope?: string;
+  remoteItemKind?: string;
+  remoteItemCategory?: string;
+  remoteMetadata?: Record<string, unknown>;
+}
+
+/** Any row object; one with `disabled: true` is stepped over. */
+type ListCursorItem = object;
+
+function isDisabledRow(item: ListCursorItem | undefined): boolean {
+  return !!item && "disabled" in item && item.disabled === true;
+}
+
+/**
+ * The row `steps` enabled rows away in `direction`, or the last enabled row
+ * before the end. With `wrap`, a step past one end continues from the other.
+ * Disabled rows are never landed on.
+ */
+export function stepListCursor(
+  items: readonly ListCursorItem[],
+  index: number,
+  direction: -1 | 1,
+  steps = 1,
+  wrap = false,
+): number {
+  let found = index;
+  let remaining = steps;
+  let next = index;
+  for (let visited = 0; visited < items.length && remaining > 0; visited += 1) {
+    next += direction;
+    if (next < 0 || next >= items.length) {
+      if (!wrap) break;
+      next = next < 0 ? items.length - 1 : 0;
+    }
+    if (isDisabledRow(items[next])) continue;
+    found = next;
+    remaining -= 1;
+  }
+  return found;
+}
+
+export type ListCursorMove = (items: readonly ListCursorItem[], index: number) => number;
+
+/**
+ * How a key moves a list cursor: up/down and k/j one row, PageUp/PageDown a
+ * page, Home/End to the first or last row, always skipping disabled rows.
+ * Null for any other key, so the caller handles it.
+ */
+export function listCursorMove(event: KeyboardModifierEventLike, pageSize: number): ListCursorMove | null {
+  const page = Math.max(1, Math.floor(pageSize));
+  const move = (direction: -1 | 1, steps?: number): ListCursorMove => (items, index) => (
+    stepListCursor(items, index, direction, steps ?? items.length)
+  );
+  if (isPlainKey(event, "up", "k")) return move(-1, 1);
+  if (isPlainKey(event, "down", "j")) return move(1, 1);
+  if (isPlainKey(event, "pageup")) return move(-1, page);
+  if (isPlainKey(event, "pagedown")) return move(1, page);
+  if (isPlainKey(event, "home")) return move(-1);
+  if (isPlainKey(event, "end")) return move(1);
+  return null;
+}
+
+function DefaultRow({
+  item,
+  selected,
+}: {
+  item: ListViewItem;
+  selected: boolean;
+}) {
+  const colors = useThemeColors();
+  if (item.kind === "heading") return <Text fg={colors.textMuted}>{t(item.label)}</Text>;
+  // The label gives way to the detail: a long label is cut with an ellipsis
+  // instead of wrapping under the row or running into the right column.
+  return (
+    <Box flexDirection="row" justifyContent="space-between" width="100%" minWidth={0}>
+      <Box flexDirection="row" flexShrink={1} minWidth={0} overflow="hidden">
+        <Text fg={selected ? colors.selectedText : colors.textDim} flexShrink={0}>
+          {selected ? "\u25b8 " : "  "}
+        </Text>
+        <Text
+          fg={item.color ?? (selected ? colors.text : colors.textDim)}
+          attributes={selected ? TextAttributes.BOLD : 0}
+          wrapMode="none"
+          truncate
+          flexShrink={1}
+          minWidth={0}
+        >
+          {t(item.label)}
+        </Text>
+      </Box>
+      {item.detail && (
+        <Box flexShrink={0} paddingLeft={1}>
+          <Text fg={colors.textMuted}>{t(item.detail)}</Text>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+export function ListView({
+  items,
+  selectedIndex,
+  scrollIndex,
+  onSelect,
+  onActivate,
+  renderRow,
+  getRowBackgroundColor,
+  showSelectedDescription = false,
+  rowDescriptions,
+  emptyMessage = "Nothing to show.",
+  bgColor,
+  selectedBgColor,
+  hoverBgColor,
+  rowGap,
+  rowHeight,
+  surface,
+  selection,
+  height,
+  flexGrow,
+  scrollable = false,
+  selectOnHover = false,
+  autoScrollToIndex = true,
+  checkboxRows,
+  onMouseScroll,
+  remoteRole = "list",
+  remoteLabel,
+  remoteScope,
+  remoteItemKind,
+  remoteItemCategory,
+  remoteMetadata,
+}: ListViewProps) {
+  const colors = useThemeColors();
+  useRemoteUiNode({
+    role: remoteRole,
+    label: remoteLabel ?? emptyMessage,
+    actions: {
+      select: (input) => {
+        const index = resolveListIndex(input, items);
+        if (index >= 0 && !items[index]?.disabled) onSelect?.(index);
+      },
+      activate: (input) => {
+        const index = resolveListIndex(input, items);
+        const item = index >= 0 ? items[index] : undefined;
+        if (item && !item.disabled) {
+          onSelect?.(index);
+          onActivate?.(item, index);
+        }
+      },
+    },
+    metadata: {
+      ...remoteMetadata,
+      scope: remoteScope,
+      selectedIndex,
+      items: items.map((item, index) => ({
+        index,
+        id: item.id,
+        label: item.label,
+        detail: item.detail,
+        category: item.category ?? remoteItemCategory,
+        kind: item.kind ?? remoteItemKind,
+        right: item.right,
+        checked: item.checked,
+        current: item.current,
+        disabled: item.disabled === true,
+      })),
+    },
+  });
+  const HostListView = useUiHost().ListView as ComponentType<ListViewProps> | undefined;
+  if (HostListView) {
+    return (
+      <HostListView
+        items={items}
+        selectedIndex={selectedIndex}
+        scrollIndex={scrollIndex}
+        onSelect={onSelect}
+        onActivate={onActivate}
+        renderRow={renderRow}
+        getRowBackgroundColor={getRowBackgroundColor}
+        showSelectedDescription={showSelectedDescription}
+        rowDescriptions={rowDescriptions}
+        emptyMessage={emptyMessage}
+        bgColor={bgColor}
+        selectedBgColor={selectedBgColor}
+        hoverBgColor={hoverBgColor}
+        rowGap={rowGap}
+        rowHeight={rowHeight}
+        surface={surface}
+        selection={selection}
+        height={height}
+        flexGrow={flexGrow}
+        scrollable={scrollable}
+        selectOnHover={selectOnHover}
+        autoScrollToIndex={autoScrollToIndex}
+        checkboxRows={checkboxRows}
+        onMouseScroll={onMouseScroll}
+        remoteRole={remoteRole}
+        remoteLabel={remoteLabel}
+        remoteScope={remoteScope}
+        remoteItemKind={remoteItemKind}
+        remoteItemCategory={remoteItemCategory}
+        remoteMetadata={remoteMetadata}
+      />
+    );
+  }
+
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const scrollRef = useRef<ScrollBoxRenderable>(null);
+  const baseBg = bgColor ?? colors.bg;
+  const activeBg = selectedBgColor ?? colors.selected;
+  const rowHoverBg = hoverBgColor ?? hoverBg(colors);
+  const selectedItem = selectedIndex >= 0 ? items[selectedIndex] : undefined;
+  const activeScrollIndex = scrollIndex ?? selectedIndex;
+  const headingAboveSelection = items[activeScrollIndex - 1]?.kind === "heading";
+  const terminalRowHeight = rowHeight ?? 1;
+  const terminalRowGap = rowGap ?? 0;
+  const rowStride = terminalRowHeight + terminalRowGap;
+
+  const revealActiveRow = useCallback(() => {
+    if (!scrollable || !autoScrollToIndex || activeScrollIndex < 0) return;
+    const sb = scrollRef.current;
+    if (!sb) return;
+    const safeIndex = Math.min(activeScrollIndex, items.length - 1);
+    const viewportH = Math.max(sb.viewport?.height ?? 1, 1);
+    const rowTop = Math.max(0, safeIndex - (headingAboveSelection ? 1 : 0)) * rowStride;
+    const rowBottom = safeIndex * rowStride + terminalRowHeight;
+    if (rowTop < sb.scrollTop) {
+      sb.scrollTo(rowTop);
+    } else if (rowBottom > sb.scrollTop + viewportH) {
+      sb.scrollTo(rowBottom - viewportH);
+    }
+  }, [activeScrollIndex, autoScrollToIndex, headingAboveSelection, items.length, rowStride, scrollable, terminalRowHeight]);
+  useEffect(revealActiveRow, [revealActiveRow]);
+  // A list that opens on a row past the fold has nothing to scroll until its
+  // first computed layout sizes the viewport and the rows.
+  useEffect(() => observeScrollBoxViewportSize(scrollRef.current, revealActiveRow), [revealActiveRow, scrollable]);
+  useEffect(() => observeScrollBoxContentSize(scrollRef.current, revealActiveRow), [revealActiveRow, scrollable]);
+
+  const syncScrollBar = useCallback(() => {
+    const sb = scrollRef.current;
+    if (!scrollable || !sb?.verticalScrollBar) return;
+    sb.verticalScrollBar.visible = items.length * rowStride - terminalRowGap > (sb.viewport?.height ?? 0);
+  }, [items.length, rowStride, scrollable, terminalRowGap]);
+  useEffect(syncScrollBar, [syncScrollBar, height, flexGrow]);
+  // A list that mounts before its first layout has no viewport height to
+  // compare yet, which would leave a scroll bar on rows that all fit.
+  useEffect(() => observeScrollBoxViewportSize(scrollRef.current, syncScrollBar), [syncScrollBar]);
+
+  if (items.length === 0) {
+    return (
+      <Box height={1}>
+        <Text fg={colors.textDim}>{t(emptyMessage)}</Text>
+      </Box>
+    );
+  }
+
+  const rows = items.map((item, index) => {
+    const selected = index === selectedIndex;
+    const hovered = index === hoveredIndex && !selected;
+    const disabled = item.disabled === true;
+    const state = { selected, hovered, disabled };
+    const rowBg = getRowBackgroundColor?.(item, state, index)
+      ?? (selected ? activeBg : hovered ? rowHoverBg : baseBg);
+
+    return (
+      <Box
+        key={item.id}
+        height={terminalRowHeight}
+        cursor={disabled ? "default" : "pointer"}
+        backgroundColor={rowBg}
+        onMouseOver={() => {
+          if (!disabled) {
+            setHoveredIndex((current) => (current === index ? current : index));
+            if (selectOnHover) onSelect?.(index);
+          }
+        }}
+        {...(onMouseScroll ? { onMouseScroll } : {})}
+        onMouseDown={() => {
+          if (disabled) return;
+          onSelect?.(index);
+          onActivate?.(item, index);
+        }}
+      >
+        {renderRow
+          ? renderRow(item, state, index)
+          : <DefaultRow item={item} selected={selected} />}
+      </Box>
+    );
+  });
+
+  return (
+    <Box flexDirection="column" height={height} flexGrow={flexGrow}>
+      {scrollable ? (
+        <ScrollBox
+          ref={scrollRef}
+          height={height}
+          flexGrow={flexGrow}
+          scrollY
+          focusable={false}
+          {...(onMouseScroll ? { onMouseScroll } : {})}
+        >
+          <Box flexDirection="column" gap={terminalRowGap}>{rows}</Box>
+        </ScrollBox>
+      ) : <Box flexDirection="column" gap={terminalRowGap}>{rows}</Box>}
+
+      {showSelectedDescription && selectedItem?.description && (
+        <>
+          <Box height={1} />
+          <Box>
+            <Text fg={colors.textDim}>{"    "}{t(selectedItem.description)}</Text>
+          </Box>
+        </>
+      )}
+    </Box>
+  );
+}
+
+function resolveListIndex(input: unknown, items: ListViewItem[]): number {
+  return resolveRemoteItemIndex(input, items, {
+    id: (item) => item.id,
+    label: (item) => item.label,
+  });
+}

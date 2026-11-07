@@ -1,0 +1,48 @@
+import type { DataProvider } from "../../../types/data-provider";
+import { loadCpiBoard } from "../cpi/client";
+import { loadCalendar } from "../econ/calendar-model";
+import { loadEarningsBoard } from "../earnings/client";
+import { loadEarningsCalendar } from "../earnings/data/cache";
+import { loadRatePath } from "../rate-path/client";
+import { readEarningsResults, type ScheduledEventSources } from "./scheduled";
+
+/**
+ * The next event dates from the data the app already shows: the earnings
+ * calendar ERN reads, the CPI board's release calendar, the FOMC meetings
+ * WIRP prices and the economic calendar ECO lists, each through its own cache. Results come from ERN's board,
+ * where a report's actual EPS lands, and from the per-ticker calendar for a
+ * company the board has no actual for (see `readEarningsResults`).
+ */
+export function scheduledEventSources(marketData: DataProvider | null | undefined): ScheduledEventSources {
+  return {
+    async earnings(symbols) {
+      if (!marketData?.getEarningsCalendar) throw new Error("Earnings dates are not available.");
+      return (await loadEarningsCalendar(marketData, symbols)).events;
+    },
+    async cpi() {
+      return (await loadCpiBoard()).payload;
+    },
+    async fomc() {
+      return (await loadRatePath()).meetings;
+    },
+    async calendar(force) {
+      return (await loadCalendar(force)).data;
+    },
+    results(symbols, from, to) {
+      return readEarningsResults(
+        symbols,
+        async (all) => (await loadEarningsBoard({ from, to, perDay: 0, symbols: all })).payload.reports.map((report) => ({
+          symbol: report.symbol, date: report.date, epsActual: report.epsActual, epsEstimate: report.epsEstimate,
+        })),
+        marketData?.getEarningsCalendar
+          ? async (missing) => (await loadEarningsCalendar(marketData, missing)).events.map((event) => ({
+            symbol: event.symbol,
+            date: event.earningsDate.toISOString().slice(0, 10),
+            epsActual: event.epsActual,
+            epsEstimate: event.epsEstimate,
+          }))
+          : null,
+      );
+    },
+  };
+}

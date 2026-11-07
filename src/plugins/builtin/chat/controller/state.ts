@@ -1,0 +1,244 @@
+import type {
+  ChatChannel,
+  ChatChannelState,
+  ChatMessage,
+  ChatMentionCandidate,
+  PersistedAuthUser,
+} from "../../../../api-client";
+import type { ConversationActivity } from "../conversation-recency";
+import { createClientMessageId, getLatestMessageId } from "./utils";
+import type { ChatDraftAttachment, DraftAttachmentEntry } from "./attachments";
+
+export const SESSION_STATE_KEY = "session";
+export const DEFAULT_CHAT_CHANNEL_ID = "everyone";
+export const TRANSCRIPT_KIND = "channel-transcript";
+export const TRANSCRIPT_SOURCE = "server";
+export const MESSAGE_PAGE_SIZE = 50;
+export const MAX_CACHED_MESSAGES = 50;
+export const SESSION_SCHEMA_VERSION = 1;
+export const CHANNEL_SCHEMA_VERSION = 1;
+export const TRANSCRIPT_SCHEMA_VERSION = 2;
+export const TRANSCRIPT_CACHE_POLICY = {
+  staleMs: 30 * 24 * 60 * 60_000,
+  expireMs: 90 * 24 * 60 * 60_000,
+};
+export const DRAFT_SYNC_DEBOUNCE_MS = 250;
+export const VERIFICATION_POLL_MS = 5_000;
+export const SESSION_RETRY_MS = 30_000;
+export const SAFETY_REFRESH_MS = 30_000;
+export const PENDING_RECONCILE_WINDOW_MS = 2 * 60_000;
+
+export interface PersistedSessionState {
+  sessionToken: string | null;
+  websocketToken?: string | null;
+  user: PersistedAuthUser | null;
+}
+
+export interface PersistedChannelState {
+  draft: string;
+  draftClientMessageId?: string | null;
+  replyToId: string | null;
+  lastCursor: string | null;
+  lastViewedMessageId?: string | null;
+}
+
+export interface PersistedTranscript {
+  messages: ChatMessage[];
+}
+
+/** An unread message for you: who sent it, and when. */
+export interface UnreadMessageForYou {
+  /** Null for a DM whose unread messages are not on this device: only the sender is known. */
+  messageId: string | null;
+  senderId: string;
+  /** The sender's username, or their name without one. */
+  senderName: string;
+  /** When it was sent, in ms; zero when not known. */
+  at: number;
+}
+
+/** Who the unread messages of one channel are from, by account id. */
+export interface ChannelUnreadPeople {
+  /** Everyone who sent an unread message there. */
+  senders: string[];
+  /** The ones among them with an unread message that mentions you or replies to you. */
+  mentioners: string[];
+  /**
+   * The newest unread message for you: in a DM or group chat the newest
+   * unread message, elsewhere the newest that mentions or replies to you.
+   * Null when none is known on this device.
+   */
+  latestForYou: UnreadMessageForYou | null;
+  /**
+   * How many unread messages are for you: every one in a DM or group chat,
+   * the ones known to mention or reply to you elsewhere.
+   */
+  forYouCount: number;
+}
+
+export interface ChatControllerSnapshot {
+  channelId: string;
+  channels: ChatChannel[];
+  channelStates: ChatChannelState[];
+  /**
+   * When each direct and group conversation last had a message, in ms, by
+   * channel id; a conversation with no known activity is left out. The same
+   * object until one of them changes.
+   */
+  conversationActivity: ConversationActivity;
+  channelsLoading: boolean;
+  loading: boolean;
+  /** Last message-load failure for this channel, or null. */
+  messagesError: string | null;
+  loadingOlderMessages: boolean;
+  hasOlderMessages: boolean;
+  hasSavedSession: boolean;
+  onlineCount: number;
+  user: { id: string; username: string; emailVerified: boolean } | null;
+  messages: ChatMessage[];
+  /** Undefined until the first scoped read, then authoritative even when empty. */
+  mentionCandidates?: ChatMentionCandidate[];
+  draft: string;
+  /** Images waiting in the composer for the next message. */
+  draftAttachments: ChatDraftAttachment[];
+  replyToId: string | null;
+  unreadMentionCount: number;
+  /**
+   * Who sent the unread messages of each channel with any, by channel id: what
+   * the app badge counts people from and the status bar names them from.
+   * Empty unless one of them asked for it
+   * ({@link ChatController.trackUnreadPeople}). A channel whose unread messages
+   * are not on this device yet lists only the ones that are, until they load.
+   */
+  unreadPeople: Record<string, ChannelUnreadPeople>;
+}
+
+type ChatConnection = {
+  send: (
+    content: string,
+    replyToId?: string,
+    clientMessageId?: string,
+    attachmentIds?: string[],
+  ) => Promise<ChatMessage>;
+  close: () => void;
+};
+
+export type MergeMessagesOptions = { countUnread?: boolean };
+
+export interface ChannelRuntimeState {
+  hydrated: boolean;
+  messagesLoading: boolean;
+  /** Last message-load failure, so an empty transcript is never mistaken for "no messages". */
+  messagesError: string | null;
+  olderMessagesLoading: boolean;
+  refreshMessagesPromise: Promise<void> | null;
+  loadOlderMessagesPromise: Promise<void> | null;
+  reachedOldestMessage: boolean;
+  /**
+   * False until this session has fetched a full latest page. The incremental
+   * cursor only ever asks for newer messages, so a message missed live can
+   * never be requested again; one uncursored fetch per session repairs it.
+   */
+  backfilled: boolean;
+  /**
+   * The account that backfill read the channel as (null signed out). Each
+   * message comes back with that reader's own reactions, so a different
+   * reader (a pane that mounted before the session was restored, a sign-in)
+   * reads the latest page again.
+   */
+  backfilledAs: string | null;
+  messages: ChatMessage[];
+  pendingMessages: ChatMessage[];
+  draft: string;
+  draftClientMessageId: string | null;
+  /** Uploads for the next message. Not persisted: a restart starts the draft without them. */
+  draftAttachments: DraftAttachmentEntry[];
+  replyToId: string | null;
+  lastCursor: string | null;
+  lastViewedMessageId: string | null;
+  notificationsEnabled: boolean;
+  unreadCount: number;
+  wsConnection: ChatConnection | null;
+  wsConnected: boolean;
+  draftSyncTimer: ReturnType<typeof setTimeout> | null;
+  openViewCount: number;
+  focusedViewCount: number;
+}
+
+export function channelStateKey(channelId: string): string {
+  return `channel:${channelId}`;
+}
+
+export function normalizeChannelId(channelId: string | null | undefined): string {
+  const normalized = channelId?.trim();
+  return normalized || DEFAULT_CHAT_CHANNEL_ID;
+}
+
+export function createEmptyChannelState(): ChannelRuntimeState {
+  return {
+    hydrated: false,
+    messagesLoading: false,
+    messagesError: null,
+    olderMessagesLoading: false,
+    refreshMessagesPromise: null,
+    loadOlderMessagesPromise: null,
+    reachedOldestMessage: false,
+    backfilled: false,
+    backfilledAs: null,
+    messages: [],
+    pendingMessages: [],
+    draft: "",
+    draftClientMessageId: null,
+    draftAttachments: [],
+    replyToId: null,
+    lastCursor: null,
+    lastViewedMessageId: null,
+    notificationsEnabled: false,
+    unreadCount: 0,
+    wsConnection: null,
+    wsConnected: false,
+    draftSyncTimer: null,
+    openViewCount: 0,
+    focusedViewCount: 0,
+  };
+}
+
+export function normalizeChannels(channels: ChatChannel[]): ChatChannel[] {
+  const byId = new Map<string, ChatChannel>();
+  for (const channel of channels) {
+    const id = channel.id.trim();
+    if (!id) continue;
+    byId.set(id, {
+      ...channel,
+      id,
+      name: channel.name.trim() || id,
+      kind: channel.kind ?? "public",
+    });
+  }
+  return [...byId.values()];
+}
+
+export function hydrateChannelRuntimeState({
+  channel,
+  messages,
+  persistedChannel,
+  userId,
+}: {
+  channel: ChannelRuntimeState;
+  messages: ChatMessage[];
+  persistedChannel: PersistedChannelState | null;
+  userId: string | null;
+}): void {
+  channel.draft = persistedChannel?.draft ?? "";
+  channel.draftClientMessageId = channel.draft.trim()
+    ? persistedChannel?.draftClientMessageId ?? createClientMessageId()
+    : null;
+  channel.replyToId = persistedChannel?.replyToId ?? null;
+  channel.messages = messages;
+  // The cursor follows the cached transcript, so a persisted cursor that ran
+  // ahead of the cache is never sent to the server.
+  channel.lastCursor = getLatestMessageId(messages);
+  channel.lastViewedMessageId = userId
+    ? persistedChannel?.lastViewedMessageId ?? getLatestMessageId(messages)
+    : null;
+}

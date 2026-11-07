@@ -1,0 +1,158 @@
+import { useCompanyDisclosureLinks } from "../company-kpis/related";
+import { useCallback, useMemo } from "react";
+import { PaneStatusBody, usePaneFooter } from "../../../components";
+import type { PaneProps } from "../../../types/plugin";
+import type { PluginModule } from "../plugin-module";
+import { usePaneInstance } from "../../../state/app/context";
+import { formatTickerListInput } from "../../../tickers/list";
+import { usePluginAppActions, usePluginTickerActions } from "../../runtime";
+import { useUiCapabilities } from "../../../ui";
+import type {
+  PaneSettingsContext,
+  PaneSettingsDef,
+} from "../../../types/plugin";
+import { attachEarningsCalendarPersistence, resetEarningsCalendarPersistence } from "./data/cache";
+import { attachEarningsCloudCaches, resetEarningsCloudCaches } from "./client";
+import { EarningsBoard } from "./board";
+import { EarningsHistoryView } from "./history";
+import { EARNINGS_CALENDAR, earningsBoardHeadless, earningsCalendarHeadless } from "./headless";
+import { scopedSymbolsFromSettings } from "./model";
+
+/** `ERN <ticker>`: that company's reports, with the footer's ways into its other panes. */
+function TickerEarnings({ symbol, focused, width, height }: { symbol: string; focused: boolean; width: number; height: number }) {
+  const { navigateTicker } = usePluginTickerActions();
+  useCompanyDisclosureLinks(symbol);
+  const { createPaneFromTemplate } = usePluginAppActions();
+  const open = useCallback((templateId: string) => createPaneFromTemplate(templateId, { symbol }), [createPaneFromTemplate, symbol]);
+  // t, e, c and a are footer hints, which bind their own keys.
+  usePaneFooter("earnings-actions", () => ({
+    order: 10,
+    hints: [
+      { id: "ticker", key: "t", label: "icker", onPress: () => navigateTicker(symbol) },
+      { id: "estimates", key: "e", label: "stimates", onPress: () => open("earnings-estimates-pane") },
+      { id: "calls", key: "c", label: "alls", onPress: () => open("earnings-calls-pane") },
+      { id: "analysts", key: "a", label: "nalysts", onPress: () => open("analyst-research-pane") },
+    ],
+  }), [navigateTicker, open, symbol]);
+  return <EarningsHistoryView symbol={symbol} width={width} height={height} focused={focused} registrationId="earnings-history" />;
+}
+
+function EarningsPane({ focused, width, height }: PaneProps) {
+  const pane = usePaneInstance();
+  const { nativePaneChrome } = useUiCapabilities();
+  const scope = useMemo(() => scopedSymbolsFromSettings(pane?.settings), [pane?.settings]);
+  // EVTS is always the market board; its ticker only picks the row.
+  const board = pane?.settings?.board === true;
+  const highlight = typeof pane?.settings?.highlight === "string" ? pane.settings.highlight : null;
+  const bodyHeight = Math.max(3, height - (nativePaneChrome ? 1 : 0));
+  if (!board && scope.error) return <PaneStatusBody error={scope.error} subject="Earnings scope" />;
+  const symbols = scope.symbols ?? [];
+  return !board && symbols.length === 1
+    ? <TickerEarnings symbol={symbols[0]!} focused={focused} width={width} height={bodyHeight} />
+    : <EarningsBoard scopedSymbols={board ? [] : symbols} highlight={highlight} focused={focused} width={width} height={bodyHeight} />;
+}
+
+/** The pane's tickers live in its settings, so they are editable there too. */
+function earningsSettings(context: PaneSettingsContext): PaneSettingsDef {
+  const scope = scopedSymbolsFromSettings(context.settings);
+  return {
+    title: "Earnings Scope",
+    values: { symbolsText: scope.text },
+    fields: [
+      {
+        key: "symbolsText",
+        label: "Tickers",
+        description: "Leave empty for the market's report days.",
+        type: "text",
+        placeholder: "AAPL, MSFT",
+        clearOnChange: ["symbols"],
+      },
+    ],
+  };
+}
+
+export const earningsModule: PluginModule = {
+  setup(ctx) {
+    attachEarningsCalendarPersistence(ctx.persistence);
+    attachEarningsCloudCaches(ctx.persistence);
+  },
+
+  dispose() {
+    resetEarningsCalendarPersistence();
+    resetEarningsCloudCaches();
+  },
+
+  panes: [
+    {
+      id: "earnings-calendar",
+      name: "Earnings Calendar",
+      icon: "$",
+      component: EarningsPane,
+      // ERN and EVTS open this pane: EVTS sets `board`, a scoped ERN sets the tickers.
+      identitySettings: ["board", "symbols", "symbolsText"],
+      personalData: ({ settings, tickers }) => {
+        const symbols = settings.board === true ? [] : scopedSymbolsFromSettings(settings).symbols;
+        if (!symbols) return null;
+        // Single-ticker report history is public. The board marks owned names.
+        if (symbols.length === 1) return null;
+        return [...tickers.values()].some(({ metadata }) => (
+          metadata.portfolios.length > 0
+          && (symbols.length === 0 || symbols.includes(metadata.ticker.trim().toUpperCase()))
+        )) ? "holdings" : null;
+      },
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 110, height: 28 },
+      tableExport: true,
+      // Dated as `fn EVTS` and `fn ERN` date it, by the calendar, not by the quotes behind the board's MOVE column.
+      reportFreshness: EARNINGS_CALENDAR,
+      settings: earningsSettings,
+    },
+  ],
+
+  paneTemplates: [
+    {
+      id: "earnings-calendar-pane",
+      paneId: "earnings-calendar",
+      label: "Earnings Calendar",
+      description: "A company's report history with surprises and moves; several tickers, their next reports; none, the market board.",
+      keywords: ["earn", "earnings", "calendar", "implied move", "surprise", "eps", "revenue", "quarterly"],
+      // ERN works on the loaded security: typed alone it takes the active
+      // ticker, and with none active it opens the market's report days.
+      shortcut: { prefix: "ERN", argPlaceholder: "tickers", argKind: "ticker-list", argOptional: true, openWithoutArg: true },
+      headless: earningsCalendarHeadless,
+      canCreate: () => true,
+      // Tickers named on the command bar scope the pane; without them it is the market board.
+      createInstance: (_context, options) => {
+        const scope = scopedSymbolsFromSettings(options?.symbols?.length
+          ? { symbols: options.symbols } : { symbolsText: options?.arg });
+        const symbols = scope.symbols;
+        return {
+          title: symbols?.length ? `ERN ${formatTickerListInput(symbols)}` : "Earnings Calendar",
+          placement: "floating",
+          settings: scope.error ? { symbolsText: scope.text }
+            : symbols?.length ? { symbols, symbolsText: scope.text } : undefined,
+        };
+      },
+    },
+    {
+      id: "earnings-board-pane",
+      paneId: "earnings-calendar",
+      label: "Earnings Days",
+      description: "The market board: report days by week or day, with implied and past moves; a ticker highlights its row.",
+      keywords: ["evts", "events", "earnings calendar", "earnings season", "reporting today"],
+      // Bloomberg's calendar: the market board always, never one company's history.
+      shortcut: { prefix: "EVTS", argPlaceholder: "ticker", argKind: "ticker", argOptional: true },
+      headless: earningsBoardHeadless,
+      canCreate: () => true,
+      createInstance: (_context, options) => {
+        const symbol = (options?.symbol ?? options?.ticker?.metadata.ticker ?? options?.arg ?? "").trim().toUpperCase();
+        return {
+          title: "Earnings Calendar",
+          placement: "floating",
+          settings: { board: true, ...(symbol ? { highlight: symbol } : {}) },
+        };
+      },
+    },
+  ],
+};

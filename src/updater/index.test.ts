@@ -1,0 +1,794 @@
+import { afterEach, describe, expect, it, test } from "bun:test";
+import { createHash } from "crypto";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { gzipSync } from "zlib";
+import {
+  applyUpdate,
+  canRestartToApply,
+  checkForUpdate,
+  checkForUpdateDetailed,
+  describeUnwritableInstall,
+  detectUpdateAction,
+  discardStagedUpdate,
+  getAssetBaseNameForRuntime,
+  performUpdate,
+  resolveSelfUpdateTargetPath,
+  setUpdateHost,
+  type ReleaseInfo,
+  type UpdateProgress,
+} from "./index";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  setUpdateHost(null);
+});
+
+function expectedAssetName(compressed = false): string {
+  const os = process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "windows" : "linux";
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const extension = os === "windows" ? ".exe" : "";
+  return compressed ? `gloomberb-${os}-${arch}${extension}.gz` : `gloomberb-${os}-${arch}${extension}`;
+}
+
+describe("getAssetBaseNameForRuntime", () => {
+  test("uses the Windows executable release asset name on win32", () => {
+    expect(getAssetBaseNameForRuntime({
+      platform: "win32",
+      arch: "x64",
+    })).toBe("gloomberb-windows-x64.exe");
+  });
+
+  test("keeps macOS arm64 runtimes on the arm64 asset", () => {
+    expect(getAssetBaseNameForRuntime({
+      platform: "darwin",
+      arch: "arm64",
+    })).toBe("gloomberb-darwin-arm64");
+  });
+
+  // An arm64 asset cannot run on an x64 macOS runtime, so it must never be
+  // offered as that runtime's update.
+  test("asks for an x64 asset on an x64 macOS runtime", () => {
+    expect(getAssetBaseNameForRuntime({
+      platform: "darwin",
+      arch: "x64",
+    })).toBe("gloomberb-darwin-x64");
+  });
+
+  // The glibc build cannot start on musl, so a musl binary must never update to it.
+  test("keeps a musl system on the musl asset", () => {
+    expect(getAssetBaseNameForRuntime({ platform: "linux", arch: "x64" }, "musl")).toBe("gloomberb-linux-x64-musl");
+    expect(getAssetBaseNameForRuntime({ platform: "linux", arch: "arm64" }, "musl")).toBe("gloomberb-linux-arm64-musl");
+    expect(getAssetBaseNameForRuntime({ platform: "linux", arch: "x64" }, "glibc")).toBe("gloomberb-linux-x64");
+  });
+});
+
+describe("detectUpdateAction", () => {
+  test("uses self-update for standalone binaries", () => {
+    expect(detectUpdateAction(
+      "/Users/ada/.local/bin/gloomberb",
+      ["/Users/ada/.local/bin/gloomberb"],
+    )).toEqual({ kind: "self" });
+  });
+
+  test("reports a standalone binary the process cannot overwrite as package-managed", () => {
+    // #684: a Nix store path is read-only, and the self-updater used to get
+    // as far as writing the download next to the binary before failing with
+    // "EROFS: read-only file system" in the header.
+    if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() === 0) return;
+    const dir = mkdtempSync(join(tmpdir(), "gloom-readonly-install-"));
+    const binary = join(dir, "gloomberb");
+    writeFileSync(binary, "#!/bin/sh\n");
+    chmodSync(binary, 0o555);
+    chmodSync(dir, 0o555);
+    try {
+      expect(detectUpdateAction(binary, [binary])).toEqual({
+        kind: "managed",
+        reason: "the install directory is not writable",
+      });
+      expect(describeUnwritableInstall("/nonexistent/gloomberb")).toBeNull();
+    } finally {
+      chmodSync(dir, 0o755);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses manual bun updates for bun-managed installs", () => {
+    expect(detectUpdateAction(
+      "/opt/homebrew/bin/bun",
+      ["/opt/homebrew/bin/bun", "/Users/ada/.bun/install/global/node_modules/gloomberb/bin/gloomberb"],
+    )).toEqual({
+      kind: "manual",
+      command: "bun install -g gloomberb@latest",
+    });
+  });
+
+  test("uses manual bun updates for Windows bun-managed installs", () => {
+    expect(detectUpdateAction(
+      "C:\\Program Files\\Bun\\bun.exe",
+      ["C:\\Program Files\\Bun\\bun.exe", "C:\\Users\\ada\\.bun\\install\\global\\node_modules\\gloomberb\\bin\\gloomberb"],
+    )).toEqual({
+      kind: "manual",
+      command: "bun install -g gloomberb@latest",
+    });
+  });
+
+  test("uses manual npm updates for node-managed installs", () => {
+    expect(detectUpdateAction(
+      "/opt/homebrew/bin/node",
+      ["/opt/homebrew/bin/node", "/usr/local/lib/node_modules/gloomberb/bin/gloomberb"],
+    )).toEqual({
+      kind: "manual",
+      command: "npm install -g gloomberb@latest",
+    });
+  });
+
+  test("does not offer self-update for standalone Windows executables", () => {
+    expect(detectUpdateAction(
+      "C:\\Users\\ada\\Downloads\\gloomberb.exe",
+      ["C:\\Users\\ada\\Downloads\\gloomberb.exe"],
+    )).toBeNull();
+  });
+
+  test("skips updates when launched from source under bun", () => {
+    expect(detectUpdateAction(
+      "/opt/homebrew/bin/bun",
+      ["/opt/homebrew/bin/bun", "src/cli/entry.ts"],
+    )).toBeNull();
+  });
+
+  test("does not treat a macOS app bundle launcher as a standalone CLI binary", () => {
+    expect(detectUpdateAction(
+      "/Applications/Gloomberb.app/Contents/MacOS/launcher",
+      ["/Applications/Gloomberb.app/Contents/MacOS/launcher"],
+    )).toBeNull();
+  });
+
+  test("does not suggest Bun-managed updates for the bundled macOS app runtime", () => {
+    expect(detectUpdateAction(
+      "/Applications/Gloomberb.app/Contents/MacOS/bun",
+      ["/Applications/Gloomberb.app/Contents/MacOS/bun", "/Applications/Gloomberb.app/Contents/Resources/gloomberb-tui/tui-entry.js"],
+    )).toBeNull();
+  });
+
+  test("does not suggest Bun-managed updates for the bundled Windows app TUI runtime", () => {
+    expect(detectUpdateAction(
+      "C:\\Users\\ada\\AppData\\Local\\Programs\\Gloomberb\\bin\\bun.exe",
+      [
+        "C:\\Users\\ada\\AppData\\Local\\Programs\\Gloomberb\\bin\\bun.exe",
+        "C:\\Users\\ada\\AppData\\Local\\Programs\\Gloomberb\\Resources\\gloomberb-tui\\tui-entry.js",
+      ],
+    )).toBeNull();
+  });
+});
+
+describe("resolveSelfUpdateTargetPath", () => {
+  it("rejects Bun runtime paths", () => {
+    expect(resolveSelfUpdateTargetPath(
+      "/Users/ada/.bun/bin/bun",
+      ["/Users/ada/.bun/bin/bun", "src/cli/entry.ts"],
+    )).toBeNull();
+  });
+
+  it("rejects Node runtime paths", () => {
+    expect(resolveSelfUpdateTargetPath(
+      "/usr/local/bin/node",
+      ["/usr/local/bin/node", "dist/index.js"],
+    )).toBeNull();
+  });
+
+  it("rejects Windows Bun runtime paths", () => {
+    expect(resolveSelfUpdateTargetPath(
+      "C:\\Program Files\\Bun\\bun.exe",
+      ["C:\\Program Files\\Bun\\bun.exe", "dist\\index.js"],
+    )).toBeNull();
+  });
+
+  it("accepts packaged gloomberb binaries", () => {
+    expect(resolveSelfUpdateTargetPath(
+      "/Applications/gloomberb",
+      ["/Applications/gloomberb"],
+    )).toBe("/Applications/gloomberb");
+  });
+
+  it("rejects launchers inside macOS app bundles", () => {
+    expect(resolveSelfUpdateTargetPath(
+      "/Applications/Gloomberb.app/Contents/MacOS/launcher",
+      ["/Applications/Gloomberb.app/Contents/MacOS/launcher"],
+    )).toBeNull();
+  });
+});
+
+describe("update host", () => {
+  test("delegates update checks to an installed host", async () => {
+    setUpdateHost({
+      async checkForUpdateDetailed() {
+        return {
+          kind: "available",
+          release: {
+            version: "0.4.0",
+            tagName: "v0.4.0",
+            downloadUrl: "https://example.com/stable-macos-arm64-update.json",
+            publishedAt: "",
+            updateAction: { kind: "desktop" },
+          },
+        };
+      },
+      async performUpdate() {},
+    });
+
+    await expect(checkForUpdateDetailed("0.3.1")).resolves.toEqual({
+      kind: "available",
+      release: {
+        version: "0.4.0",
+        tagName: "v0.4.0",
+        downloadUrl: "https://example.com/stable-macos-arm64-update.json",
+        publishedAt: "",
+        updateAction: { kind: "desktop" },
+      },
+    });
+  });
+
+  test("delegates update installation and progress to an installed host", async () => {
+    const progress: UpdateProgress[] = [];
+    const release: ReleaseInfo = {
+      version: "0.4.0",
+      tagName: "v0.4.0",
+      downloadUrl: "https://example.com/stable-macos-arm64-update.json",
+      publishedAt: "",
+      updateAction: { kind: "desktop" },
+    };
+
+    setUpdateHost({
+      async checkForUpdateDetailed() {
+        return { kind: "current" };
+      },
+      async performUpdate(_release, onProgress) {
+        onProgress({ phase: "downloading", percent: 50 });
+        onProgress({ phase: "done", message: "Update installed, restarting..." });
+      },
+    });
+
+    await performUpdate(release, (entry) => {
+      progress.push(entry);
+    });
+
+    expect(progress).toEqual([
+      { phase: "downloading", percent: 50 },
+      { phase: "done", message: "Update installed, restarting..." },
+    ]);
+  });
+});
+
+describe("restarting into a ready update", () => {
+  test("only a host that can relaunch offers it, and the terminal never restarts itself", async () => {
+    expect(canRestartToApply({ phase: "ready", canRestart: true })).toBe(true);
+    // The terminal binary is swapped and says so; there is nothing to click.
+    expect(canRestartToApply({ phase: "ready" })).toBe(false);
+    expect(canRestartToApply({ phase: "replacing", canRestart: true })).toBe(false);
+
+    const progress: UpdateProgress[] = [];
+    await applyUpdate((entry) => { progress.push(entry); });
+    expect(progress).toEqual([
+      { phase: "error", error: "Restarting to apply an update is unavailable in this runtime." },
+    ]);
+
+    let applied = 0;
+    setUpdateHost({
+      async checkForUpdateDetailed() { return { kind: "current" }; },
+      async performUpdate() {},
+      async applyUpdate() { applied += 1; },
+    });
+    await applyUpdate(() => {});
+    expect(applied).toBe(1);
+  });
+});
+
+describe("checkForUpdate", () => {
+  it("skips update checks when running from source", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Users/ada/.bun/bin/bun", configurable: true });
+      Object.defineProperty(process, "argv", {
+        value: ["/Users/ada/.bun/bin/bun", "src/cli/entry.ts"],
+        configurable: true,
+      });
+
+      await expect(checkForUpdate("0.2.0")).resolves.toBeNull();
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+
+  it("finds gzipped release assets published on GitHub", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      tag_name: "v0.3.2",
+      published_at: "2026-04-03T00:00:00Z",
+      assets: [{
+        name: expectedAssetName(true),
+        browser_download_url: "https://example.com/gloomberb.gz",
+        digest: `sha256:${"ab".repeat(32)}`,
+      }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Applications/gloomberb", configurable: true });
+      Object.defineProperty(process, "argv", {
+        value: ["/Applications/gloomberb"],
+        configurable: true,
+      });
+
+      await expect(checkForUpdate("0.3.1")).resolves.toEqual({
+        version: "0.3.2",
+        tagName: "v0.3.2",
+        downloadUrl: "https://example.com/gloomberb.gz",
+        publishedAt: "2026-04-03T00:00:00Z",
+        updateAction: { kind: "self" },
+        compressed: true,
+        checksum: "ab".repeat(32),
+      });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+});
+
+describe("checkForUpdateDetailed", () => {
+  it("returns a useful error when GitHub rejects the request", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    globalThis.fetch = (async () => new Response("busy", { status: 503 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Applications/gloomberb", configurable: true });
+      Object.defineProperty(process, "argv", {
+        value: ["/Applications/gloomberb"],
+        configurable: true,
+      });
+
+      await expect(checkForUpdateDetailed("0.3.1")).resolves.toEqual({
+        kind: "error",
+        error: "GitHub returned 503",
+        failure: { phase: "check", code: "server_error" },
+      });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+
+  test.each([
+    ["missing", undefined],
+    ["malformed", "sha256:not-a-checksum"],
+  ])("rejects release assets with a %s digest", async (_label, digest) => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      tag_name: "v0.3.2",
+      published_at: "2026-04-03T00:00:00Z",
+      assets: [{
+        name: expectedAssetName(),
+        browser_download_url: "https://example.com/gloomberb",
+        ...(digest ? { digest } : {}),
+      }],
+    }), { status: 200 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Applications/gloomberb", configurable: true });
+      Object.defineProperty(process, "argv", { value: ["/Applications/gloomberb"], configurable: true });
+
+      await expect(checkForUpdateDetailed("0.3.1")).resolves.toEqual({
+        kind: "error",
+        error: expect.stringContaining("valid SHA-256 digest"),
+        failure: { phase: "check", code: "no_build" },
+      });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+  // Splitting on "." read "1-beta" as NaN, and NaN <= 0 is false, so these
+  // were offered as updates.
+  test.each([
+    ["a prerelease of the running version", "v0.3.1-beta.1"],
+    ["a tag that is not a version", "nightly"],
+  ])("does not offer %s as an update", async (_label, tagName) => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      tag_name: tagName,
+      published_at: "2026-04-03T00:00:00Z",
+      assets: [{
+        name: expectedAssetName(),
+        browser_download_url: "https://example.com/gloomberb",
+        digest: `sha256:${"ab".repeat(32)}`,
+      }],
+    }), { status: 200 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Applications/gloomberb", configurable: true });
+      Object.defineProperty(process, "argv", { value: ["/Applications/gloomberb"], configurable: true });
+
+      await expect(checkForUpdateDetailed("0.3.1")).resolves.toEqual({ kind: "current" });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+});
+
+describe("performUpdate", () => {
+  it("returns a manual command instead of trying to overwrite Bun-managed installs", async () => {
+    const progress: UpdateProgress[] = [];
+    const release: ReleaseInfo = {
+      version: "9.9.9",
+      tagName: "v9.9.9",
+      downloadUrl: "https://example.com/gloomberb-darwin-arm64",
+      publishedAt: "2026-04-01T00:00:00Z",
+      updateAction: { kind: "manual", command: "bun install -g gloomberb@latest" },
+    };
+
+    await performUpdate(release, (entry) => {
+      progress.push(entry);
+    });
+
+    expect(progress).toEqual([
+      {
+        phase: "error",
+        error: "Run bun install -g gloomberb@latest",
+      },
+    ]);
+  });
+
+  it("names the package manager instead of downloading into a read-only install", async () => {
+    const progress: UpdateProgress[] = [];
+    let fetched = false;
+    globalThis.fetch = (async () => { fetched = true; throw new Error("should not download"); }) as typeof fetch;
+    try {
+      await performUpdate({
+        version: "9.9.9",
+        tagName: "v9.9.9",
+        downloadUrl: "https://example.com/gloomberb.gz",
+        publishedAt: "2026-04-01T00:00:00Z",
+        updateAction: { kind: "managed", reason: "the install is on a read-only file system" },
+      }, (entry) => { progress.push(entry); });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(fetched).toBe(false);
+    expect(progress).toEqual([{
+      phase: "error",
+      error: "Update through the package manager that installed Gloom: the install is on a read-only file system.",
+    }]);
+  });
+
+  it("returns an explicit error instead of overwriting Bun when execution context changes", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const progress: UpdateProgress[] = [];
+    const release: ReleaseInfo = {
+      version: "9.9.9",
+      tagName: "v9.9.9",
+      downloadUrl: "https://example.com/gloomberb-darwin-arm64",
+      publishedAt: "2026-04-01T00:00:00Z",
+      updateAction: { kind: "self" },
+    };
+
+    try {
+      Object.defineProperty(process, "execPath", { value: "/Users/ada/.bun/bin/bun", configurable: true });
+      Object.defineProperty(process, "argv", {
+        value: ["/Users/ada/.bun/bin/bun", "src/cli/entry.ts"],
+        configurable: true,
+      });
+
+      await performUpdate(release, (entry) => {
+        progress.push(entry);
+      });
+
+      expect(progress).toEqual([
+        {
+          phase: "error",
+          error: "Self-update is unavailable when running from source or via Bun/Node. Relaunch the packaged gloom binary to update.",
+        },
+      ]);
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  });
+
+  test.each([
+    ["missing", undefined],
+    ["malformed", "not-a-checksum"],
+  ])("leaves the installed binary untouched when the checksum is %s", async (_label, checksum) => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const tempDir = mkdtempSync(join(tmpdir(), "gloomberb-update-"));
+    const execPath = join(tempDir, "gloomberb");
+    const oldBinary = Buffer.from("old-binary");
+    const progress: UpdateProgress[] = [];
+
+    writeFileSync(execPath, oldBinary);
+    chmodSync(execPath, 0o755);
+    globalThis.fetch = (async () => new Response(gzipSync("new-binary"), { status: 200 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: execPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: [execPath], configurable: true });
+
+      await performUpdate({
+        version: "9.9.9",
+        tagName: "v9.9.9",
+        downloadUrl: "https://example.com/gloomberb.gz",
+        publishedAt: "2026-04-03T00:00:00Z",
+        updateAction: { kind: "self" },
+        compressed: true,
+        ...(checksum ? { checksum } : {}),
+      }, (entry) => { progress.push(entry); });
+
+      expect(readFileSync(execPath)).toEqual(oldBinary);
+      expect(progress.at(-1)).toEqual({
+        phase: "error",
+        error: "Self-update requires a valid SHA-256 checksum.",
+        failure: { phase: "verify", code: "no_build" },
+      });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // Release assets are gzipped; the checksum covers the downloaded bytes.
+  test.each([
+    ["an uncompressed", false],
+    ["a gzipped", true],
+  ])("replaces the binary when %s asset's checksum matches", async (_label, compressed) => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const tempDir = mkdtempSync(join(tmpdir(), "gloomberb-update-"));
+    const execPath = join(tempDir, "gloomberb");
+    const nextBinary = Buffer.from("verified-binary");
+    const asset = compressed ? gzipSync(nextBinary) : nextBinary;
+    const checksum = createHash("sha256").update(asset).digest("hex");
+    const progress: UpdateProgress[] = [];
+
+    writeFileSync(execPath, Buffer.from("old-binary"));
+    chmodSync(execPath, 0o755);
+    globalThis.fetch = (async () => new Response(asset, { status: 200 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: execPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: [execPath], configurable: true });
+
+      await performUpdate({
+        version: "9.9.9",
+        tagName: "v9.9.9",
+        downloadUrl: "https://example.com/gloomberb",
+        publishedAt: "2026-04-03T00:00:00Z",
+        updateAction: { kind: "self" },
+        compressed,
+        checksum,
+      }, (entry) => { progress.push(entry); });
+
+      expect(readFileSync(execPath)).toEqual(nextBinary);
+      // Swapped in and waiting: the running process is never restarted for the user.
+      expect(progress.at(-1)).toEqual({ phase: "ready" });
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // Switching back to stable before the restart must not leave the nightly
+  // build to start next time; a stable update keeps no copy, as before.
+  test("a nightly build swapped in is put back for the binary this run started from", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const tempDir = mkdtempSync(join(tmpdir(), "gloomberb-update-"));
+    const execPath = join(tempDir, "gloomberb");
+    const runningBinary = Buffer.from("running-binary");
+    const update = (version: string, bytes: Buffer): ReleaseInfo => ({
+      version,
+      tagName: `v${version}`,
+      downloadUrl: "https://example.com/gloomberb",
+      publishedAt: "2026-10-16T05:00:00Z",
+      updateAction: { kind: "self" },
+      checksum: createHash("sha256").update(bytes).digest("hex"),
+    });
+    const install = async (release: ReleaseInfo, bytes: Buffer) => {
+      globalThis.fetch = (async () => new Response(bytes, { status: 200 })) as typeof fetch;
+      const progress: UpdateProgress[] = [];
+      await performUpdate(release, (entry) => { progress.push(entry); });
+      expect(progress.at(-1)).toEqual({ phase: "ready" });
+    };
+
+    writeFileSync(execPath, runningBinary);
+    chmodSync(execPath, 0o755);
+    try {
+      Object.defineProperty(process, "execPath", { value: execPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: [execPath], configurable: true });
+
+      const nightlyBinary = Buffer.from("nightly-binary");
+      await install(update("9.9.10-nightly.20261016.5.gabcdef0", nightlyBinary), nightlyBinary);
+      expect(readFileSync(execPath)).toEqual(nightlyBinary);
+
+      await expect(discardStagedUpdate()).resolves.toBeNull();
+      expect(readFileSync(execPath)).toEqual(runningBinary);
+      expect(readdirSync(tempDir)).toEqual(["gloomberb"]);
+      // Nothing is left to take back twice.
+      await expect(discardStagedUpdate()).resolves.toBe("the previous version was not kept");
+
+      const stableBinary = Buffer.from("stable-binary");
+      await install(update("9.9.10", stableBinary), stableBinary);
+      expect(readdirSync(tempDir)).toEqual(["gloomberb"]);
+      await expect(discardStagedUpdate()).resolves.toBe("the previous version was not kept");
+      expect(readFileSync(execPath)).toEqual(stableBinary);
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the installed binary untouched when the checksum mismatches", async () => {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const tempDir = mkdtempSync(join(tmpdir(), "gloomberb-update-"));
+    const execPath = join(tempDir, "gloomberb");
+    const oldBinary = Buffer.from("old-binary");
+    const progress: UpdateProgress[] = [];
+
+    writeFileSync(execPath, oldBinary);
+    chmodSync(execPath, 0o755);
+    globalThis.fetch = (async () => new Response("tampered", { status: 200 })) as typeof fetch;
+
+    try {
+      Object.defineProperty(process, "execPath", { value: execPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: [execPath], configurable: true });
+
+      await performUpdate({
+        version: "9.9.9",
+        tagName: "v9.9.9",
+        downloadUrl: "https://example.com/gloomberb",
+        publishedAt: "2026-04-03T00:00:00Z",
+        updateAction: { kind: "self" },
+        checksum: "00".repeat(32),
+      }, (entry) => { progress.push(entry); });
+
+      expect(readFileSync(execPath)).toEqual(oldBinary);
+      expect(progress.at(-1)).toEqual(expect.objectContaining({
+        phase: "error",
+        error: expect.stringContaining("Checksum mismatch"),
+        failure: { phase: "verify", code: "corrupt" },
+      }));
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("update channels", () => {
+  const digest = `sha256:${"ab".repeat(32)}`;
+  function release(tag: string, options: { prerelease?: boolean; draft?: boolean; withAsset?: boolean } = {}) {
+    return {
+      tag_name: tag,
+      published_at: "2026-10-15T03:00:00Z",
+      prerelease: options.prerelease ?? tag.includes("-"),
+      draft: options.draft ?? false,
+      assets: options.withAsset === false ? [] : [{
+        name: expectedAssetName(true),
+        browser_download_url: `https://example.com/${tag}/gloomberb.gz`,
+        digest,
+      }],
+    };
+  }
+
+  /** Runs `body` as the standalone binary, with GitHub answering `latest` and `list`. */
+  async function asStandaloneBinary(
+    github: { latest?: ReturnType<typeof release>; list?: ReturnType<typeof release>[] },
+    body: (requests: string[]) => Promise<void>,
+    binary = "/Applications/gloomberb",
+    argv = [binary],
+  ) {
+    const originalExecPath = process.execPath;
+    const originalArgv = process.argv;
+    const requests: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      return new Response(JSON.stringify(url.endsWith("/releases/latest") ? github.latest : github.list), { status: 200 });
+    }) as typeof fetch;
+    try {
+      Object.defineProperty(process, "execPath", { value: binary, configurable: true });
+      Object.defineProperty(process, "argv", { value: argv, configurable: true });
+      await body(requests);
+    } finally {
+      Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+      Object.defineProperty(process, "argv", { value: originalArgv, configurable: true });
+    }
+  }
+
+  const NIGHTLY_OLD = "v0.3.3-nightly.20261015.4.gfff0000";
+  const NIGHTLY_NEW = "v0.3.3-nightly.20261016.5.g0000fff";
+
+  test("stable reads releases/latest only, which never holds a prerelease", async () => {
+    await asStandaloneBinary({ latest: release("v0.3.2"), list: [release(NIGHTLY_NEW)] }, async (requests) => {
+      const result = await checkForUpdateDetailed("0.3.1", "stable");
+      expect(result).toMatchObject({ kind: "available", release: { version: "0.3.2", tagName: "v0.3.2" } });
+      expect(result.kind === "available" && result.release.channel).toBeFalsy();
+      expect(requests).toEqual(["https://api.github.com/repos/gloom-sh/gloomberb/releases/latest"]);
+    });
+  });
+
+  test("nightly takes the highest version, prereleases included, that has this platform's binary", async () => {
+    const list = [
+      release("v0.3.4-nightly.20261017.6.gaaaaaaa", { draft: true }),
+      release("v0.3.4-nightly.20261017.7.gbbbbbbb", { withAsset: false }),
+      release(NIGHTLY_OLD),
+      release(NIGHTLY_NEW),
+      release("v0.3.2"),
+    ];
+    await asStandaloneBinary({ list }, async (requests) => {
+      await expect(checkForUpdateDetailed("0.3.2", "nightly")).resolves.toMatchObject({
+        kind: "available",
+        release: { version: NIGHTLY_NEW.slice(1), tagName: NIGHTLY_NEW, channel: "nightly", updateAction: { kind: "self" } },
+      });
+      expect(requests).toEqual(["https://api.github.com/repos/gloom-sh/gloomberb/releases?per_page=30"]);
+      // Already on the newest nightly build: nothing to do.
+      await expect(checkForUpdateDetailed(NIGHTLY_NEW.slice(1), "nightly")).resolves.toEqual({ kind: "current" });
+    });
+  });
+
+  test("a nightly build is offered the stable release once it passes the nightly's version", async () => {
+    await asStandaloneBinary({ list: [release("v0.3.3"), release(NIGHTLY_NEW), release(NIGHTLY_OLD)] }, async () => {
+      await expect(checkForUpdateDetailed(NIGHTLY_NEW.slice(1), "nightly")).resolves.toMatchObject({
+        kind: "available",
+        release: { version: "0.3.3", tagName: "v0.3.3" },
+      });
+    });
+  });
+
+  test("back on stable, a nightly build stays until a newer stable release, and says so", async () => {
+    await asStandaloneBinary({ latest: release("v0.3.2") }, async () => {
+      await expect(checkForUpdateDetailed(NIGHTLY_NEW.slice(1), "stable")).resolves.toEqual({
+        kind: "current",
+        notice: `Staying on ${NIGHTLY_NEW} until a newer stable release`,
+      });
+    });
+    await asStandaloneBinary({ latest: release("v0.3.3") }, async () => {
+      await expect(checkForUpdateDetailed(NIGHTLY_NEW.slice(1), "stable")).resolves.toMatchObject({
+        kind: "available",
+        release: { version: "0.3.3" },
+      });
+    });
+  });
+
+  test("npm and Bun installs follow stable on either channel", async () => {
+    const bun = "/opt/homebrew/bin/bun";
+    const argv = [bun, "/Users/ada/.bun/install/global/node_modules/gloomberb/bin/gloomberb"];
+    await asStandaloneBinary({ latest: release("v0.3.2"), list: [release(NIGHTLY_NEW)] }, async (requests) => {
+      await expect(checkForUpdateDetailed("0.3.1", "nightly")).resolves.toMatchObject({
+        kind: "available",
+        release: { version: "0.3.2", updateAction: { kind: "manual" } },
+      });
+      expect(requests).toEqual(["https://api.github.com/repos/gloom-sh/gloomberb/releases/latest"]);
+    }, bun, argv);
+  });
+});

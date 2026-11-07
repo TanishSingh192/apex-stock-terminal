@@ -1,0 +1,303 @@
+import { useLayoutEffect, useState } from "react";
+import { t, tf } from "../../../i18n";
+import { useThemeColors } from "../../../theme/theme-context";
+import { Box, Text, TextAttributes } from "../../../ui";
+import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
+import { Button, terminalButtonColumns } from "../../ui";
+import type { ListScreenState } from "../list/model";
+import { CommandBarListBody } from "../list/view";
+import { ThemePicker } from "../theme-picker";
+import type { CommandBarRoute } from "../workflow/types";
+import { HEADER_MARKET_TITLE, isHeaderMarketRoute } from "../routes/header-market";
+import { NATIVE_COMMAND_SURFACE, nativeCommandSurfaceBorder } from "./native-surface";
+import { useCommandBarPalette } from "./palette";
+import { publishCommandBarPrompt } from "./prompt-binding";
+import { takeCommandBarExample } from "./prompt-example";
+import { useAppSelector } from "../../../state/app/context";
+import { showsCommandBarIntro } from "../../../app/command-bar-intro";
+import type { CommandBarPanelProps } from "./types";
+
+const COMMAND_BAR_OVERLAY_Z_INDEX = 2_147_483_646;
+const COMMAND_BAR_PANEL_Z_INDEX = 2_147_483_647;
+const NEW_PANE_LABEL = "New pane";
+
+/** Ticker search's title when Enter changes a pane: the pane's name gives way first. */
+function changeTickerTitle(pane: string, width: number): string {
+  const full = tf("Change ticker · {pane}", { pane });
+  return displayWidth(full) <= width ? full : truncateToDisplayWidth(t("Change ticker"), width);
+}
+
+/**
+ * The root screen keeps the closed prompt's own words. Opening the bar puts the
+ * caret in the same input the header was already showing, so changing the
+ * placeholder underneath it read as the control being swapped out. The first
+ * opens are the exception: they show plain words to type instead, picked once
+ * when the bar opens and kept until it closes. Nested screens are a different
+ * screen and say so.
+ */
+function resolvePromptPlaceholder(listState: ListScreenState, example: string | null): string {
+  if (listState.kind === "root") {
+    return example ? tf("Try: {example}", { example }) : t("Search or run a command");
+  }
+  if (listState.title === "Security Description" || listState.title === HEADER_MARKET_TITLE) return t("Search tickers");
+  return t("Filter");
+}
+
+export function CommandBarPanel({
+  bodySlotKey,
+  committedThemeId,
+  contentPadding,
+  currentRoute,
+  hasChromeRow,
+  labelWidth,
+  listBodyHeight,
+  nativeListRows,
+  nativeListScrollRef,
+  nativeOccluderRect,
+  nativePaneChrome,
+  onBack,
+  onListHoverIndex,
+  onListRowMouseDown,
+  onListScroll,
+  onNativeOccluderChange,
+  onOverlayClose,
+  onQueryChange,
+  onThemeCommit,
+  onThemePreview,
+  panelBounds,
+  clearBounds = null,
+  queryDisplayWidth,
+  rootGhostSuffix,
+  rootShortcutFeedback,
+  onRunShortcut,
+  selectedScrollRowIndex,
+  termHeight,
+  termWidth,
+  themePickerActive,
+  themePickerFilter,
+  themePickerRef,
+  trailingWidth,
+  tickerSearchTarget = null,
+  onRunSecondary,
+  selectionKeyHints = null,
+  visibleListState,
+}: CommandBarPanelProps) {
+  const colors = useThemeColors();
+  const newPaneColumns = terminalButtonColumns({ label: NEW_PANE_LABEL, shortcut: "Shift+Enter", compact: true });
+  const palette = useCommandBarPalette(nativePaneChrome);
+  // The count already includes this opening, so this reads the same until the bar closes.
+  const intro = useAppSelector((state) => showsCommandBarIntro(state.config));
+  // The bar mounts on each opening, so each of the first openings gets its own example.
+  const [example] = useState(() => (intro ? takeCommandBarExample() : null));
+
+  useLayoutEffect(() => {
+    const scrollBox = nativeListScrollRef.current;
+    if (!scrollBox) return;
+    if (scrollBox.verticalScrollBar) scrollBox.verticalScrollBar.visible = false;
+    if (selectedScrollRowIndex < 0) return;
+    const viewportHeight = Math.max(1, scrollBox.viewport?.height ?? listBodyHeight);
+    if (selectedScrollRowIndex < scrollBox.scrollTop) {
+      scrollBox.scrollTo(selectedScrollRowIndex);
+    } else if (selectedScrollRowIndex >= scrollBox.scrollTop + viewportHeight) {
+      scrollBox.scrollTo(selectedScrollRowIndex - viewportHeight + 1);
+    }
+  }, [listBodyHeight, nativeListScrollRef, selectedScrollRowIndex, visibleListState?.kind, visibleListState?.query]);
+
+  // The header prompt is the bar's input while a list screen is showing.
+  useLayoutEffect(() => {
+    if (!visibleListState) {
+      publishCommandBarPrompt(null);
+      return;
+    }
+    publishCommandBarPrompt({
+      screenKey: `${visibleListState.kind}:${visibleListState.title}`,
+      query: visibleListState.query,
+      placeholder: resolvePromptPlaceholder(visibleListState, example),
+      ghostSuffix: visibleListState.kind === "root" ? rootGhostSuffix : null,
+      keyHints: selectionKeyHints,
+      onQueryChange,
+    });
+  }, [example, onQueryChange, rootGhostSuffix, selectionKeyHints, visibleListState]);
+  useLayoutEffect(() => () => publishCommandBarPrompt(null), []);
+
+  useLayoutEffect(() => {
+    onNativeOccluderChange?.(nativeOccluderRect);
+    return () => {
+      onNativeOccluderChange?.(null);
+    };
+  }, [
+    nativeOccluderRect.height,
+    nativeOccluderRect.width,
+    nativeOccluderRect.x,
+    nativeOccluderRect.y,
+    onNativeOccluderChange,
+  ]);
+
+  return (
+    // The click-away overlay starts where the sheet does: the header above it
+    // holds the bar's input, and a click there must reach it, not close the bar.
+    <Box
+      position="absolute"
+      top={panelBounds.y}
+      left={0}
+      width={termWidth}
+      height={Math.max(0, termHeight - panelBounds.y)}
+      zIndex={nativePaneChrome ? COMMAND_BAR_OVERLAY_Z_INDEX : 100}
+      onMouseDown={(event: any) => {
+        event.stopPropagation?.();
+        event.preventDefault?.();
+        onOverlayClose();
+      }}
+    >
+      {/* The terminal sheet's rows are its own, edge to edge: no piece of a pane shows at its sides. */}
+      {clearBounds && (
+        <Box
+          position="absolute"
+          top={clearBounds.y}
+          left={clearBounds.x}
+          width={clearBounds.width}
+          height={clearBounds.height}
+          backgroundColor={palette.panelBg}
+          zIndex={100}
+        />
+      )}
+      <Box
+        position="absolute"
+        top={0}
+        left={panelBounds.x}
+        width={panelBounds.width}
+        height={panelBounds.height}
+        flexDirection="column"
+        backgroundColor={palette.panelBg}
+        zIndex={nativePaneChrome ? COMMAND_BAR_PANEL_Z_INDEX : 101}
+        onMouseDown={(event: any) => {
+          event.stopPropagation?.();
+        }}
+        data-gloom-role="command-bar-panel"
+        style={nativePaneChrome ? {
+          // The lower half of the control the header input opens: rounded and
+          // bordered along its three free edges, open where the input sits.
+          border: `1px solid ${nativeCommandSurfaceBorder(colors)}`,
+          borderTopWidth: 0,
+          borderRadius: `0 0 ${NATIVE_COMMAND_SURFACE.radiusPx}px ${NATIVE_COMMAND_SURFACE.radiusPx}px`,
+          boxShadow: NATIVE_COMMAND_SURFACE.shadow,
+          overflow: "hidden",
+          padding: `${NATIVE_COMMAND_SURFACE.paddingYPx}px ${NATIVE_COMMAND_SURFACE.paddingXPx}px`,
+        } : undefined}
+      >
+        {/* The desktop sheet pads itself in CSS; the terminal spends a row. */}
+        {!nativePaneChrome && <Box height={1} />}
+
+        {/* Rows stop at the results column, so a selection bar on a wide window
+          does not run on past the text into empty sheet. */}
+        <Box
+          key={bodySlotKey}
+          flexDirection="column"
+          flexGrow={1}
+          width={queryDisplayWidth + contentPadding * 2}
+          backgroundColor={palette.panelBg}
+        >
+          {/* The query itself is typed in the header prompt. This row only exists
+            when it has something to say: the way back from a nested screen, or
+            what a typed prefix resolved to. Its height is reserved in
+            panel/layout.ts, which is why the render is keyed on the same flag. */}
+          {hasChromeRow && (
+            <>
+              <Box height={1} paddingX={contentPadding} flexDirection="row">
+                {currentRoute ? (
+                  <>
+                    <Button
+                      label={t("Back")}
+                      displayLabel={nativePaneChrome ? `‹ ${t("Back")}` : `\u2190 ${t("Back")}`}
+                      variant="plain"
+                      compact
+                      flush
+                      stopPropagation
+                      onPress={onBack}
+                    />
+                    <Box width={2} />
+                    <Text fg={palette.text} attributes={TextAttributes.BOLD}>
+                      {tickerSearchTarget
+                        ? changeTickerTitle(tickerSearchTarget, Math.max(1, queryDisplayWidth - 8 - newPaneColumns - 2))
+                        : truncateToDisplayWidth(t(getCommandBarPanelTitle(currentRoute)), Math.max(1, queryDisplayWidth - 8))}
+                    </Text>
+                    {tickerSearchTarget && (
+                      <>
+                        <Box flexGrow={1} />
+                        {/* Enter changes the pane; opening another one is the secondary action. */}
+                        <Button
+                          label={NEW_PANE_LABEL}
+                          variant="plain"
+                          compact
+                          flush
+                          stopPropagation
+                          shortcut="Shift+Enter"
+                          onPress={onRunSecondary}
+                        />
+                      </>
+                    )}
+                  </>
+                ) : rootShortcutFeedback ? (
+                  // Says what Enter runs, and a click on it runs the same.
+                  <Button
+                    label={rootShortcutFeedback}
+                    displayLabel={truncateToDisplayWidth(rootShortcutFeedback, queryDisplayWidth)}
+                    variant="plain"
+                    compact
+                    flush
+                    stopPropagation
+                    onPress={onRunShortcut}
+                  />
+                ) : null}
+              </Box>
+              <Box height={1} />
+            </>
+          )}
+
+          {themePickerActive && (
+            <ThemePicker
+              ref={themePickerRef}
+              filter={themePickerFilter}
+              committedThemeId={committedThemeId}
+              height={listBodyHeight}
+              contentPadding={contentPadding}
+              labelWidth={labelWidth}
+              trailingWidth={trailingWidth}
+              queryDisplayWidth={queryDisplayWidth}
+              nativePaneChrome={nativePaneChrome}
+              onPreview={onThemePreview}
+              onCommit={onThemeCommit}
+            />
+          )}
+
+          {visibleListState && !themePickerActive && (
+            <CommandBarListBody
+              visibleListState={visibleListState}
+              nativeListRows={nativeListRows}
+              listBodyHeight={listBodyHeight}
+              contentPadding={contentPadding}
+              labelWidth={labelWidth}
+              nativePaneChrome={nativePaneChrome}
+              nativeListScrollRef={nativeListScrollRef}
+              queryDisplayWidth={queryDisplayWidth}
+              trailingWidth={trailingWidth}
+              onHoverIndex={onListHoverIndex}
+              onListScroll={onListScroll}
+              onRowMouseDown={onListRowMouseDown}
+            />
+          )}
+        </Box>
+
+        {!nativePaneChrome && <Box height={1} />}
+      </Box>
+    </Box>
+  );
+}
+
+function getCommandBarPanelTitle(route: CommandBarRoute): string {
+  if (route.kind === "mode") {
+    if (route.screen === "layout") return "Layout Actions";
+    return isHeaderMarketRoute(route.payload) ? HEADER_MARKET_TITLE : "Security Description";
+  }
+  return route.title;
+}

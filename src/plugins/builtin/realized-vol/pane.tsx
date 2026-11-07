@@ -1,0 +1,247 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DataTableView, EmptyState, PaneStatusBody, QueryBar, StatGrid, statGridRows, useChartTableSelection, usePaneFooter, usePaneNoticeFooter, usePaneTabs,
+  usePaneTicker, type DataTableColumn, type StatItem } from "../../../components";
+import { barsPerYearLabel, currencyPairInstrument } from "../../../market-data/bars-per-year";
+import { instrumentFromTicker, quoteSubscriptionTargetFromTicker } from "../../../market-data/request-types";
+import { useQuoteUpdates } from "../../../state/hooks/quote-streaming";
+import { useAsyncResource } from "../../../react/async-resource";
+import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
+import { usePaneSettingValue, usePluginAppActions, usePluginPaneState } from "../../../public/react";
+import { useThemeColors } from "../../../theme/theme-context";
+import type { PaneProps } from "../../../types/plugin";
+import { Box, useUiCapabilities } from "../../../ui";
+import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
+import { useAutoRefresh } from "../../../react/auto-refresh";
+import { useRemoteUiNode } from "../../../remote/semantic-tree";
+import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
+import { useLiveSessionRefresh } from "../shared/volatility/live-session";
+import type { RealizedVolatilityEstimator, VolatilityConeStatistics } from "../shared/volatility";
+import { loadCurrentAtmIv, loadRealizedVolatilityHistory, refreshCurrentAtmIv } from "./client";
+import type { CurrentAtmIvSnapshot } from "./model";
+import { atmIvObservedLabel, projectRealizedVolatility } from "./model";
+import { RealizedVolGraph, VolatilityConeChart } from "./charts";
+import { coneWindowDate } from "./chart-model";
+import type { RealizedVolEvidenceStatus } from "./evidence";
+import { DEFAULT_WINDOWS, ESTIMATOR_OPTIONS, selectedWindows } from "./settings";
+import { priceSeriesUnit } from "../../../market-data/market/index-level";
+import { fxVolatilityPair } from "../../../market-data/options-alternatives";
+import { fxProxyIvLessRv, fxProxyLabel, fxProxyNote, loadFxVolProxy } from "./fx-proxy";
+
+/** In session, while visible, the current ATM IV reference re-reads its expiry this often. */
+const ATM_IV_REFRESH_MS = 60_000;
+const TABS = [{ value: "graph", label: "History" }, { value: "cone", label: "Cone" }];
+const percent = (value: number | null | undefined) => value == null ? "--" : `${(value * 100).toFixed(2)}%`;
+const points = (value: number) => `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}`;
+const NO_CONE: VolatilityConeStatistics[] = [];
+const coneRowId = (row: VolatilityConeStatistics) => String(row.window);
+const coneRowDate = (row: VolatilityConeStatistics) => coneWindowDate(row.window);
+const CONE_COLUMNS: DataTableColumn[] = [
+  { id: "window", label: "Bars", width: 10, align: "left" },
+  ...["current", "min", "max", "mean", "median"].map((id) => ({ id, label: id[0]!.toUpperCase() + id.slice(1), width: 11, align: "right" as const })),
+  { id: "percentile", label: "Percentile", width: 12, align: "right" },
+  { id: "sampleSize", label: "Samples", width: 10, align: "right" },
+];
+
+export function RealizedVolPane({ width, height, focused }: PaneProps) {
+  const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
+  const { symbol, ticker, financials, error: identityError } = usePaneTicker();
+  const { createPaneFromTemplate } = usePluginAppActions();
+  const [initialView] = usePaneSettingValue("initialView", "graph");
+  const [view, setView] = usePluginPaneState("activeTabId", initialView);
+  const [estimatorValue, setEstimator] = usePaneSettingValue("estimator", "close-to-close");
+  const [windowValue] = usePaneSettingValue<string[] | string>("windows", DEFAULT_WINDOWS);
+  const [lookback, setLookback] = usePaneSettingValue("lookbackYears", "1");
+  const [showIv, setShowIv] = usePaneSettingValue("showIv", true);
+  const [selected, setSelected] = usePluginPaneState("selectedWindow", 30);
+  const [sort, setSort] = useState<{ columnId: keyof VolatilityConeStatistics; direction: SortDirection }>({ columnId: "window", direction: "asc" });
+  const estimator = ESTIMATOR_OPTIONS.find((option) => option.value === estimatorValue)?.value ?? "close-to-close";
+  const windows = useMemo(() => selectedWindows(windowValue), [windowValue]);
+  const instrument = instrumentFromTicker(ticker, symbol);
+  const instrumentKey = JSON.stringify(instrument);
+  // An FX pair or currency future has no chain: a currency fund's IV30 stands in for its ATM IV, labelled as a thin proxy.
+  const fxPair = !!symbol && fxVolatilityPair(symbol, instrument?.exchange) != null;
+  const historyController = useRef<AbortController | null>(null);
+  const ivController = useRef<AbortController | null>(null);
+  const historyLoader = useCallback(async (force: boolean) => {
+    historyController.current?.abort();
+    const controller = new AbortController();
+    historyController.current = controller;
+    const snapshot = await loadRealizedVolatilityHistory({ instrument: instrument!, forceRefresh: force, signal: controller.signal });
+    if (!snapshot.history.length && snapshot.error) throw new Error(snapshot.error);
+    return snapshot;
+  }, [instrumentKey]);
+  const quote = financials?.quote;
+  const quoteRef = useRef(quote);
+  quoteRef.current = quote;
+  const spotAvailable = !!quote && Number.isFinite(quote.price) && quote.price > 0 && !quote.stale;
+  const ivLoader = useCallback(async (force: boolean) => {
+    ivController.current?.abort();
+    const controller = new AbortController();
+    ivController.current = controller;
+    const currentQuote = quoteRef.current!;
+    return loadCurrentAtmIv({ instrument: instrument!, spot: currentQuote.price, spotAsOf: currentQuote.lastUpdated,
+      forceRefresh: force, signal: controller.signal });
+  }, [instrumentKey, spotAvailable]);
+  const proxyController = useRef<AbortController | null>(null);
+  const proxyLoader = useCallback(async () => {
+    proxyController.current?.abort();
+    const controller = new AbortController();
+    proxyController.current = controller;
+    return loadFxVolProxy({ symbol: instrument!.symbol, exchange: instrument!.exchange, signal: controller.signal });
+  }, [instrumentKey]);
+  const history = useAsyncResource(instrument ? historyLoader : null);
+  const loadedIv = useAsyncResource(instrument && showIv && spotAvailable && !fxPair ? ivLoader : null);
+  const proxy = useAsyncResource(instrument && showIv && fxPair ? proxyLoader : null);
+  useEffect(() => () => historyController.current?.abort(), [historyLoader]);
+  useEffect(() => () => ivController.current?.abort(), [ivLoader, showIv]);
+  useEffect(() => () => proxyController.current?.abort(), [proxyLoader, showIv]);
+  useAutoRefresh(history.updatedAt, history.load);
+  useAutoRefresh(loadedIv.updatedAt, loadedIv.load);
+  useAutoRefresh(proxy.updatedAt, proxy.load);
+  // The pane subscribes its own quote: the IV reference is fitted at the live
+  // price even when no other pane streams this ticker. The price is only
+  // sampled at each refresh, so the slow off-screen cadence is enough.
+  const liveStreaming = useLiveStreamingSetting();
+  const quoteTarget = quoteSubscriptionTargetFromTicker(ticker, symbol, "provider");
+  useQuoteUpdates(quoteTarget ? [{ ...quoteTarget, surface: "detail", visible: false, weight: 70 }] : [], { liveStreaming });
+  // In session the reference's own expiry is re-read every minute; the full
+  // load that chose it still runs on the global refresh.
+  const [refreshedIv, setRefreshedIv] = useState<{ owner: typeof ivLoader; at: number; data: CurrentAtmIvSnapshot } | null>(null);
+  const ivDataRef = useRef<CurrentAtmIvSnapshot | null>(null);
+  const refreshIv = useCallback(async () => {
+    const previous = ivDataRef.current;
+    const currentQuote = quoteRef.current;
+    if (!previous?.reference || !instrument || !currentQuote || currentQuote.stale || !(currentQuote.price > 0)) return;
+    ivController.current?.abort();
+    const controller = new AbortController();
+    ivController.current = controller;
+    const owner = ivLoader;
+    const data = await refreshCurrentAtmIv({ instrument, spot: currentQuote.price, spotAsOf: currentQuote.lastUpdated,
+      signal: controller.signal }, previous);
+    if (!controller.signal.aborted) setRefreshedIv({ owner, at: Date.now(), data });
+  }, [ivLoader]);
+  const refreshedCurrent = refreshedIv?.owner === ivLoader && refreshedIv.at > (loadedIv.updatedAt ?? 0) ? refreshedIv.data : null;
+  const iv = { ...loadedIv, data: refreshedCurrent ?? loadedIv.data };
+  ivDataRef.current = iv.data;
+  const ivRefresh = useLiveSessionRefresh(refreshIv, ATM_IV_REFRESH_MS, showIv && spotAvailable && !fxPair && !!iv.data?.reference && !loadedIv.loading,
+    loadedIv.updatedAt);
+  const proxyData = showIv && fxPair ? proxy.data ?? null : null;
+  // The proxy's IV30 is a dated close: drawn on its session, as the ATM IV is on its observation.
+  const proxyPoint = proxyData?.iv30
+    ? { value: proxyData.iv30.value, date: new Date(`${proxyData.iv30.date}T00:00:00Z`), label: fxProxyLabel(proxyData) } : null;
+  const proxySpread = useMemo(() => fxProxyIvLessRv(proxyData, history.data?.history ?? [],
+    currencyPairInstrument(instrument?.symbol, instrument?.exchange)), [proxyData, history.data, instrumentKey]);
+  const model = useMemo(() => history.data ? projectRealizedVolatility(history.data.history, {
+    symbol: history.data.symbol, exchange: instrument?.exchange, estimator, windows, lookbackYears: Number(lookback) === 2 ? 2 : 1,
+  }) : null, [history.data, estimator, windows, lookback]);
+  const chartInput = useMemo(() => model ? { history: model.history, rolling: model.series, windows: model.windows,
+    priceUnit: priceSeriesUnit(quote?.currency ?? "", quote?.instrumentType, quote?.priceBasis), iv: showIv ? iv.data?.reference ?? proxyPoint : null } : null,
+  [model, quote?.currency, quote?.instrumentType, quote?.priceBasis, showIv, iv.data, proxyPoint?.value, proxyPoint?.label, proxyPoint?.date.getTime()]);
+  const notices = [identityError, history.error, history.data?.error, iv.error, ivRefresh.error, iv.data?.error,
+    ...(model?.warnings ?? []), model?.historyNote, model?.formingNote, ...(showIv ? iv.data?.warnings ?? [] : []),
+    ...(showIv && symbol && !spotAvailable && !fxPair ? ["Current ATM IV unavailable: underlying quote is missing or stale"] : []),
+    proxy.error, proxyData?.error, proxySpread.note,
+  ].filter((value): value is string => !!value);
+  usePaneNoticeFooter({ registrationId: "realized-vol-notices", notices: [...new Set(notices)], focused });
+  const cycleView = () => setView(view === "graph" ? "cone" : "graph");
+  const openSurface = () => { if (symbol) createPaneFromTemplate("vol-surface-pane", { symbol, ticker, instrument: instrument?.instrument,
+    ...(ticker ? { listing: { name: ticker.metadata.name, exchange: ticker.metadata.exchange,
+      currency: ticker.metadata.currency, type: ticker.metadata.assetCategory ?? "STK" } } : {}),
+    values: iv.data?.reference ? { expiration: String(iv.data.reference.expiration) } : {} }); };
+  // The footer hints bind v, i and s in every view and state; only the reload
+  // is the pane's own key.
+  usePaneRefreshKey(() => {
+    void history.reload();
+    if (showIv) void (fxPair ? proxy.reload() : iv.reload());
+  }, { focused });
+  usePaneFooter("realized-vol", () => ({ info: [
+    ...(history.loading ? [{ id: "loading", parts: [{ text: "loading history", tone: "muted" as const }] }] : []),
+    ...(history.data?.stale ? [{ id: "stale", parts: [{ text: "stale history", tone: "warning" as const }] }] : []),
+    ...(history.data ? [{ id: "cadence", parts: [{
+      text: model ? `daily closes · ${barsPerYearLabel(model.barsPerYear)}` : "daily closes", tone: "muted" as const,
+    }] }] : []),
+    ...(model?.asOf ? [{ id: "date", parts: [{ text: model.asOf.toISOString().slice(0, 10), tone: "muted" as const }] }] : []),
+    ...(showIv && iv.loading ? [{ id: "iv-loading", parts: [{ text: "loading ATM IV", tone: "muted" as const }] }] : []),
+    ...(showIv && proxy.loading ? [{ id: "proxy-loading", parts: [{ text: "loading FX vol proxy", tone: "muted" as const }] }] : []),
+  ], hints: [
+    { id: "view", key: "v", label: "iew", onPress: cycleView },
+    { id: "iv", key: "i", label: showIv ? "v off" : "v on", onPress: () => setShowIv(!showIv) },
+    ...(symbol ? [{ id: "surface", key: "s", label: "urface", onPress: openSurface }] : []),
+  ] }), [history.loading, history.data, model?.asOf, model?.barsPerYear, iv.loading, proxy.loading, showIv, view, symbol, iv.data]);
+  // The cone's legend reads the selected row, or the last one when that window has none.
+  const legendWindow = view === "cone" && model?.cone.length
+    ? (model.cone.find((row) => row.window === selected) ?? model.cone.at(-1)!).window : null;
+  // A report of the pane says which window its legend figures are for, as the legend does by its cursor.
+  useRemoteUiNode(legendWindow != null ? {
+    role: "report-notice", label: "Chart window",
+    getMetadata: () => ({ text: `Chart legend: ${legendWindow}-bar window`, key: "legendWindow", value: legendWindow }),
+  } : null);
+  const ivErrors = showIv && !fxPair ? [...new Set([iv.error, ivRefresh.error, iv.data?.error, !iv.data?.reference ? "Current ATM IV unavailable" : null]
+    .filter((value): value is string => !!value))] : [];
+  const evidence: RealizedVolEvidenceStatus = {
+    symbol: model?.symbol ?? symbol ?? "", view: view === "cone" ? "cone" : "graph", estimator, legendWindow,
+    windows, lookbackYears: Number(lookback) === 2 ? 2 : 1, showIv, shortWindows: model?.shortWindows ?? [],
+    loading: history.loading || (showIv && (iv.loading || proxy.loading)),
+    stale: history.data?.stale ?? false, source: history.data?.source ?? null,
+    asOf: model?.asOf?.toISOString() ?? null,
+    errors: [...new Set([history.error, history.data?.error, ...(model?.warnings ?? []), ...ivErrors]
+      .filter((value): value is string => !!value))],
+    ivErrors,
+    currentIv: showIv && iv.data?.reference ? { value: iv.data.reference.value * 100,
+      date: iv.data.reference.date.toISOString(), label: iv.data.reference.label,
+      source: iv.data.reference.source, expiration: iv.data.reference.expiration } : null,
+    ...(fxPair ? { fxPair, proxyIv: showIv && proxyPoint && proxyData
+      ? { fund: proxyData.fund, value: proxyPoint.value * 100, date: proxyPoint.date.toISOString() } : null,
+    proxyStale: showIv && proxySpread.stale } : {}),
+  };
+  const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: TABS, activeValue: view, onSelect: setView, focused, dense: true });
+  const reference = showIv ? iv.data?.reference ?? null : null;
+  // The cone has no IV line of its own, so the dated ATM IV it is read against sits above it; for an FX pair,
+  // the proxy fund's IV30 with its close, how many of the fund's expiries price at the money, and IV30 less the pair's HV20.
+  const coneStats: StatItem[] = view !== "cone" || !model ? []
+    : reference ? [{ id: "atm-iv", label: "ATM IV", value: percent(reference.value), detail: `${Math.round(reference.daysToExpiry)}d` }]
+      : proxyData ? [
+        // A stale IV30 is marked here and said in the footer ("FXB has no IV30 since 2026-05-18").
+        { id: "proxy-iv", label: fxProxyLabel(proxyData), value: percent(proxyData.iv30?.value), detail: proxyData.iv30?.date,
+          tone: proxySpread.stale ? "warning" : undefined },
+        { id: "proxy-spread", label: "IV30 - HV20", value: proxySpread.spread == null ? "--" : points(proxySpread.spread), detail: "pts" },
+        { id: "proxy-expiries", label: "Expiries with ATM IV", value: proxyData.expiries ? `${proxyData.expiries.usable} of ${proxyData.expiries.read}` : "--" },
+      ] : [];
+  const contentHeight = Math.max(4, height - 1 - tabRows - statGridRows(coneStats, width));
+  // The table's selected window is the chart's cursor, so its legend reads that row's figures.
+  const coneSelection = useChartTableSelection({ rows: model?.cone ?? NO_CONE, getId: coneRowId, getDate: coneRowDate,
+    selectedId: String(selected), onSelect: (id) => setSelected(Number(id)), focused, enabled: view === "cone" });
+  const sortedCone = [...(model?.cone ?? [])].sort((left, right) => compareSortValues(left[sort.columnId], right[sort.columnId], sort.direction));
+  const coneTableHeight = Math.min(Math.max(2, sortedCone.length + 1), 10, Math.max(4, Math.floor(contentHeight * 0.42)));
+  return <Box width={width} height={height} flexDirection="column" overflow="hidden">
+    {tabStrip}
+    <QueryBar width={width} filters={[
+      { id: "estimator", label: "Estimator", value: estimator, options: ESTIMATOR_OPTIONS, onChange: (value: string) => setEstimator(value as RealizedVolatilityEstimator) },
+      { id: "lookback", label: "Lookback", value: String(lookback), options: [{ value: "1", label: "1Y" }, { value: "2", label: "2Y" }], onChange: setLookback },
+    ]} meta={reference ? `ATM IV observed ${atmIvObservedLabel(reference.date)}` : proxyData ? fxProxyNote(proxyData) : "Annualized %"} />
+    {!symbol ? <EmptyState title="Select a ticker." /> : <PaneStatusBody subject="realized volatility" loading={history.loading && !model}
+      error={!model ? history.error ?? identityError ?? null : null} empty={!!model && !model.history.length}>
+      {model && view === "cone" ? <>
+        <StatGrid items={coneStats} width={width} />
+        <DataTableView<VolatilityConeStatistics> focused={focused} columns={CONE_COLUMNS} items={sortedCone}
+          rootWidth={width} rootHeight={coneTableHeight} getItemKey={coneRowId}
+          sortColumnId={sort.columnId} sortDirection={sort.direction} emptyStateTitle="Volatility cone unavailable."
+          onHeaderClick={(id) => setSort((current) => nextHeaderSort(current, id as keyof VolatilityConeStatistics))}
+          selection={{ kind: "id", selectedId: String(selected), getId: coneRowId, onChange: (_id, row) => setSelected(row.window) }}
+          onActivate={(row) => setSelected(row.window)}
+          getExportMetadata={() => [["symbol", model.symbol], ["estimator", model.estimator], ["lookback years", model.lookbackYears],
+            ["as of", model.asOf?.toISOString()], ["source", history.data?.source], ["units", "annualized %"], ["annualization", barsPerYearLabel(model.barsPerYear)], ["warnings", ...notices]]}
+          renderCell={(row, column) => ({ text: column.id === "window" ? String(row.window)
+            : column.id === "sampleSize" ? String(row.sampleSize)
+              : column.id === "percentile" ? row.percentile == null ? "--" : `${row.percentile.toFixed(1)}%`
+                : percent(row[column.id as "current" | "min" | "max" | "mean" | "median"]),
+            color: column.id === "current" ? colors.warning : colors.text })} />
+        {/* Desktop chrome runs a little taller than its rows; the spare row keeps the last window in view. */}
+        <VolatilityConeChart evidence={evidence} rows={model.cone} width={width} selection={coneSelection}
+          height={Math.max(3, contentHeight - coneTableHeight - (nativePaneChrome ? 1 : 0))} focused={focused} />
+      </> : chartInput && windows.length ? <RealizedVolGraph evidence={evidence} input={chartInput} width={width} height={contentHeight} focused={focused} />
+        : <EmptyState title="Select graph windows in pane settings." />}
+    </PaneStatusBody>}
+  </Box>;
+}

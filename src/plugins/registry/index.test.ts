@@ -1,0 +1,769 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { renderToStaticMarkup } from "react-dom/server";
+import { assetDataProvider } from "../../capabilities";
+import { AppPersistence } from "../../data/app-persistence";
+import { TickerRepository } from "../../data/ticker-repository";
+import { createDefaultConfig, createPaneInstance } from "../../types/config";
+import type { DataProvider } from "../../types/data-provider";
+import type { GloomPlugin, GloomPluginContext } from "../../types/plugin";
+import {
+  altDataPlugin,
+  applicationPlugin,
+  creditPlugin,
+  cryptoPlugin,
+  earningsPlugin,
+  futuresCommoditiesPlugin,
+  globalMarketsPlugin,
+  portfolioPlugin,
+  quantPlugin,
+  ratesMacroPlugin,
+  screenersPlugin,
+  filingsPlugin,
+  optionsVolatilityPlugin,
+  ownershipPlugin,
+  tickerCorePlugin,
+} from "../builtin/composite-plugins";
+import { registeredStateNamespace } from "../test-fixture";
+import { resolveShellVisibleLayout } from "../../components/layout/shell/visible-layout";
+import { expandBuiltinPluginGroups } from "../ownership";
+import { composeBuiltinPlugin } from "../builtin/plugin-module";
+import { useAssetData, usePluginAppActions } from "../runtime";
+import { usePluginRenderContext } from "../runtime/context";
+import { PluginRegistry } from "./index";
+import { createTestDataProvider, createTestFinancials, createTestQuote } from "../../test-support/data-provider";
+
+const dataProvider: DataProvider = createTestDataProvider({
+  getTickerFinancials: async () => createTestFinancials(),
+  getQuote: async (symbol) => createTestQuote({ symbol, price: 1 }),
+});
+
+let currentRegistry: PluginRegistry | null = null;
+let currentPersistence: AppPersistence | null = null;
+
+function createRegistry(options: {
+  disabledPlugins?: string[];
+  disabledSources?: string[];
+  enableCapabilityHandlers?: boolean;
+} = {}): PluginRegistry {
+  const persistence = new AppPersistence(":memory:");
+  const registry = new PluginRegistry(
+    dataProvider,
+    new TickerRepository(persistence.tickers),
+    persistence,
+    { enableCapabilityHandlers: options.enableCapabilityHandlers },
+  );
+  registry.bindHost({
+    getConfig: () => ({
+      ...createDefaultConfig("/tmp/gloomberb-context-menu-test"),
+      disabledPlugins: options.disabledPlugins ?? [],
+      disabledSources: options.disabledSources ?? [],
+    }),
+  });
+  currentRegistry = registry;
+  currentPersistence = persistence;
+  return registry;
+}
+
+function plugin(id: string, setup: (ctx: GloomPluginContext) => void): GloomPlugin {
+  return {
+    id,
+    name: id,
+    version: "1.0.0",
+    setup,
+  };
+}
+
+function contextMenuLabels(items: ReturnType<PluginRegistry["getContextMenuItems"]>): string[] {
+  return items.flatMap((item) => item.type === "divider" || !item.label ? [] : [item.label]);
+}
+
+afterEach(() => {
+  currentRegistry?.destroy();
+  currentRegistry = null;
+  currentPersistence?.close();
+  currentPersistence = null;
+});
+
+describe("PluginRegistry lifecycle", () => {
+  test("rejects retired built-in module ids", async () => {
+    const registry = createRegistry();
+
+    await expect(registry.register({
+      id: "analytics",
+      name: "Conflicting Analytics",
+      version: "1.0.0",
+    })).rejects.toThrow("Plugin id is reserved by a built-in module: analytics");
+
+    expect(registry.allPlugins.has("analytics")).toBe(false);
+  });
+
+  test("rolls back rejected registrations and always removes owned contributions", async () => {
+    const registry = createRegistry();
+    const pane = {
+      id: "shared-pane",
+      name: "Shared",
+      component: () => null,
+      defaultPosition: "right" as const,
+    };
+
+    await expect(registry.register({
+      id: "setup-failure",
+      name: "Setup failure",
+      version: "1.0.0",
+      panes: [pane],
+      setup: () => { throw new Error("setup failed"); },
+    })).rejects.toThrow("setup failed");
+    expect(registry.allPlugins.has("setup-failure")).toBe(false);
+    expect(registry.panes.has("shared-pane")).toBe(false);
+
+    await registry.register({ id: "owner", name: "Owner", version: "1.0.0", panes: [pane] });
+    await expect(registry.register({ id: "collision", name: "Collision", version: "1.0.0", panes: [pane] }))
+      .rejects.toThrow("Duplicate plugin contribution id");
+    expect(registry.panes.get("shared-pane")?.name).toBe("Shared");
+
+    await registry.register({
+      id: "throwing-dispose",
+      name: "Throwing dispose",
+      version: "1.0.0",
+      panes: [{
+        id: "disposable-pane",
+        name: "Disposable",
+        component: () => null,
+        defaultPosition: "right",
+      }],
+      dispose: () => { throw new Error("dispose failed"); },
+    });
+    expect(() => registry.unregister("throwing-dispose")).toThrow("dispose failed");
+    expect(registry.allPlugins.has("throwing-dispose")).toBe(false);
+    expect(registry.panes.has("disposable-pane")).toBe(false);
+  });
+
+  test("a renamed plugin keeps reading and writing the state saved under its old id", async () => {
+    const registry = createRegistry();
+    const pluginConfig: Record<string, Record<string, unknown>> = { legacy: { model: "saved" } };
+    registry.bindHost({
+      getConfig: () => ({
+        ...createDefaultConfig("/tmp/gloomberb-state-id-test"),
+        pluginConfig,
+      }),
+      setPluginConfigValue: async (pluginId, key, value) => {
+        pluginConfig[pluginId] = { ...(pluginConfig[pluginId] ?? {}), [key]: value };
+      },
+    });
+
+    let context: GloomPluginContext | null = null;
+    await registry.register({
+      id: "renamed",
+      stateId: "legacy",
+      name: "Renamed",
+      version: "1.0.0",
+      setup: (ctx) => { context = ctx; },
+    });
+
+    const ctx = context!;
+    expect(ctx.configState.get("model")).toBe("saved");
+    expect(ctx.configState.keys()).toEqual(["model"]);
+    await ctx.configState.set("model", "chosen");
+    expect(pluginConfig.legacy?.model).toBe("chosen");
+    expect(pluginConfig.renamed).toBeUndefined();
+
+    ctx.resume.setState("thread", { id: "one" });
+    expect(registry.getResumeState("legacy", "thread")).toEqual({ id: "one" });
+  });
+});
+
+describe("built-in composite plugin ownership", () => {
+  test("registers modules through their one top-level owner", async () => {
+    const registry = createRegistry();
+    await registry.register(portfolioPlugin);
+    await registry.register(applicationPlugin);
+
+    expect(registry.getPluginPaneIds("portfolio")).toEqual(expect.arrayContaining([
+      "portfolio-list",
+      "analytics",
+      "kelly-sizer",
+    ]));
+    expect(registry.getPluginPaneIds("application")).toEqual(expect.arrayContaining([
+      "help",
+      "changelog",
+      "connections",
+    ]));
+    expect(registry.getPanePluginId("analytics")).toBe("portfolio");
+    expect(registry.getPanePluginId("help")).toBe("application");
+    expect(registry.getPanePluginId("connections")).toBe("application");
+    expect(registry.getCommandPluginId("gridlock-all")).toBe("application");
+    expect(registry.allPlugins.has("analytics")).toBe(false);
+    expect(registry.allPlugins.has("kelly-sizer")).toBe(false);
+    expect(registry.allPlugins.has("changelog")).toBe(false);
+  });
+});
+
+describe("Macro's successors", () => {
+  test("keep the state Macro saved, and each hides only its own panes", async () => {
+    const disabledPlugins: string[] = [];
+    const pluginConfig: Record<string, Record<string, unknown>> = { macro: { "yield-curve:forward": "1y" } };
+    const registry = createRegistry();
+    registry.bindHost({
+      getConfig: () => ({ ...createDefaultConfig("/tmp/gloomberb-macro-split-test"), pluginConfig, disabledPlugins }),
+      setPluginConfigValue: async (pluginId, key, value) => {
+        pluginConfig[pluginId] = { ...(pluginConfig[pluginId] ?? {}), [key]: value };
+      },
+    });
+    currentPersistence!.pluginState.set("macro", "resume:credit:tab", "sovereign");
+    for (const plugin of [ratesMacroPlugin, creditPlugin, earningsPlugin]) await registry.register(plugin);
+
+    // Pane state, slots and persistence resolve their namespace the same way.
+    for (const pluginId of ["rates-macro", "credit", "earnings"]) {
+      expect(registry.getConfigState(pluginId, "yield-curve:forward")).toBe("1y");
+      expect(registry.getResumeState(pluginId, "credit:tab")).toBe("sovereign");
+    }
+    await registry.setConfigState("credit", "cds:tenor", "5y");
+    expect(Object.keys(pluginConfig)).toEqual(["macro"]);
+
+    const instances = ["econ-calendar", "yield-curve", "fixed-income", "earnings-calendar"]
+      .map((paneId) => createPaneInstance(paneId, { instanceId: `${paneId}:main`, binding: { kind: "none" } }));
+    const layout = {
+      dockRoot: null,
+      instances,
+      floating: instances.map((instance, index) => ({ instanceId: instance.instanceId, x: index, y: 0, width: 40, height: 10, zIndex: index })),
+      detached: [],
+    };
+    const visiblePanes = (disabled: readonly string[]) => {
+      const disabledPaneIds = new Set(disabled.flatMap((pluginId) => registry.getPluginPaneIds(pluginId)));
+      return resolveShellVisibleLayout(layout, disabledPaneIds, registry.panes).instances.map((instance) => instance.paneId);
+    };
+    expect(visiblePanes(["credit"])).toEqual(["econ-calendar", "yield-curve", "earnings-calendar"]);
+    expect(visiblePanes(["earnings"])).toEqual(["econ-calendar", "yield-curve", "fixed-income"]);
+    expect(visiblePanes(expandBuiltinPluginGroups(["macro"]))).toEqual([]);
+  });
+});
+
+describe("Market Overview's successors", () => {
+  test("keep its state, each hides only its own panes, and CHOKE answers to Global Markets", async () => {
+    const pluginConfig: Record<string, Record<string, unknown>> = {
+      "market-overview": { "map:layer": "ships" },
+      "ticker-research": { priceLevels: "kept" },
+    };
+    const registry = createRegistry();
+    registry.bindHost({ getConfig: () => ({ ...createDefaultConfig("/tmp/gloomberb-market-overview-split-test"), pluginConfig }) });
+    for (const plugin of [tickerCorePlugin, globalMarketsPlugin, screenersPlugin, futuresCommoditiesPlugin, cryptoPlugin, altDataPlugin, quantPlugin]) {
+      await registry.register(plugin);
+    }
+
+    for (const pluginId of ["global-markets", "screeners", "futures-commodities", "crypto"]) {
+      expect(registry.getConfigState(pluginId, "map:layer")).toBe("ships");
+    }
+    // Alt Data and Quant already sit in the namespace their Ticker Research
+    // modules will bring; their Market Overview modules keep theirs, which
+    // the attention pane test checks where it renders.
+    for (const pluginId of ["alt-data", "quant"]) {
+      expect(registry.getConfigState(pluginId, "priceLevels")).toBe("kept");
+    }
+
+    const paneIds = ["world-venue-map", "world-indices", "equity-screener", "commodities-energy", "crypto-board", "attention", "correlation"];
+    const instances = paneIds.map((paneId) => createPaneInstance(paneId, { instanceId: `${paneId}:main`, binding: { kind: "none" } }));
+    const layout = {
+      dockRoot: null,
+      instances,
+      floating: instances.map((instance, index) => ({ instanceId: instance.instanceId, x: index, y: 0, width: 40, height: 10, zIndex: index })),
+      detached: [],
+    };
+    const visiblePanes = (disabled: readonly string[]) => {
+      const disabledPaneIds = new Set(disabled.flatMap((pluginId) => registry.getPluginPaneIds(pluginId)));
+      return resolveShellVisibleLayout(layout, disabledPaneIds, registry.panes).instances.map((instance) => instance.paneId);
+    };
+    expect(visiblePanes(["global-markets"])).toEqual(["equity-screener", "commodities-energy", "crypto-board", "attention", "correlation"]);
+    expect(visiblePanes(expandBuiltinPluginGroups(["market-overview"]))).toEqual([]);
+
+    // The template is Global Markets', the chart it opens Ticker Research's.
+    expect(registry.getDisabledPaneTemplateOwner("chokepoint-chart-pane", ["global-markets"])).toEqual({ id: "global-markets", name: "Global Markets" });
+    expect(registry.getDisabledPaneTemplateOwner("chokepoint-chart-pane", ["ticker-core"])).toEqual({ id: "ticker-core", name: "Ticker Research" });
+  });
+});
+
+describe("Ticker Research's successors", () => {
+  const successors = [
+    tickerCorePlugin, optionsVolatilityPlugin, ownershipPlugin, filingsPlugin,
+    creditPlugin, earningsPlugin, altDataPlugin, quantPlugin, ratesMacroPlugin, globalMarketsPlugin,
+  ];
+
+  // A module that moved into a plugin with another namespace reads its old
+  // state only through its override, so each moved module is checked next to
+  // a module that was already there.
+  test("every module reads the state it read before the split", async () => {
+    const registry = createRegistry();
+    for (const plugin of successors) await registry.register(plugin);
+    const pane = (paneId: string) => registeredStateNamespace(registry.panes.get(paneId)!.component);
+    const tab = (tabId: string) => registeredStateNamespace(registry.tickerResearchTabs.get(tabId)!.component);
+
+    expect({
+      "fixed-income": pane("fixed-income"),
+      "earnings-ripple": pane("earnings-ripple"),
+      "earnings-calls": pane("earnings-calls"),
+      "earnings-calls tab": tab("earnings-calls"),
+      "supply-chain": pane("supply-chain"),
+      "hiring tab": tab("hiring-momentum"),
+      attention: pane("attention"),
+      backtest: pane("backtest"),
+      seasonality: pane("seasonality"),
+      correlation: pane("correlation"),
+      "ticker-research": pane("ticker-research"),
+      options: pane("options"),
+      "holders tab": tab("holders"),
+      sec: pane("sec"),
+    }).toEqual({
+      "fixed-income": "macro",
+      "earnings-ripple": "ticker-research",
+      "earnings-calls": "macro",
+      "earnings-calls tab": "macro",
+      "supply-chain": "ticker-research",
+      "hiring tab": "ticker-research",
+      attention: "market-overview",
+      backtest: "ticker-research",
+      seasonality: "ticker-research",
+      correlation: "market-overview",
+      "ticker-research": "ticker-research",
+      options: "ticker-research",
+      "holders tab": "ticker-research",
+      sec: "ticker-research",
+    });
+  });
+
+  test("hide only their own panes, and name themselves where something of theirs would open hidden", async () => {
+    const registry = createRegistry();
+    for (const plugin of successors) await registry.register(plugin);
+    const paneIds = ["ticker-research", "options", "holders", "fixed-income", "earnings-ripple", "supply-chain", "backtest", "econ-calendar", "world-venue-map"];
+    const instances = paneIds.map((paneId) => createPaneInstance(paneId, { instanceId: `${paneId}:main`, binding: { kind: "fixed", symbol: "AAPL" } }));
+    const layout = {
+      dockRoot: null,
+      instances,
+      floating: instances.map((instance, index) => ({ instanceId: instance.instanceId, x: index, y: 0, width: 40, height: 10, zIndex: index })),
+      detached: [],
+    };
+    const visiblePanes = (disabled: readonly string[]) => {
+      const disabledPaneIds = new Set(disabled.flatMap((pluginId) => registry.getPluginPaneIds(pluginId)));
+      return resolveShellVisibleLayout(layout, disabledPaneIds, registry.panes).instances.map((instance) => instance.paneId);
+    };
+    // The retired Ticker Research group still includes Credit & Fixed Income; Rates & Macro and Global Markets do not.
+    expect(visiblePanes(expandBuiltinPluginGroups(["ticker-research"]))).toEqual(["econ-calendar", "world-venue-map"]);
+    expect(visiblePanes(["ownership"])).toEqual(paneIds.filter((paneId) => paneId !== "holders"));
+
+    const off = (pluginId: string) => [pluginId];
+    // DES, Enter and Open in Ticker Research open this pane type.
+    expect(registry.getDisabledPaneOwner("ticker-research", off("ticker-core"))).toEqual({ id: "ticker-core", name: "Ticker Research" });
+    // The overview's Holders figure opens the tab, else the pane.
+    expect(registry.getDisabledTickerResearchTabOwner("holders", off("ownership"))).toEqual({ id: "ownership", name: "Ownership & Insiders" });
+    expect(registry.getDisabledPaneTemplateOwner("holders-pane", off("ownership"))).toEqual({ id: "ownership", name: "Ownership & Insiders" });
+    // The ripple's supplier links and G from any of them.
+    expect(registry.getDisabledPaneTemplateOwner("supply-chain-pane", off("alt-data"))).toEqual({ id: "alt-data", name: "Supply Chain & Alt Data" });
+    expect(registry.getDisabledPaneTemplateOwner("chart-composer-pane", off("ticker-core"))).toEqual({ id: "ticker-core", name: "Ticker Research" });
+  });
+});
+
+describe("PluginRegistry context menu providers", () => {
+  test("registers and unregisters context menu providers", async () => {
+    const registry = createRegistry();
+    await registry.register(plugin("tools", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "app-menu",
+        contexts: ["app"],
+        getItems: () => [{ id: "tools:item", label: "Tools Item" }],
+      });
+    }));
+
+    expect(contextMenuLabels(registry.getContextMenuItems({ kind: "app" }))).toEqual(["Tools Item"]);
+
+    registry.unregister("tools");
+    expect(registry.getContextMenuItems({ kind: "app" })).toEqual([]);
+  });
+
+  test("orders providers by order, plugin id, and provider id", async () => {
+    const registry = createRegistry();
+    await registry.register(plugin("z-plugin", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "z-provider",
+        order: 20,
+        getItems: () => [{ id: "z", label: "Z" }],
+      });
+    }));
+    await registry.register(plugin("a-plugin", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "b-provider",
+        order: 10,
+        getItems: () => [{ id: "a-b", label: "A/B" }],
+      });
+      ctx.registerContextMenuProvider({
+        id: "a-provider",
+        order: 10,
+        getItems: () => [{ id: "a-a", label: "A/A" }],
+      });
+    }));
+
+    expect(contextMenuLabels(registry.getContextMenuItems({ kind: "app" }))).toEqual([
+      "A/A",
+      "A/B",
+      "Z",
+    ]);
+  });
+
+  test("filters providers from disabled plugins", async () => {
+    const registry = createRegistry({ disabledPlugins: ["disabled-tools"] });
+    await registry.register(plugin("disabled-tools", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "hidden",
+        getItems: () => [{ id: "hidden", label: "Hidden" }],
+      });
+    }));
+    await registry.register(plugin("enabled-tools", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "visible",
+        getItems: () => [{ id: "visible", label: "Visible" }],
+      });
+    }));
+
+    expect(contextMenuLabels(registry.getContextMenuItems({ kind: "app" }))).toEqual(["Visible"]);
+  });
+
+  test("provider exceptions do not prevent other provider items", async () => {
+    const registry = createRegistry();
+    await registry.register(plugin("bad-tools", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "throws",
+        getItems: () => {
+          throw new Error("boom");
+        },
+      });
+    }));
+    await registry.register(plugin("good-tools", (ctx) => {
+      ctx.registerContextMenuProvider({
+        id: "works",
+        getItems: () => [{ id: "works", label: "Works" }],
+      });
+    }));
+
+    expect(contextMenuLabels(registry.getContextMenuItems({ kind: "app" }))).toEqual(["Works"]);
+  });
+});
+
+describe("PluginRegistry capabilities", () => {
+  const source = (id: string) => assetDataProvider({ ...dataProvider, id, name: id });
+
+  test("disabled plugins disable their contributed capabilities", async () => {
+    const registry = createRegistry({ disabledPlugins: ["source-plugin"] });
+    await registry.register({
+      id: "source-plugin",
+      name: "Source Plugin",
+      version: "1.0.0",
+      capabilities: [source("source-a")],
+    });
+
+    expect(registry.getCapability("asset-data.source-a")?.sourceId).toBe("source-a");
+    expect(registry.getCapabilityPluginId("asset-data.source-a")).toBe("source-plugin");
+    expect(registry.getEnabledCapabilities("asset-data")).toEqual([]);
+  });
+
+  test("disabledSources disables only the matching capability source", async () => {
+    const registry = createRegistry({ disabledSources: ["source-a"] });
+    await registry.register({
+      id: "source-plugin",
+      name: "Source Plugin",
+      version: "1.0.0",
+      capabilities: [source("source-a"), source("source-b")],
+    });
+
+    expect(registry.getEnabledCapabilities("asset-data").map((entry) => entry.sourceId)).toEqual(["source-b"]);
+  });
+
+  test("can skip plugin capability handlers in renderer registries", async () => {
+    const registry = createRegistry({ enableCapabilityHandlers: false });
+    await registry.register({
+      id: "source-plugin",
+      name: "Source Plugin",
+      version: "1.0.0",
+      capabilities: [source("source-a")],
+      setup(ctx) {
+        ctx.registerCapability(source("source-b"));
+      },
+    });
+
+    expect(registry.getCapability("asset-data.source-a")).toBeNull();
+    expect(registry.getCapability("asset-data.source-b")).toBeNull();
+    expect(registry.getEnabledCapabilities("asset-data")).toEqual([]);
+  });
+});
+
+describe("PluginRegistry ticker research tabs", () => {
+  test("tracks the owning plugin for registered ticker research tabs", async () => {
+    const registry = createRegistry();
+    await registry.register(plugin("filings", (ctx) => {
+      ctx.registerTickerResearchTab({
+        id: "sec",
+        name: "SEC",
+        order: 45,
+        component: () => null,
+      });
+    }));
+
+    expect(registry.getTickerResearchTabPluginId("sec")).toBe("filings");
+
+    registry.unregister("filings");
+    expect(registry.getTickerResearchTabPluginId("sec")).toBeUndefined();
+  });
+});
+
+describe("PluginRegistry command bar search providers", () => {
+  test("withdraws providers on dispose and on plugin unregister", async () => {
+    const registry = createRegistry();
+    const provider = (id: string) => ({
+      id,
+      category: "Documents",
+      provide: async () => [],
+    });
+    let disposeSelfRegistered: (() => void) | null = null;
+
+    await registry.register(plugin("research-search", (ctx) => {
+      ctx.registerCommandBarSearchProvider(provider("documents"));
+      disposeSelfRegistered = ctx.registerCommandBarSearchProvider(provider("self-withdrawn"));
+    }));
+
+    expect(registry.getCommandBarSearchProviderPluginId("documents")).toBe("research-search");
+    disposeSelfRegistered!();
+    expect(registry.commandBarSearchProviders.has("self-withdrawn")).toBe(false);
+
+    registry.unregister("research-search");
+    expect(registry.commandBarSearchProviders.size).toBe(0);
+    expect(registry.getCommandBarSearchProviderPluginId("documents")).toBeUndefined();
+  });
+});
+
+describe("PluginRegistry pane settings", () => {
+  test("resolves effective pane setting values from settings definitions", async () => {
+    const registry = createRegistry();
+    const config = createDefaultConfig("/tmp/gloomberb-pane-settings-test");
+    config.layout = {
+      dockRoot: { kind: "pane", instanceId: "test-pane:main" },
+      instances: [{
+        instanceId: "test-pane:main",
+        paneId: "test-pane",
+        binding: { kind: "none" },
+        settings: {},
+      }],
+      floating: [],
+      detached: [],
+    };
+    registry.bindHost({ getConfig: () => config, getLayout: () => config.layout });
+
+    await registry.register(plugin("tables", (ctx) => {
+      ctx.registerPane({
+        id: "test-pane",
+        name: "Test Pane",
+        defaultPosition: "right",
+        component: () => null,
+        settings: {
+          values: {
+            columnIds: ["ticker", "price"],
+            collectionScope: "all",
+          },
+          fields: [
+            {
+              key: "columnIds",
+              label: "Columns",
+              type: "ordered-multi-select",
+              options: [
+                { value: "ticker", label: "Ticker" },
+                { value: "price", label: "Price" },
+              ],
+            },
+            {
+              key: "collectionScope",
+              label: "Collections",
+              type: "select",
+              options: [{ value: "all", label: "All" }],
+            },
+          ],
+        },
+      });
+    }));
+
+    const descriptor = registry.resolvePaneSettings("test-pane:main");
+
+    expect(descriptor?.context.settings.columnIds).toEqual(["ticker", "price"]);
+    expect(descriptor?.context.settings.collectionScope).toBe("all");
+    expect(descriptor?.rawSettings.columnIds).toBeUndefined();
+  });
+
+  test("resolves plugin-scoped pane setting values from plugin config", async () => {
+    const registry = createRegistry();
+    const config = createDefaultConfig("/tmp/gloomberb-pane-settings-test");
+    config.layout = {
+      dockRoot: { kind: "pane", instanceId: "test-pane:main" },
+      instances: [{
+        instanceId: "test-pane:main",
+        paneId: "test-pane",
+        binding: { kind: "none" },
+        settings: { breakingNewsNotificationsEnabled: false },
+      }],
+      floating: [],
+      detached: [],
+    };
+    config.pluginConfig = {
+      news: { breakingNewsNotificationsEnabled: true },
+    };
+    registry.bindHost({ getConfig: () => config, getLayout: () => config.layout });
+
+    await registry.register(plugin("news", (ctx) => {
+      ctx.registerPane({
+        id: "test-pane",
+        name: "Test Pane",
+        defaultPosition: "right",
+        component: () => null,
+        settings: {
+          values: { autoUpdate: true },
+          fields: [{
+            key: "breakingNewsNotificationsEnabled",
+            label: "Notifications",
+            type: "toggle",
+            storage: "plugin",
+          }, {
+            key: "autoUpdate",
+            label: "Auto-update",
+            type: "toggle",
+            storage: "plugin",
+          }],
+        },
+      });
+    }));
+
+    const descriptor = registry.resolvePaneSettings("test-pane:main");
+
+    expect(descriptor?.pluginId).toBe("news");
+    expect(descriptor?.context.settings.breakingNewsNotificationsEnabled).toBe(true);
+    // Never set: the declared default, so a setting can be on until turned off.
+    expect(descriptor?.context.settings.autoUpdate).toBe(true);
+  });
+
+  test("resolves and applies toggle-backed pane quick settings", async () => {
+    const registry = createRegistry();
+    const config = createDefaultConfig("/tmp/gloomberb-pane-quick-settings-test");
+    config.layout = {
+      dockRoot: { kind: "pane", instanceId: "test-pane:main" },
+      instances: [{
+        instanceId: "test-pane:main",
+        paneId: "test-pane",
+        binding: { kind: "none" },
+        settings: {},
+      }],
+      floating: [],
+      detached: [],
+    };
+    registry.bindHost({ getConfig: () => config, getLayout: () => config.layout });
+
+    await registry.register(plugin("quotes", (ctx) => {
+      ctx.registerPane({
+        id: "test-pane",
+        name: "Test Pane",
+        defaultPosition: "right",
+        component: () => null,
+        quickSettings: [
+          { type: "toggle", key: "liveStreaming", icon: "zap" },
+          { type: "toggle", key: "sizeBy", icon: "sqrt", onValue: "sqrt", label: "Square root sizing" },
+        ],
+        settings: {
+          values: { liveStreaming: true, sizeBy: "cap" },
+          fields: [{
+            key: "liveStreaming",
+            label: "Live streaming",
+            type: "toggle",
+          }, {
+            key: "sizeBy",
+            label: "Size by",
+            type: "select",
+            options: [{ value: "cap", label: "Market cap" }, { value: "sqrt", label: "Square root" }],
+          }],
+        },
+      });
+    }));
+
+    const applied: Array<{ key: string; value: unknown }> = [];
+    registry.bindHost({
+      applyPaneSettingValue: async (_paneId, field, value) => {
+        applied.push({ key: field.key, value });
+      },
+    });
+
+    expect(registry.resolvePaneQuickSettings("test-pane:main")).toMatchObject([{
+      key: "liveStreaming",
+      icon: "zap",
+      label: "Live streaming",
+      value: true,
+    }, {
+      key: "sizeBy",
+      icon: "sqrt",
+      label: "Square root sizing",
+      value: false,
+    }]);
+
+    await registry.togglePaneQuickSetting("test-pane:main", "liveStreaming");
+    // A two-option select flips to the option the control stands for.
+    await registry.togglePaneQuickSetting("test-pane:main", "sizeBy");
+    expect(applied).toEqual([{ key: "liveStreaming", value: false }, { key: "sizeBy", value: "sqrt" }]);
+  });
+});
+
+test("composed slots receive plugin context and keep extracted actions bound", async () => {
+  const registry = createRegistry();
+  let notify: ReturnType<typeof usePluginAppActions>["notify"];
+  const widget = () => {
+    notify = usePluginAppActions().notify;
+    return useAssetData()!.id;
+  };
+  await registry.register(composeBuiltinPlugin({
+    id: "slot-probe", name: "Slot probe", version: "1",
+    modules: [{ slots: { "status:widget": widget } }, { slots: { "status:widget": widget } }],
+  }));
+  const delivered: string[] = [];
+  registry.bindHost({ notify: ({ body }) => { delivered.push(body); } });
+  expect(renderToStaticMarkup(registry.renderSlot("status:widget", {}))).toBe("test-providertest-provider");
+  notify!({ body: "Bound action" });
+  expect(delivered).toEqual(["Bound action"]);
+});
+
+test("unbinding keeps a later binding, and the old slot names still bind", () => {
+  const registry = createRegistry();
+  const shared: string[] = [];
+  const unbindFirst = registry.bindHost({ sharePane: () => { shared.push("first"); } });
+  const unbindSecond = registry.bindHost({ sharePane: () => { shared.push("second"); } });
+  unbindFirst();
+  registry.sharePane();
+  unbindSecond();
+  registry.sharePane();
+  expect(shared).toEqual(["second"]);
+
+  const layout = { dockRoot: null, instances: [], floating: [], detached: [] };
+  registry.getLayoutFn = () => layout;
+  expect(registry.getLayout()).toBe(layout);
+  expect(registry.getLayoutFn()).toBe(layout);
+});
+
+test("slots skip disabled plugins and share their plugin's state namespace", async () => {
+  const registry = createRegistry({ disabledPlugins: ["slot-off"] });
+  const widget = () => usePluginRenderContext().pluginId;
+  await registry.register({ id: "slot-on", stateId: "shared-state", name: "On", version: "1", slots: { "status:widget": widget } });
+  await registry.register({ id: "slot-off", name: "Off", version: "1", slots: { "status:widget": widget } });
+  expect(renderToStaticMarkup(registry.renderSlot("status:widget", {}))).toBe("shared-state");
+});
+
+test("ticker actions follow their owner's live enabled state and unregister cleanly", async () => {
+  const options = { disabledPlugins: [] as string[] };
+  const registry = createRegistry(options);
+  await registry.register(plugin("action-owner", (ctx) => ctx.registerTickerAction({
+    id: "action", label: "Action", keywords: [], execute: () => {},
+  })));
+  expect(registry.getEnabledTickerActions().map(({ id }) => id)).toEqual(["action"]);
+  options.disabledPlugins.push("action-owner");
+  expect(registry.getEnabledTickerActions()).toEqual([]);
+  options.disabledPlugins.length = 0;
+  expect(registry.getEnabledTickerActions()).toHaveLength(1);
+  registry.unregister("action-owner");
+  expect(registry.getEnabledTickerActions()).toEqual([]);
+});

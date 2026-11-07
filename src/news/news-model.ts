@@ -1,0 +1,300 @@
+import { coinSearchName } from "../utils/crypto-pair";
+import { canonicalExchange, normalizeSymbol } from "../utils/exchanges";
+import type { NewsCapability } from "../capabilities";
+import type { NewsArticle, NewsFeed, NewsQuery, NewsQueryState } from "./types";
+
+export const MAX_ARTICLES = 10_000;
+export const DEFAULT_GLOBAL_QUERY: NewsQuery = { feed: "latest", limit: MAX_ARTICLES };
+
+const FEEDS = new Set<NewsFeed>(["latest", "top", "breaking", "ticker", "sector", "topic"]);
+const DETAIL_CAPABLE_ARTICLE = Symbol("detail-capable-news-article");
+
+type DetailCapableArticle = NewsArticle & { [DETAIL_CAPABLE_ARTICLE]?: true };
+
+function normalizeTicker(ticker: string | undefined): string {
+  return ticker ? normalizeSymbol(ticker) : "";
+}
+
+function normalizeNewsCategory(category: string): string {
+  return category.trim().toLowerCase();
+}
+
+export function normalizeNewsFeed(query: NewsQuery): NewsFeed {
+  if (query.feed && FEEDS.has(query.feed)) return query.feed;
+  return query.scope === "ticker" ? "ticker" : "latest";
+}
+
+function normalizeStringList(values: string[] | undefined): string[] | undefined {
+  const normalized = [...new Set((values ?? []).map(normalizeNewsCategory).filter(Boolean))].sort();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+export function buildNewsQueryKey(query: NewsQuery): string {
+  const feed = normalizeNewsFeed(query);
+  const ticker = normalizeTicker(query.ticker);
+  const exchange = canonicalExchange(query.exchange);
+  const topics = normalizeStringList(query.topics ?? query.categories) ?? [];
+  const sectors = normalizeStringList(query.sectors) ?? [];
+  const sources = normalizeStringList(query.sources) ?? [];
+  const excludeSources = normalizeStringList(query.excludeSources) ?? [];
+  const tickerRelations = normalizeStringList(query.tickerRelations) ?? [];
+  return [
+    feed,
+    ticker,
+    exchange,
+    query.tickerTier ?? "",
+    query.limit ?? MAX_ARTICLES,
+    topics.join(","),
+    sectors.join(","),
+    sources.join(","),
+    excludeSources.join(","),
+    tickerRelations.join(","),
+    query.sentiment ?? "",
+    query.minImportance ?? "",
+    query.minUrgency ?? "",
+    query.breaking == null ? "" : String(query.breaking),
+    query.since?.toISOString() ?? "",
+    query.until?.toISOString() ?? "",
+    query.cursor ?? "",
+    // A coin pair's feed falls back to stories naming the coin; a name that arrives after the
+    // first load is a new query, so the pane asks again. A stock's or a major coin's key is unchanged by it.
+    ...(feed === "ticker" ? [coinSearchName(ticker, exchange, query.listingName) ?? ""].filter(Boolean) : []),
+  ].join("|");
+}
+
+export function normalizeNewsQuery(query: NewsQuery): NewsQuery {
+  const feed = normalizeNewsFeed(query);
+  const topics = normalizeStringList(query.topics ?? query.categories);
+  const sectors = normalizeStringList(query.sectors);
+  return {
+    ...query,
+    feed,
+    scope: feed === "ticker" ? "ticker" : "global",
+    ticker: query.ticker ? normalizeTicker(query.ticker) : undefined,
+    exchange: query.exchange ? canonicalExchange(query.exchange) : undefined,
+    tickerTier: query.tickerTier ?? (feed === "ticker" ? "primary" : undefined),
+    topics,
+    categories: topics,
+    sectors,
+    sources: normalizeStringList(query.sources),
+    excludeSources: normalizeStringList(query.excludeSources),
+    tickerRelations: normalizeStringList(query.tickerRelations),
+    limit: Math.max(1, Math.min(MAX_ARTICLES, query.limit ?? MAX_ARTICLES)),
+  };
+}
+
+export function createIdleNewsQueryState(): NewsQueryState {
+  return {
+    phase: "idle",
+    articles: [],
+    error: null,
+    updatedAt: null,
+    sourceIds: [],
+    nextCursor: null,
+    loadingMore: false,
+    access: null,
+  };
+}
+
+function articleKey(item: NewsArticle): string {
+  const url = item.url.trim().toLowerCase().replace(/#.*$/, "").replace(/\/$/, "");
+  return url || `id:${item.id}`;
+}
+
+function sortByPublishedAt(items: NewsArticle[]): NewsArticle[] {
+  return [...items].sort((a, b) => b.publishedAt.getTime() - a.publishedAt.getTime());
+}
+
+function hasStoryItems(item: NewsArticle | null | undefined): boolean {
+  return (item?.items?.length ?? 0) > 0;
+}
+
+export function markDetailCapableArticle(source: NewsCapability, item: NewsArticle): NewsArticle {
+  if (!source.provider.fetchNewsStory) return item;
+  Object.defineProperty(item, DETAIL_CAPABLE_ARTICLE, {
+    value: true,
+    configurable: true,
+  });
+  return item;
+}
+
+function isDetailCapableArticle(item: NewsArticle): boolean {
+  return (item as DetailCapableArticle)[DETAIL_CAPABLE_ARTICLE] === true;
+}
+
+function shouldReplaceDuplicate(existing: NewsArticle, item: NewsArticle): boolean {
+  return (
+    item.importance > existing.importance ||
+    (item.importance === existing.importance && item.publishedAt > existing.publishedAt)
+  );
+}
+
+function selectDetailArticle(
+  existing: NewsArticle,
+  item: NewsArticle,
+  winner: NewsArticle,
+): NewsArticle | null {
+  if (isDetailCapableArticle(winner)) return winner;
+  if (isDetailCapableArticle(item)) return item;
+  if (isDetailCapableArticle(existing)) return existing;
+  if (hasStoryItems(winner)) return winner;
+  if (hasStoryItems(item)) return item;
+  if (hasStoryItems(existing)) return existing;
+  return null;
+}
+
+function newsArticleSummaryRevision(article: NewsArticle): string {
+  return JSON.stringify([article.id, article.publishedAt.getTime(), article.title, article.summary, article.url, article.source]);
+}
+
+export function newsArticleRevision(article: NewsArticle): string {
+  return JSON.stringify([newsArticleSummaryRevision(article), article.items ?? []]);
+}
+
+function mergeDuplicateArticle(existing: NewsArticle, item: NewsArticle): NewsArticle {
+  if (existing.id === item.id) {
+    // A story's newer publication supersedes its earlier importance score.
+    // For equal timestamps, the first (freshly fetched) correction wins;
+    // identical content can still carry a higher cross-source ranking.
+    const sameSummary = newsArticleSummaryRevision(existing) === newsArticleSummaryRevision(item);
+    const compatibleTimeline = !hasStoryItems(existing) || !hasStoryItems(item)
+      || newsArticleRevision(existing) === newsArticleRevision(item);
+    const winner = item.publishedAt > existing.publishedAt
+      || (sameSummary && compatibleTimeline && item.importance > existing.importance) ? item : existing;
+    const other = winner === item ? existing : item;
+    return !hasStoryItems(winner) && sameSummary && hasStoryItems(other)
+      ? { ...winner, items: other.items }
+      : winner;
+  }
+  const winner = shouldReplaceDuplicate(existing, item)
+    ? { ...existing, ...item }
+    : existing;
+  const detailArticle = selectDetailArticle(existing, item, winner);
+  if (!detailArticle || detailArticle.id === winner.id) return winner;
+  return {
+    ...winner,
+    id: detailArticle.id,
+    items: hasStoryItems(detailArticle) ? detailArticle.items : winner.items,
+  };
+}
+
+export function dedupeNewsArticles(items: NewsArticle[]): NewsArticle[] {
+  // A publisher can correct a story's URL. Collapse stable IDs first so the
+  // same story cannot survive twice under its old and new URLs.
+  const byId = new Map<string, NewsArticle>();
+  for (const item of items) {
+    const existing = byId.get(item.id);
+    byId.set(item.id, existing ? mergeDuplicateArticle(existing, item) : item);
+  }
+  const byKey = new Map<string, NewsArticle>();
+  for (const item of byId.values()) {
+    const key = articleKey(item);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, item);
+      continue;
+    }
+    byKey.set(key, mergeDuplicateArticle(existing, item));
+  }
+  return sortByPublishedAt([...byKey.values()]).slice(0, MAX_ARTICLES);
+}
+
+export function mergeNewsArticle(base: NewsArticle, detail: NewsArticle): NewsArticle {
+  const detailItems = detail.items ?? [];
+  const baseItems = base.items ?? [];
+  const olderDetail = detail.publishedAt < base.publishedAt;
+  return {
+    ...base,
+    ...detail,
+    ...(olderDetail ? base : {}),
+    items: olderDetail && baseItems.length > 0 ? baseItems : detailItems.length > 0 ? detailItems : baseItems,
+  };
+}
+
+export function filterNewsArticlesForQuery(items: NewsArticle[], query: NewsQuery): NewsArticle[] {
+  let filtered = items;
+  if (query.since) {
+    const sinceMs = query.since.getTime();
+    filtered = filtered.filter((item) => item.publishedAt.getTime() > sinceMs);
+  }
+  const topics = query.topics ?? query.categories;
+  if (topics && topics.length > 0) {
+    const topicSet = new Set(topics.map(normalizeNewsCategory));
+    filtered = filtered.filter((item) => (
+      [item.topic, ...item.topics, ...item.categories].some((topic) => topicSet.has(normalizeNewsCategory(topic)))
+    ));
+  }
+  if (query.sectors && query.sectors.length > 0) {
+    const sectorSet = new Set(query.sectors.map(normalizeNewsCategory));
+    filtered = filtered.filter((item) => (
+      [...item.sectors, ...item.categories].some((sector) => sectorSet.has(normalizeNewsCategory(sector)))
+    ));
+  }
+  if (query.sentiment) {
+    filtered = filtered.filter((item) => item.sentiment === query.sentiment);
+  }
+  if (query.minImportance != null) {
+    filtered = filtered.filter((item) => item.scores.importance >= query.minImportance!);
+  }
+  if (query.minUrgency != null) {
+    filtered = filtered.filter((item) => item.scores.urgency >= query.minUrgency!);
+  }
+  if (query.breaking != null) {
+    filtered = filtered.filter((item) => item.isBreaking === query.breaking);
+  }
+  // Page size is a fetch hint. Accumulated load-more results keep MAX_ARTICLES.
+  return filtered.slice(0, MAX_ARTICLES);
+}
+
+/** Words that carry no news of their own: a summary made of them and the headline's words says nothing new. */
+const FILLER_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "from", "by", "with", "as", "into", "onto",
+  "over", "through", "about", "after", "amid", "than", "that", "this", "these", "those", "it", "its", "their", "his",
+  "her", "they", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had", "will", "would", "could",
+  "may", "might", "can", "also", "which", "who", "while", "more", "some",
+]);
+
+/** A word cut to its stem, near enough to match its other forms: seeking and seeks, restricts and restrictions. */
+function wordStem(word: string): string {
+  const bare = word.replace(/['\u2019]s$/, "");
+  let stem = bare.length > 5 ? bare.replace(/(?:ing|ed)$/, "") : bare;
+  stem = stem.length > 3 ? stem.replace(/e?s$/, "") : stem;
+  return stem.length >= 3 ? stem : bare;
+}
+
+function newsWordStems(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+(?:['\u2019][\p{L}]+)?/gu) ?? [])
+    .filter((word) => !FILLER_WORDS.has(word))
+    .map(wordStem);
+}
+
+/** How much of a summary may be words its headline lacks and the summary still only restate it. */
+const RESTATED_NEW_WORDS = 1 / 3;
+
+/**
+ * Whether a story's summary only says its headline again, in other words or
+ * not: at most a third of its words (fillers aside) are words the headline
+ * lacks, in any of their forms. "Apple is seeking to raise about $7 billion
+ * through a bond sale, Bloomberg News reports." restates "Apple seeks about $7
+ * billion from bond sale, Bloomberg News reports"; a summary that adds the
+ * why or the numbers does not.
+ */
+export function summaryRestatesHeadline(title: string, summary: string): boolean {
+  const headline = newsWordStems(title);
+  const words = newsWordStems(summary);
+  if (words.length === 0) return true;
+  const known = (word: string) => headline.some((stem) => stem === word
+    || (Math.min(stem.length, word.length) >= 4 && (stem.startsWith(word) || word.startsWith(stem))));
+  return words.filter((word) => !known(word)).length <= words.length * RESTATED_NEW_WORDS;
+}
+
+/**
+ * A story's summary as one line under its row in a text list (`news`,
+ * `fn CN`): its whitespace and line breaks run together, null when it has
+ * none or only restates the headline (summaryRestatesHeadline).
+ */
+export function newsSummaryLine(article: Pick<NewsArticle, "title" | "summary">): string | null {
+  const summary = article.summary?.replace(/\s+/g, " ").trim();
+  if (!summary || summaryRestatesHeadline(article.title, summary)) return null;
+  return summary;
+}

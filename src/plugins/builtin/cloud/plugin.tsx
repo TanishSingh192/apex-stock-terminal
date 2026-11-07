@@ -1,0 +1,213 @@
+import type { GloomPlugin } from "../../../types/plugin";
+import { apiClient } from "../../../api-client";
+import { createGloomberbCloudCapabilities, createGloomberbCloudProvider } from "../../../sources/gloomberb-cloud";
+import { accountManagementModule } from "../account-management";
+import { buildoutModule } from "../buildout";
+import { chatModule } from "../chat";
+import {
+  CONGRESS_TRADES_PANE_ID,
+  CongressPane,
+} from "../congress-trades/pane";
+import { congressHeadless } from "../congress-trades/headless";
+import { cloudTweetsModule } from "../cloud-tweets";
+import { composeBuiltinPlugin, type PluginModule } from "../plugin-module";
+import { askgConversationListStore } from "./askg/conversation-store";
+import { ASKG_PANE_ID, ASKGPane } from "./askg/pane";
+import { askGloomQuestion, requestASKGPaneAttachment } from "./askg/pending-question";
+import { registerAskGloomPaneHandler } from "../../../ask-gloom/pane-request";
+import { registerCloudAuthCommands } from "./auth-commands";
+import { registerMcpConnectCommand } from "./mcp-connect/command";
+import { registerCloudUpgradeCommand } from "./upgrade-command";
+import { CloudUpgradeStatusWidget } from "./upgrade-status-widget";
+import { registerTrialOfferCommand, TrialOfferStatusWidget } from "./trial-offer-status-widget";
+import { OneTapPrompt } from "./one-tap/one-tap-prompt";
+import { CloudVerificationStatusWidget } from "./verification-status-widget";
+import { createPublicPaneShare } from "../shared/public-pane";
+import { teamModule } from "./team/module";
+import { registerMcpConnectSection } from "./mcp-connect/sections";
+import { TerminalControlSection } from "./terminal-relay/connect-section";
+import { terminalRelayGrants } from "./terminal-relay/grants";
+import { TerminalRelayStatusWidget } from "./terminal-relay/indicator";
+import { thesisModule } from "./thesis/module";
+import { askgLockNote } from "./askg/lock-note";
+
+function createCloudDataModule(): PluginModule {
+  return {
+    capabilities: createGloomberbCloudCapabilities(createGloomberbCloudProvider()),
+    setup(ctx) {
+      ctx.registerSyncTransport({
+        id: "gloomberb-cloud",
+        isAvailable: () => apiClient.getVerifiedSessionIdentity() !== null,
+        pullSnapshot: () => apiClient.getSyncSnapshot(),
+        pushSnapshot: (snapshot, options) => apiClient.putSyncSnapshot(snapshot, options),
+      });
+    },
+    dispose() {
+      apiClient.dispose();
+    },
+  };
+}
+
+/**
+ * Sign-in, upgrade and MCP setup commands, and the email verification,
+ * upgrade and trial prompts, and the hosted terminal's Google One Tap, which
+ * draws nothing in the status bar itself.
+ */
+const cloudAccountModule: PluginModule = {
+  slots: {
+    "status:widget": () => (
+      <>
+        <CloudVerificationStatusWidget />
+        <CloudUpgradeStatusWidget />
+        <TrialOfferStatusWidget />
+        <OneTapPrompt />
+      </>
+    ),
+  },
+  setup: (ctx) => {
+    registerCloudAuthCommands(ctx);
+    registerCloudUpgradeCommand(ctx);
+    registerTrialOfferCommand(ctx);
+    registerMcpConnectCommand(ctx);
+  },
+};
+
+const ASKG_TEMPLATE_ID = "askg-pane";
+
+/** While Ask Gloom is on, every pane offers to be asked about. */
+let removeAskGloomPaneHandler: (() => void) | null = null;
+
+const askgModule: PluginModule = {
+  setup(ctx) {
+    // Only the dragged sidebar width is per device; the conversations
+    // themselves belong to the account and are read from the cloud.
+    askgConversationListStore.attach(ctx.persistence);
+    removeAskGloomPaneHandler?.();
+    removeAskGloomPaneHandler = registerAskGloomPaneHandler((attachment) => {
+      // The pane takes it once it is open: a new conversation with the pane attached.
+      requestASKGPaneAttachment(attachment);
+      ctx.createPaneFromTemplate(ASKG_TEMPLATE_ID);
+    });
+  },
+  dispose() {
+    removeAskGloomPaneHandler?.();
+    removeAskGloomPaneHandler = null;
+  },
+  panes: [{
+    id: ASKG_PANE_ID,
+    reportFreshness: { status: "not-a-feed", basis: "generated answer", local: true },
+    reportLockNote: askgLockNote,
+    // Without a session the wall is all there is, so `fn ASKG` prints it at once.
+    signInWall: true,
+    name: "Ask Gloom",
+    personalData: "messages",
+    icon: "K",
+    component: ASKGPane,
+    defaultPosition: "right",
+    defaultMode: "floating",
+    defaultFloatingSize: { width: 96, height: 32 },
+    portableShare: {
+      // A conversation and the panes it read are personal to the account.
+      private: { title: true, params: true, settings: true, state: true },
+    },
+  }],
+  paneTemplates: [{
+    id: ASKG_TEMPLATE_ID,
+    paneId: ASKG_PANE_ID,
+    label: "Ask Gloom",
+    description: "Ask a question about your panes and watch the tools Gloom runs",
+    keywords: ["ask", "gloom", "assistant", "ai", "question", "askg"],
+    shortcut: { prefix: "ASKG", argPlaceholder: "question", argKind: "text" },
+    createInstance: (_context, options) => {
+      // The question is handed to the pane directly, so it is never persisted
+      // with the layout and never replayed on the next launch.
+      askGloomQuestion(options?.arg ?? "");
+      // One assistant: a second question focuses the conversation already open
+      // and asks there instead of stacking another pane.
+      return { placement: "floating", instanceId: "askg:main" };
+    },
+  }],
+};
+
+/**
+ * Remote control from the Gloom Cloud MCP: which assistants were approved
+ * live with the profile, and the status chip shows one at work. The relay
+ * itself is mounted by the app (terminal-relay/host.tsx) and stays off while
+ * this plugin is.
+ */
+let removeTerminalControlSection: (() => void) | null = null;
+
+const terminalRelayModule: PluginModule = {
+  slots: {
+    "status:widget": () => <TerminalRelayStatusWidget />,
+  },
+  setup(ctx) {
+    terminalRelayGrants.attach(ctx.persistence);
+    removeTerminalControlSection?.();
+    removeTerminalControlSection = registerMcpConnectSection({
+      id: "terminal-control",
+      order: 10,
+      Component: TerminalControlSection,
+    });
+  },
+  dispose() {
+    removeTerminalControlSection?.();
+    removeTerminalControlSection = null;
+    terminalRelayGrants.detach();
+  },
+};
+
+const congressTradesModule: PluginModule = {
+  panes: [{
+    id: CONGRESS_TRADES_PANE_ID,
+    name: "Congress",
+    icon: "G",
+    component: CongressPane,
+    defaultPosition: "right",
+    defaultMode: "floating",
+    defaultFloatingSize: { width: 112, height: 30 },
+    tableExport: true,
+  }],
+  paneTemplates: [{
+    id: "congress-trades-pane",
+    paneId: CONGRESS_TRADES_PANE_ID,
+    label: "Congress Trades",
+    description: "Track newly disclosed House and Senate periodic transaction reports.",
+    keywords: ["congress", "house", "senate", "trades", "ptr", "stock", "disclosures"],
+    shortcut: { prefix: "CG", argPlaceholder: "ticker", argKind: "ticker", argOptional: true },
+    headless: congressHeadless,
+    createInstance: (_context, options) => {
+      const symbol = (options?.symbol ?? options?.arg)?.trim().toUpperCase();
+      return symbol
+        ? { instanceId: `${CONGRESS_TRADES_PANE_ID}:${symbol}`, title: `Congress ${symbol}`, placement: "floating", settings: { ticker: symbol } }
+        : { placement: "floating" };
+    },
+    publicShare: createPublicPaneShare("Congress Trades"),
+  }],
+};
+
+export function createGloomberbCloudPlugin(): GloomPlugin {
+  return composeBuiltinPlugin({
+    id: "gloomberb-cloud",
+    name: "Gloom Cloud",
+    version: "1.0.0",
+    description: "Free market, macro, and chat services. Chat requires signup.",
+    toggleable: true,
+    order: 10,
+    // TheBuildout's panes read its API directly.
+    hosts: ["api.thebuildout.ai"],
+    modules: [
+      createCloudDataModule(),
+      chatModule,
+      teamModule,
+      thesisModule,
+      accountManagementModule,
+      cloudAccountModule,
+      askgModule,
+      terminalRelayModule,
+      buildoutModule,
+      congressTradesModule,
+      cloudTweetsModule,
+    ],
+  });
+}

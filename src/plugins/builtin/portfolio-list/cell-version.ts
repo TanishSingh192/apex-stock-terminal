@@ -1,0 +1,81 @@
+import type { ColumnContext } from "../../../portfolio/column-values";
+
+const DAY_MS = 86_400_000;
+
+// What each column reads from the context besides the pane's collection and
+// base currency. A quote tick changes one row's financials; these keep an FX
+// refresh, a new portfolio total or a clock tick from recomputing every cell.
+const FX_COLUMN_IDS = new Set([
+  "dollar_volume",
+  "market_cap",
+  "cost_basis",
+  "mkt_value",
+  "weight",
+  "drift",
+  "trade",
+  "trade_value",
+  "day_pnl",
+  "pnl",
+  "pnl_pct",
+]);
+/** Columns that divide by the portfolio's total. */
+const ALLOCATION_COLUMN_IDS = new Set(["weight", "drift", "trade", "trade_value"]);
+/** Columns read at the price the pane values at: the latest print or the regular close. */
+const VALUATION_COLUMN_IDS = new Set([
+  "mkt_value", "weight", "drift", "trade", "trade_value", "day_pnl", "pnl", "pnl_pct", "as_of",
+]);
+// DIV% reads the corporate actions to measure a trailing yield and to tell a dividend that stopped, which a day can change.
+const SUPPLEMENTAL_COLUMN_IDS = new Set(["target", "target_pct", "rating", "ex_div", "next_earn", "dividend_yield"]);
+const DAY_CLOCK_COLUMN_IDS = new Set(["held", "ex_div", "next_earn", "as_of", "dividend_yield"]);
+export const PERPETUAL_COLUMN_IDS: ReadonlySet<string> = new Set(["perp_premium", "perp_funding"]);
+/** Columns a future's contract size or settlement moves: its quantity, its value, and at the close its Last. */
+const FUTURES_TERMS_COLUMN_IDS = new Set([
+  ...VALUATION_COLUMN_IDS, "shares", "cost_basis", "avg_cost", "price", "change", "change_pct",
+]);
+
+const exchangeRateVersions = new WeakMap<ReadonlyMap<string, number>, string>();
+
+/** Content version: a rebuilt map with the same rates is the same version. */
+function exchangeRatesVersion(rates: ReadonlyMap<string, number>): string {
+  const cached = exchangeRateVersions.get(rates);
+  if (cached != null) return cached;
+  const version = [...rates]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([currency, rate]) => `${currency}:${rate}`)
+    .join(",");
+  exchangeRateVersions.set(rates, version);
+  return version;
+}
+
+const targetVersions = new WeakMap<Readonly<Record<string, number>>, string>();
+
+function targetsVersion(targets: Readonly<Record<string, number>> | undefined): string {
+  if (!targets) return "";
+  let version = targetVersions.get(targets);
+  if (version == null) {
+    version = Object.entries(targets).sort(([left], [right]) => left.localeCompare(right)).map(([symbol, weight]) => `${symbol}:${weight}`).join(",");
+    targetVersions.set(targets, version);
+  }
+  return version;
+}
+
+export function columnContextVersion(columnId: string, ctx: ColumnContext): string {
+  let version = `${ctx.activeTab ?? ""}|${ctx.baseCurrency}`;
+  if (FX_COLUMN_IDS.has(columnId)) version += `|${exchangeRatesVersion(ctx.exchangeRates)}`;
+  if (ALLOCATION_COLUMN_IDS.has(columnId)) version += `|${ctx.portfolioWeightBase ?? 0}`;
+  if (VALUATION_COLUMN_IDS.has(columnId)) version += `|${ctx.valuationBasis ?? "latest-print"}`;
+  if (ALLOCATION_COLUMN_IDS.has(columnId) || columnId === "target_weight") version += `|${targetsVersion(ctx.portfolioTargets)}`;
+  if (SUPPLEMENTAL_COLUMN_IDS.has(columnId)) version += `|${ctx.supplementalVersion ?? 0}`;
+  if (PERPETUAL_COLUMN_IDS.has(columnId)) version += `|${ctx.perpetualsVersion ?? 0}`;
+  if (FUTURES_TERMS_COLUMN_IDS.has(columnId)) version += `|${ctx.futuresTermsVersion ?? 0}`;
+  if (columnId === "pnl" || columnId === "pnl_pct") version += `|${ctx.periodPnl ? ctx.periodPnlVersion ?? 0 : "cost"}`;
+  if (columnId === "ticker") version += `|${ctx.homeMarket ?? ""}`;
+  if (columnId === "latency") version += `|${ctx.now}`;
+  if (DAY_CLOCK_COLUMN_IDS.has(columnId)) version += `|${Math.floor(ctx.now / DAY_MS)}`;
+  return version;
+}
+
+export function columnUsesClock(columnId: string): "age" | "day" | null {
+  if (columnId === "latency") return "age";
+  return DAY_CLOCK_COLUMN_IDS.has(columnId) ? "day" : null;
+}

@@ -1,0 +1,743 @@
+import { Box, ContextMenuProvider, useNativeRenderer, useRendererHost, useUiHost } from "./ui";
+import { ToastViewport, useToastHost } from "./ui/toast";
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore, type Dispatch, type ReactNode } from "react";
+import {
+  AppProvider,
+  getFocusedTickerSymbol,
+  useAppDispatch,
+  useAppSelector,
+  useAppStateRef,
+  type AppState,
+} from "./state/app/context";
+import type { AppAction } from "./core/state/app/state";
+import { bindAppActivity, isAppVisible, subscribeAppVisibility, useAppActive, useAppVisible } from "./state/app/activity";
+import { Header } from "./components/layout/header";
+import { StatusBar } from "./components/layout/status-bar";
+import { useAppChromeShown } from "./components/layout/presentation";
+import { useLinkedLayoutSync } from "./layout-marketplace/linked-sync";
+import { useTeamCollectionsSync } from "./team/collections-sync";
+import { Shell } from "./components/layout/shell";
+import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
+import { TransientLayoutProvider } from "./components/layout/transient-layout";
+import { CommandBar } from "./components/command-bar/surface";
+import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
+import { useRunSetupAgain } from "./components/onboarding/run-setup-again";
+import { CompanyPickerHost } from "./plugins/builtin/cloud/company-picker";
+import { TerminalRelayHost } from "./plugins/builtin/cloud/terminal-relay/host";
+import { SignInGate } from "./components/sign-in-gate";
+import { useDialog } from "./ui/dialog";
+import { PluginRegistry } from "./plugins/registry";
+import type { LoadedExternalPlugin } from "./plugins/loader";
+import type { AppServicesFactory, AppTickerRepositoryPort } from "./core/app-service-ports";
+import { useThemeColors } from "./theme/theme-context";
+import type { AppConfig } from "./types/config";
+import type { DesktopDeepLinkBridge } from "./types/desktop-deeplink";
+import type { AppNotificationRequest, CliLaunchRequest, GloomPlugin } from "./types/plugin";
+import type { DataProvider } from "./types/data-provider";
+import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "./types/desktop-window";
+import type { DesktopApplicationMenuBridge } from "./types/desktop-menu";
+import { isPaneInLayout, type LayoutBounds } from "./layout/pane-manager";
+import type { AppSessionSnapshot } from "./core/state/session-persistence";
+import type { MarketDataCoordinator } from "./market-data/coordinator";
+import { createAppNotifier } from "./notifications/app-notifier";
+import { attachSeenPaneNotices } from "./components/pane-notice-seen";
+import { attachNotificationLog } from "./notifications/notification-log";
+import { attachListingIndex } from "./tickers/search/listing-index";
+import { useBrokerImportRuntime } from "./app/runtime/broker-import";
+import { useDesktopDeepLinkRuntime } from "./app/runtime/desktop-deeplink";
+import { useDesktopApplicationMenuRuntime } from "./app/runtime/desktop-menu";
+import { useAppGlobalShortcuts } from "./app/global-shortcuts";
+import { AppDialogBridge } from "./app/dialog-bridge";
+import { KeybindingsProvider, useResolvedKeybindings } from "./app/keybindings";
+import { useAppPaneRuntime } from "./app/pane-runtime";
+import { bindPluginRegistryRuntimeAccess } from "./app/runtime/plugin-bindings";
+import { useAppStartupRuntime } from "./app/runtime/startup";
+import { useTickerRefreshRuntime } from "./app/runtime/ticker-refresh";
+import { useAppUpdateRuntime } from "./app/runtime/update";
+import { resolveUpdateChannel } from "./updater/channel";
+import { createCoreSyncContributors } from "./sync/core-contributors";
+import { useCloudSyncRuntime } from "./sync/react";
+import { changesOtherWindowTabs, withOtherWindowTabs, withoutOtherWindowTabs } from "./sync/other-window-tabs";
+import { getDesktopWindows } from "./state/desktop-windows";
+import type { OtherWindowTab } from "./types/desktop-window";
+import { RemoteControlHost, type RemoteControlAdapter } from "./remote/app-host";
+import { RemoteUiRegistryProvider } from "./remote/semantic-tree";
+import {
+  resolveAppSessionSnapshot,
+  resolveCliLaunchConfig,
+  resolveInitialAppConfig,
+} from "./app/app-bootstrap-state";
+import { saveConfigImmediately, scheduleConfigSave } from "./state/config-save-scheduler";
+import { LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS } from "./state/persist-scheduler";
+import { savedLayoutsDifferOnlyInMirror } from "./core/state/app/layout";
+import { measurePerf } from "./utils/perf-marks";
+import { useAppLanguage } from "./i18n/react";
+import { AppLanguageConfigObserver } from "./app/language-observer";
+import { isPaneShareHandoff } from "./shares/location";
+import { apiClient } from "./api-client";
+import { reportTelemetryConfig } from "./telemetry/live-config";
+import { AttentionCountsNotice } from "./app/attention-notice";
+import { recordFunctionOpen } from "./telemetry/usage-counts";
+import { logFailure } from "./utils/log-failure";
+
+const EMPTY_EXTERNAL_PLUGINS: LoadedExternalPlugin[] = [];
+
+interface AppInnerProps {
+  externalPlugins: readonly LoadedExternalPlugin[];
+  pluginRegistry: PluginRegistry;
+  tickerRepository: AppTickerRepositoryPort;
+  dataProvider: DataProvider;
+  marketData: MarketDataCoordinator;
+  sessionSnapshot?: AppSessionSnapshot | null;
+  desktopWindowBridge?: DesktopWindowBridge;
+  desktopApplicationMenuBridge?: DesktopApplicationMenuBridge;
+  desktopDeepLinkBridge?: DesktopDeepLinkBridge;
+  remoteControlAdapter?: RemoteControlAdapter;
+  updatesEnabled?: boolean;
+  onboardingActive?: boolean;
+  onOnboardingComplete?: (config: AppConfig) => void | Promise<void>;
+  /** Shows setup again once Run Setup Again has saved its progress; absent where setup cannot run. */
+  onRunSetupAgain?: () => void;
+  /** Hosted browser terminal: nothing is reachable until a session exists. */
+  signInGateActive?: boolean;
+  /** Fires once the startup state is in place and the first real layout can paint. */
+  onInitialized?: () => void;
+  /** Settles once every plugin has registered, setup included. */
+  pluginsReady?: Promise<unknown>;
+}
+
+function ThemedAppRoot({ children }: { children: ReactNode }) {
+  const themeColors = useThemeColors();
+  return (
+    <Box
+      flexDirection="column"
+      flexGrow={1}
+      flexShrink={1}
+      flexBasis={0}
+      minWidth={0}
+      minHeight={0}
+      overflow="hidden"
+      backgroundColor={themeColors.bg}
+    >
+      {children}
+    </Box>
+  );
+}
+
+const noOtherWindowTabs = (): readonly OtherWindowTab[] => NO_OTHER_WINDOW_TABS;
+const NO_OTHER_WINDOW_TABS: readonly OtherWindowTab[] = [];
+const noSubscription = () => () => {};
+
+function AppInner({
+  externalPlugins,
+  pluginRegistry,
+  tickerRepository,
+  dataProvider,
+  marketData,
+  sessionSnapshot = null,
+  desktopWindowBridge,
+  desktopApplicationMenuBridge,
+  desktopDeepLinkBridge,
+  remoteControlAdapter,
+  updatesEnabled = true,
+  onboardingActive = false,
+  onOnboardingComplete,
+  onRunSetupAgain,
+  signInGateActive = false,
+  onInitialized,
+  pluginsReady,
+}: AppInnerProps) {
+  const dispatch = useAppDispatch();
+  const stateRef = useAppStateRef();
+  const getRemoteState = useCallback(() => stateRef.current, [stateRef]);
+  useLinkedLayoutSync(pluginRegistry);
+  const config = useAppSelector((state) => state.config);
+  // Telemetry switches apply as soon as they change, not at the next launch.
+  useEffect(() => {
+    reportTelemetryConfig(config.telemetry);
+  }, [config.telemetry]);
+  const tickers = useAppSelector((state) => state.tickers);
+  const paneState = useAppSelector((state) => state.paneState);
+  const focusedPaneId = useAppSelector((state) => state.focusedPaneId);
+  const initialized = useAppSelector((state) => state.initialized);
+  const onInitializedRef = useRef(onInitialized);
+  onInitializedRef.current = onInitialized;
+  useEffect(() => {
+    if (initialized) onInitializedRef.current?.();
+  }, [initialized]);
+  const commandBarOpen = useAppSelector((state) => state.commandBarOpen);
+  const inputCaptured = useAppSelector((state) => state.inputCaptured);
+  const updateAvailable = useAppSelector((state) => state.updateAvailable);
+  const updateProgress = useAppSelector((state) => state.updateProgress);
+  const updateCheckInProgress = useAppSelector((state) => state.updateCheckInProgress);
+  const state = useMemo(() => ({
+    ...stateRef.current,
+    config,
+    tickers,
+    paneState,
+    focusedPaneId,
+    initialized,
+    commandBarOpen,
+    inputCaptured,
+    updateAvailable,
+    updateProgress,
+    updateCheckInProgress,
+  }) as AppState, [
+    commandBarOpen,
+    config,
+    focusedPaneId,
+    initialized,
+    inputCaptured,
+    paneState,
+    stateRef,
+    tickers,
+    updateAvailable,
+    updateCheckInProgress,
+    updateProgress,
+  ]);
+  // Cloud sync in the desktop app's main window pushes and pulls every
+  // window's tabs, not only its own (sync/other-window-tabs.ts). The same
+  // state, getter and dispatch with one window and everywhere else.
+  const desktopWindows = getDesktopWindows();
+  const otherWindowTabs = useSyncExternalStore(
+    desktopWindows?.subscribe ?? noSubscription,
+    desktopWindows?.otherWindowTabs ?? noOtherWindowTabs,
+  );
+  const otherWindowTabsRef = useRef(otherWindowTabs);
+  otherWindowTabsRef.current = otherWindowTabs;
+  const syncState = useMemo(() => withOtherWindowTabs(state, otherWindowTabs), [state, otherWindowTabs]);
+  const getSyncState = useCallback(() => withOtherWindowTabs(stateRef.current, otherWindowTabsRef.current), [stateRef]);
+  const syncDispatch = useCallback<Dispatch<AppAction>>((action) => {
+    if (action.type !== "SET_CONFIG") {
+      dispatch(action);
+      return;
+    }
+    const others = otherWindowTabsRef.current;
+    if (changesOtherWindowTabs(action.config, others)) void saveConfigImmediately(action.config);
+    dispatch({ ...action, config: withoutOtherWindowTabs(action.config, others, stateRef.current.config) });
+  }, [dispatch, stateRef]);
+  const appActive = useAppActive();
+  const appVisible = useAppVisible();
+  const appActiveRef = useRef(appActive);
+  const rendererHost = useRendererHost();
+  const dialog = useDialog();
+  const toast = useToastHost();
+  const isDetachedWindow = desktopWindowBridge?.kind === "detached";
+  // The main desktop window does the app-wide work (account sync, update
+  // checks, launch notices, background alerts); a popped-out pane's window
+  // and every other full window leave it to it.
+  const appWideWorkElsewhere = isDetachedWindow || desktopWindowBridge?.primary === false;
+  // Not while setup is already showing.
+  const runSetupAgain = useRunSetupAgain(onboardingActive ? undefined : onRunSetupAgain);
+  const detachedPaneId = isDetachedWindow ? desktopWindowBridge.paneId ?? null : null;
+  const focusDetachedPane = useMemo(() => {
+    const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
+    return focus ? (paneId: string) => { void focus(paneId).catch(logFailure("app", "Focus detached pane window failed")); } : undefined;
+  }, [desktopWindowBridge]);
+  const [desktopDockPreview, setDesktopDockPreview] = useState<DesktopDockPreviewState | null>(null);
+  const [commandBarNativeOccluder, setCommandBarNativeOccluder] = useState<LayoutBounds | null>(null);
+  appActiveRef.current = appActive;
+  const appNotifier = useMemo(() => createAppNotifier({
+    isAppActive: () => appActiveRef.current,
+    renderToast: (notification) => {
+      const type = notification.type ?? "info";
+      let toastId: string | number | undefined;
+      const dismissAfter = (run: () => void) => () => {
+        try {
+          run();
+        } finally {
+          if (toastId != null) toast.dismiss(toastId);
+        }
+      };
+      const options = {
+        title: notification.title,
+        subtitle: notification.subtitle,
+        duration: notification.persistent ? 0 : notification.duration,
+        action: notification.action
+          ? {
+            label: notification.action.label,
+            onClick: dismissAfter(() => notification.action?.onClick()),
+          }
+          : undefined,
+        secondaryAction: notification.secondaryAction
+          ? {
+            label: notification.secondaryAction.label,
+            onClick: dismissAfter(() => notification.secondaryAction?.onClick()),
+          }
+          : undefined,
+        onShown: notification.onShown,
+      };
+      if (type === "success") toastId = toast.success(notification.body, options);
+      else if (type === "error") toastId = toast.error(notification.body, options);
+      else toastId = toast.info(notification.body, options);
+    },
+    desktop: rendererHost.supportsNativeDesktopNotifications ? rendererHost : undefined,
+  }), [rendererHost, toast]);
+  const notify = useCallback((body: string, options?: { type?: "info" | "success" | "error" }) => {
+    pluginRegistry.notify({ body, ...options });
+  }, [pluginRegistry]);
+  const notifyRequest = useCallback((request: AppNotificationRequest) => {
+    pluginRegistry.notify(request);
+  }, [pluginRegistry]);
+
+  useEffect(() => {
+    // Popped-out panes dock into the main window only.
+    if (desktopWindowBridge?.kind !== "main" || appWideWorkElsewhere || !desktopWindowBridge.subscribeDockPreview) return;
+    return desktopWindowBridge.subscribeDockPreview((preview) => {
+      setDesktopDockPreview(preview);
+    });
+  }, [appWideWorkElsewhere, desktopWindowBridge]);
+
+  // Another window asked this one to show one of its panes: a link followed, a pane found.
+  useEffect(() => {
+    const windows = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.windows : undefined;
+    if (!windows) return;
+    return windows.subscribeFocusRequests((paneId) => {
+      if (isPaneInLayout(stateRef.current.config.layout, paneId)) pluginRegistry.focusPane(paneId);
+    });
+  }, [desktopWindowBridge, pluginRegistry, stateRef]);
+
+  useEffect(() => {
+    const disposers = createCoreSyncContributors().map((contributor) => (
+      pluginRegistry.registerSyncContributorForPlugin("core", contributor)
+    ));
+    return () => {
+      for (const dispose of disposers) dispose();
+    };
+  }, [pluginRegistry]);
+
+  const {
+    primeCachedFinancials,
+    refreshQuote,
+    refreshQuotesBatch,
+    refreshTicker,
+    refreshTickersBatch,
+  } = useTickerRefreshRuntime({
+    appVisible,
+    baseCurrency: state.config.baseCurrency,
+    dispatch,
+    marketData,
+    pluginRegistry,
+    tickers: state.tickers,
+  });
+
+  const { importBrokerPositions, autoImportBrokerPositions } = useBrokerImportRuntime({
+    dispatch,
+    pluginRegistry,
+    refreshQuote,
+    stateRef,
+    tickerRepository,
+  });
+
+  const { restartToApplyUpdate, runUpdateCheck, runUpdateCommand, startUpdate } = useAppUpdateRuntime({
+    enabled: updatesEnabled,
+    dispatch,
+    isDetachedWindow: appWideWorkElsewhere,
+    pluginRegistry,
+    stateRef,
+    updateAvailable: state.updateAvailable,
+    updateChannel: resolveUpdateChannel(state.config),
+    updateCheckInProgress: state.updateCheckInProgress,
+    updateProgress: state.updateProgress,
+  });
+
+  useDesktopApplicationMenuRuntime({
+    desktopApplicationMenuBridge,
+    desktopWindowKind: desktopWindowBridge?.kind,
+    dispatch,
+    pluginRegistry,
+    rendererHost,
+    runUpdateCheck,
+    stateRef,
+  });
+
+  useDesktopDeepLinkRuntime({
+    desktopDeepLinkBridge,
+    desktopWindowKind: desktopWindowBridge?.kind,
+    dispatch,
+    // The browser bridge re-emits from the URL on subscribe and nothing rewrites
+    // it, so a `?layout=` / `?share=` intent survives the gate and lands once a
+    // session exists. Running it earlier would only 401 behind the scrim.
+    initialized: state.initialized && !signInGateActive,
+    pluginRegistry,
+    stateRef,
+  });
+
+  const focusedTickerSymbol = getFocusedTickerSymbol(state);
+  useAppStartupRuntime({
+    appActive,
+    autoImportBrokerPositions,
+    importBrokerPositions,
+    dataProvider,
+    dispatch,
+    externalPlugins,
+    focusedTickerSymbol,
+    getState: getRemoteState,
+    isDetachedWindow: appWideWorkElsewhere,
+    marketData,
+    pluginRegistry,
+    pluginsReady,
+    primeCachedFinancials,
+    refreshQuote,
+    refreshQuotesBatch,
+    refreshTicker,
+    refreshTickersBatch,
+    sessionSnapshot,
+    state,
+    tickerRepository,
+  });
+
+  bindPluginRegistryRuntimeAccess({
+    dataProvider,
+    dispatch,
+    importBrokerPositions,
+    marketData,
+    pluginRegistry,
+    stateRef,
+    tickerRepository,
+  });
+
+  useCloudSyncRuntime({
+    state: syncState,
+    getState: getSyncState,
+    dispatch: syncDispatch,
+    tickerRepository,
+    pluginRegistry,
+    appActive,
+    // Keep a first-run workspace stable while the local guide is active. Once
+    // onboarding finishes, the normal pull-before-push sync starts immediately.
+    initialized: state.initialized
+      && !appWideWorkElsewhere
+      && !onboardingActive
+      && !signInGateActive,
+  });
+
+  const persistConfig = useCallback((nextConfig: AppState["config"]) => {
+    scheduleConfigSave(nextConfig);
+  }, []);
+  useTeamCollectionsSync({ persistConfig, tickerRepository });
+
+  useAppPaneRuntime({
+    dataProvider,
+    detachedPaneId,
+    dialog,
+    dispatch,
+    externalPlugins,
+    focusDetachedPane,
+    isDetachedWindow,
+    notify,
+    persistConfig,
+    pluginRegistry,
+    state,
+    stateRef,
+    tickerRepository,
+  });
+
+  // Wire up app-level notifications.
+  pluginRegistry.bindHost({ notify: appNotifier.notify });
+  // Missed alerts live in this device's state store. Any other desktop window
+  // keeps its own in memory rather than overwrite the main window's.
+  useEffect(() => (
+    appWideWorkElsewhere ? undefined : attachNotificationLog(pluginRegistry.persistence.pluginState)
+  ), [appWideWorkElsewhere, pluginRegistry]);
+  // Data warnings the user has opened stay muted across restarts, the same way.
+  useEffect(() => (
+    appWideWorkElsewhere ? undefined : attachSeenPaneNotices(pluginRegistry.persistence.pluginState)
+  ), [appWideWorkElsewhere, pluginRegistry]);
+  // The listings a typed symbol names before search answers. Every window reads
+  // them; the main window keeps what search answers and, while it can be seen,
+  // refreshes the shipped ones.
+  useEffect(() => attachListingIndex({
+    pluginState: pluginRegistry.persistence.pluginState,
+    writable: !appWideWorkElsewhere,
+    searchBatch: dataProvider.searchBatch ? (queries, options) => dataProvider.searchBatch!(queries, options) : null,
+    visibility: { isVisible: isAppVisible, subscribe: subscribeAppVisibility },
+  }), [appWideWorkElsewhere, dataProvider, pluginRegistry]);
+
+  // Persist layout changes (switching, saving, deleting, renaming layouts).
+  // The saved layouts also mirror live pane state and focus, so they change on
+  // every cursor move; those updates are written on the low-priority delay
+  // rather than paying a full config serialization per keystroke.
+  const prevLayouts = useRef(state.config.layouts);
+  useEffect(() => {
+    if (state.config.layouts === prevLayouts.current) return;
+    const mirrorOnly = savedLayoutsDifferOnlyInMirror(prevLayouts.current, state.config.layouts);
+    prevLayouts.current = state.config.layouts;
+    scheduleConfigSave(
+      () => stateRef.current.config,
+      mirrorOnly ? { delayMs: LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS } : {},
+    );
+  }, [state.config.layouts, state.config, stateRef]);
+
+  // Emit ticker:selected events based on focused pane context.
+  const prevSelectedRef = useRef(focusedTickerSymbol);
+  useEffect(() => {
+    if (focusedTickerSymbol !== prevSelectedRef.current) {
+      pluginRegistry.events.emit("ticker:selected", {
+        symbol: focusedTickerSymbol,
+        previous: prevSelectedRef.current,
+      });
+      prevSelectedRef.current = focusedTickerSymbol;
+    }
+  }, [focusedTickerSymbol]);
+
+  const chrome = useAppChromeShown();
+  const keybindingHost = useUiHost().kind === "opentui" ? "terminal" : "desktop";
+  const keybindings = useResolvedKeybindings(state.config.keybindings, keybindingHost);
+  useAppGlobalShortcuts({
+    dispatch,
+    focusedTickerSymbol,
+    isDetachedWindow,
+    keybindings,
+    pluginRegistry,
+    refreshTicker,
+    restartToApplyUpdate,
+    startUpdate,
+    state,
+  });
+
+  if (desktopWindowBridge?.kind === "detached" && desktopWindowBridge.paneId) {
+    return (
+      <KeybindingsProvider value={keybindings}>
+        <AppDialogBridge />
+        <ContextMenuProvider pluginRegistry={pluginRegistry}>
+          <RemoteControlHost
+            adapter={remoteControlAdapter}
+            dispatch={dispatch}
+            getState={getRemoteState}
+            pluginRegistry={pluginRegistry}
+            desktopWindowBridge={desktopWindowBridge}
+          >
+            <ThemedAppRoot>
+              <DetachedPaneShell
+                pluginRegistry={pluginRegistry}
+                desktopWindowBridge={{ ...desktopWindowBridge, kind: "detached", paneId: desktopWindowBridge.paneId }}
+              />
+              <ToastViewport position="bottom-right" />
+            </ThemedAppRoot>
+          </RemoteControlHost>
+        </ContextMenuProvider>
+      </KeybindingsProvider>
+    );
+  }
+
+  return (
+    <KeybindingsProvider value={keybindings}>
+    <AppDialogBridge />
+    <ContextMenuProvider pluginRegistry={pluginRegistry}>
+      <RemoteControlHost
+        adapter={remoteControlAdapter}
+        dispatch={dispatch}
+        getState={getRemoteState}
+        pluginRegistry={pluginRegistry}
+        desktopWindowBridge={desktopWindowBridge}
+      >
+        <ThemedAppRoot>
+          {chrome.header && (
+            <Header
+              onOpenHelp={() => {
+                recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
+                pluginRegistry.showPane("help");
+              }}
+              onRestartForUpdate={updatesEnabled && !isDetachedWindow ? restartToApplyUpdate : undefined}
+            />
+          )}
+          <TransientLayoutProvider>
+            <Shell
+              pluginRegistry={pluginRegistry}
+              dataProvider={dataProvider}
+              tickerRepository={tickerRepository}
+              desktopWindowBridge={desktopWindowBridge}
+              desktopDockPreview={desktopDockPreview}
+              commandBarNativeOccluder={commandBarNativeOccluder}
+            />
+            <StatusBar />
+          </TransientLayoutProvider>
+          {!onboardingActive ? <CompanyPickerHost pluginRegistry={pluginRegistry} /> : null}
+          {initialized && !onboardingActive && !signInGateActive ? <AttentionCountsNotice notify={notifyRequest} /> : null}
+          <TerminalRelayHost device={remoteControlAdapter?.terminalDevice} />
+          {onboardingActive && onOnboardingComplete ? (
+            <OnboardingWizard
+              pluginRegistry={pluginRegistry}
+              importBrokerPositions={importBrokerPositions}
+              onComplete={onOnboardingComplete}
+            />
+          ) : null}
+          {signInGateActive ? <SignInGate /> : null}
+          {state.commandBarOpen && (
+            <CommandBar
+              dataProvider={dataProvider}
+              tickerRepository={tickerRepository}
+              pluginRegistry={pluginRegistry}
+              quitApp={() => rendererHost.requestExit()}
+              onCheckForUpdates={updatesEnabled ? runUpdateCommand : undefined}
+              onRunSetupAgain={runSetupAgain}
+              onNativeOccluderChange={setCommandBarNativeOccluder}
+            />
+          )}
+          <ToastViewport position="bottom-right" />
+        </ThemedAppRoot>
+      </RemoteControlHost>
+    </ContextMenuProvider>
+    </KeybindingsProvider>
+  );
+}
+
+interface AppProps {
+  config: AppConfig;
+  servicesFactory: AppServicesFactory;
+  externalPlugins?: LoadedExternalPlugin[];
+  plugins: readonly GloomPlugin[];
+  cliLaunchRequest?: CliLaunchRequest | null;
+  desktopWindowBridge?: DesktopWindowBridge;
+  desktopApplicationMenuBridge?: DesktopApplicationMenuBridge;
+  desktopDeepLinkBridge?: DesktopDeepLinkBridge;
+  desktopSnapshot?: DesktopSharedStateSnapshot | null;
+  desktopThemePreview?: DesktopThemePreviewState | null;
+  remoteControlAdapter?: RemoteControlAdapter;
+  updatesEnabled?: boolean;
+  /**
+   * Requires a Gloom Cloud session before the app is usable. The hosted browser
+   * terminal sets this; desktop and the TUI keep sign-in optional.
+   */
+  requireSignIn?: boolean;
+  /**
+   * Settings can open setup again (Run Setup Again). The browser keeps no
+   * setup progress, so it turns this off.
+   */
+  setupEnabled?: boolean;
+  /** Fires once the startup state is in place and the first real layout can paint. */
+  onInitialized?: () => void;
+}
+
+export function App({
+  config: initialConfig,
+  servicesFactory,
+  externalPlugins: providedExternalPlugins,
+  plugins,
+  cliLaunchRequest = null,
+  desktopWindowBridge,
+  desktopApplicationMenuBridge,
+  desktopDeepLinkBridge,
+  desktopSnapshot = null,
+  desktopThemePreview = null,
+  remoteControlAdapter,
+  updatesEnabled = true,
+  requireSignIn = false,
+  setupEnabled = true,
+  onInitialized,
+}: AppProps) {
+  useAppLanguage();
+  const externalPlugins = providedExternalPlugins ?? EMPTY_EXTERNAL_PLUGINS;
+  const renderer = useNativeRenderer();
+  const effectiveInitialConfig = useMemo(() => {
+    return resolveInitialAppConfig({
+      initialConfig,
+      desktopSnapshot,
+      hasDesktopWindowBridge: !!desktopWindowBridge,
+    });
+  }, [desktopSnapshot, desktopWindowBridge, initialConfig]);
+  const initialCliLaunch = useMemo(() => {
+    return resolveCliLaunchConfig({
+      cliLaunchRequest,
+      config: effectiveInitialConfig,
+      terminalWidth: renderer.terminalWidth,
+      terminalHeight: renderer.terminalHeight,
+    });
+  }, [cliLaunchRequest, effectiveInitialConfig, renderer.terminalHeight, renderer.terminalWidth]);
+  const cliLaunchStateRef = useRef(initialCliLaunch.launchState);
+
+  const [config, setConfig] = useState(() => {
+    return initialCliLaunch.config;
+  });
+  // Only the surfaces that require a session subscribe, so desktop and the
+  // terminal keep their current render profile.
+  const [signedIn, setSignedIn] = useState(() => !requireSignIn || apiClient.isSignedIn());
+  useEffect(() => {
+    if (!requireSignIn) return;
+    const sync = () => setSignedIn(apiClient.isSignedIn());
+    sync();
+    return apiClient.subscribeCurrentUser(sync);
+  }, [requireSignIn]);
+  const signInGateActive = requireSignIn && !signedIn;
+  const shareHandoff = isPaneShareHandoff();
+  // Setup runs in the main window only.
+  const [showOnboarding, setShowOnboarding] = useState(() => (
+    desktopWindowBridge?.kind !== "detached"
+    && desktopWindowBridge?.primary !== false
+    && !shareHandoff
+    && (!effectiveInitialConfig.onboardingComplete || !!effectiveInitialConfig.onboardingProgress)
+  ));
+
+  const showSetup = useCallback(() => setShowOnboarding(true), []);
+
+  useEffect(() => bindAppActivity(renderer), [renderer]);
+
+  const services = useMemo(() => {
+    return measurePerf("startup.app.create-services", () => (
+      servicesFactory({
+        config,
+        plugins,
+        externalPlugins,
+      })
+    ), {
+      externalPluginCount: externalPlugins.length,
+      disabledPluginCount: config.disabledPlugins.length,
+      brokerInstanceCount: config.brokerInstances.length,
+    });
+  }, [config.dataDir, externalPlugins, plugins, servicesFactory]);
+
+  useEffect(() => {
+    return () => services.destroy();
+  }, [services]);
+
+  const sessionSnapshot = useMemo(() => {
+    return resolveAppSessionSnapshot({
+      cliLaunchRequest,
+      config,
+      cliLaunchState: cliLaunchStateRef.current,
+      desktopSnapshot,
+      desktopWindowKind: desktopWindowBridge?.kind,
+      sessionStore: services.persistence.sessions,
+    });
+  }, [cliLaunchRequest, config, desktopSnapshot, desktopWindowBridge?.kind, services.persistence.sessions]);
+
+  return (
+    <RemoteUiRegistryProvider>
+      <AppProvider
+        config={config}
+        sessionStore={desktopWindowBridge?.kind === "detached" || desktopWindowBridge?.primary === false
+          ? undefined
+          : services.persistence.sessions}
+        sessionSnapshot={sessionSnapshot}
+        desktopBridge={desktopWindowBridge}
+        desktopSnapshot={desktopSnapshot}
+        initialThemePreview={desktopThemePreview}
+      >
+        <AppLanguageConfigObserver />
+        <AppInner
+          externalPlugins={externalPlugins}
+          pluginRegistry={services.pluginRegistry}
+          tickerRepository={services.tickerRepository}
+          dataProvider={services.dataProvider}
+          marketData={services.marketData}
+          sessionSnapshot={sessionSnapshot}
+          desktopWindowBridge={desktopWindowBridge}
+          desktopApplicationMenuBridge={desktopApplicationMenuBridge}
+          desktopDeepLinkBridge={desktopDeepLinkBridge}
+          remoteControlAdapter={remoteControlAdapter}
+          updatesEnabled={updatesEnabled}
+          onboardingActive={showOnboarding}
+          signInGateActive={signInGateActive}
+          onInitialized={onInitialized}
+          pluginsReady={services.ready}
+          onOnboardingComplete={(updatedConfig) => {
+            setConfig(updatedConfig);
+            setShowOnboarding(false);
+          }}
+          onRunSetupAgain={setupEnabled && !shareHandoff ? showSetup : undefined}
+        />
+      </AppProvider>
+    </RemoteUiRegistryProvider>
+  );
+}

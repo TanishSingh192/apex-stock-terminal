@@ -1,0 +1,231 @@
+import { handleHttpProxy } from "./http-proxy";
+import { anonymousRateKey, createProxySessionGate } from "./proxy-session";
+import { HTTP_PROXY_PATH, WEB_DIRECT_HOSTS } from "../../utils/plugin-proxy-hosts";
+
+interface StaticAssetsBinding {
+  fetch(request: Request): Promise<Response>;
+}
+
+/** Cloudflare's rate limiting binding: counts per key, per location, across isolates. */
+interface RateLimitBinding {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
+export interface WorkerEnv {
+  ASSETS: StaticAssetsBinding;
+  /** Signed-out plugin proxy calls per address (wrangler.jsonc `ratelimits`). */
+  SIGNED_OUT_PROXY_PER_ADDRESS?: RateLimitBinding;
+  /** Signed-out plugin proxy calls from everyone together. */
+  SIGNED_OUT_PROXY_TOTAL?: RateLimitBinding;
+}
+
+/**
+ * The isolate's own window can be dodged by landing on many isolates, so a
+ * signed-out call also counts against Cloudflare's limits per address and
+ * for every signed-out caller together. Either one spent refuses it.
+ */
+export function signedOutProxyLimit(env: WorkerEnv): ((request: Request) => Promise<boolean>) | undefined {
+  const { SIGNED_OUT_PROXY_PER_ADDRESS: perAddress, SIGNED_OUT_PROXY_TOTAL: total } = env;
+  if (!perAddress && !total) return undefined;
+  return async (request) => {
+    if (perAddress && !(await perAddress.limit({ key: anonymousRateKey(request) })).success) return false;
+    return !total || (await total.limit({ key: "signed-out" })).success;
+  };
+}
+
+const SHARE_PATH = /^\/s\/[a-f0-9]{32}\/?$/;
+const LAYOUT_SHARE_PATH = /^\/l\/[a-f0-9]{32}\/?$/;
+const API_PATH = /^\/api(?:\/|$)/;
+const APPLE_APP_SITE_ASSOCIATION_PATH = "/.well-known/apple-app-site-association";
+const ROBOTS_PATH = "/robots.txt";
+/**
+ * Files the web build names after their contents (`main-<hash>.js`, the launch
+ * frame, the bundled plugins: `withContentHash` in scripts/build-web.ts, the
+ * first 16 hex digits of a SHA-256). A name never serves other bytes, so a
+ * browser keeps them for a year without asking again; the bundle audit checks
+ * each such name against its file. Lazy chunks keep plain names and are
+ * revalidated as before.
+ */
+export const IMMUTABLE_ASSET_PATH = /^\/assets\/.+-[a-f0-9]{16}\.(?:js|css)$/;
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+/**
+ * The icons and the install manifest keep their names from build to build.
+ * The browser asked whether each had changed before the first paint of every
+ * open; a copy up to a day old does no harm.
+ */
+const DAILY_ASSET_PATH = /^\/(?:favicon\.(?:ico|svg)|manifest\.webmanifest|app-icon-\d+\.png)$/;
+const DAILY_CACHE_CONTROL = "public, max-age=86400";
+
+/**
+ * Crawling stays allowed on purpose. Deep links are kept out of the index by
+ * the `x-robots-tag` header on their HTML, which a crawler only sees if it may
+ * fetch the page. A `Disallow` would leave already indexed URLs stuck as
+ * "Indexed, though blocked by robots.txt".
+ */
+const ROBOTS_TXT = "User-agent: *\nAllow: /\n";
+
+/**
+ * Lets the iOS app claim `https://term.gloom.sh/s/...` share links.
+ *
+ * Apple fetches this over HTTPS with its own client, so it has to be a direct
+ * 200 with JSON content type: a redirect, an HTML error page, or a 404 all
+ * silently disable universal links with no visible failure on device.
+ *
+ * The path list mirrors `SHARE_PATH` above. Only pane/content shares are
+ * claimed. Layout permalinks stay in the browser so their page can preview the
+ * workspace and hand it to the hosted terminal as an editable copy.
+ *
+ * `3XQML3UV65` is the Apple team id that prefixes the app id.
+ */
+const APPLE_APP_SITE_ASSOCIATION = {
+  applinks: {
+    details: [
+      {
+        appIDs: ["3XQML3UV65.sh.gloom.companion"],
+        components: [{ "/": "/s/*", comment: "Public portfolio shares" }],
+      },
+    ],
+  },
+} as const;
+const API_ORIGIN = "https://api.gloom.sh";
+const API_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
+type ApiFetch = (request: Request) => Promise<Response>;
+/** Module scope, so every request this isolate serves shares one session cache. */
+const proxySessions = createProxySessionGate({ sessionUrl: `${API_ORIGIN}/auth/get-session` });
+
+/**
+ * Google Identity Services, which draws Google One Tap for signed-out
+ * visitors: its script, the frame and requests it makes, and its stylesheet,
+ * each by the narrowest path Google documents. The script is only added to
+ * the page when the prompt is about to be asked for.
+ */
+const GOOGLE_IDENTITY = "https://accounts.google.com/gsi/";
+
+/**
+ * What the page may fetch: itself (the API and the plugin proxy are both
+ * same-origin), the app's own hosts, Google sign-in, and the plugin hosts the
+ * browser calls directly. Every other plugin host goes through the proxy.
+ */
+const CONNECT_SRC = [
+  "'self'",
+  "https://api.github.com",
+  "https://plugins.gloom.sh",
+  "https://gloom.sh",
+  GOOGLE_IDENTITY,
+  ...WEB_DIRECT_HOSTS.map((host) => `https://${host}`),
+].join(" ");
+
+export const SECURITY_HEADERS = {
+  "content-security-policy": `default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self' ${GOOGLE_IDENTITY}client; frame-src 'self' ${GOOGLE_IDENTITY}; style-src 'self' 'unsafe-inline' ${GOOGLE_IDENTITY}style; img-src 'self' data: https:; media-src 'self' https:; connect-src ${CONNECT_SRC}; form-action 'self'; upgrade-insecure-requests`,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+} as const;
+
+export function withSecurityHeaders(response: Response, options: { share?: boolean; noindex?: boolean; keep?: "immutable" | "daily" } = {}): Response {
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+  const html = (headers.get("content-type") ?? "").includes("text/html");
+  if (options.share) headers.set("x-robots-tag", "noindex, nofollow, noarchive");
+  else if (options.noindex && html) headers.set("x-robots-tag", "noindex");
+  if (html) headers.set("cache-control", "no-store");
+  // Only the file itself: a name the build no longer has falls back to the app's HTML, which stays no-store.
+  else if (options.keep && (response.ok || response.status === 304)) {
+    headers.set("cache-control", options.keep === "immutable" ? IMMUTABLE_CACHE_CONTROL : DAILY_CACHE_CONTROL);
+  }
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+/**
+ * Where a `/api/...` request goes: the API origin followed by the rest of the
+ * path, which must start with exactly one slash. The path is appended, never
+ * resolved against the origin, since `//host/x` (or `\host/x`, which the URL
+ * parser reads as the same) resolves to another host. Anything that does not
+ * end up on the API origin gets no upstream.
+ */
+function apiUpstreamUrl(url: URL): URL | null {
+  const path = url.pathname.slice("/api".length) || "/";
+  if (!path.startsWith("/") || /^\/[/\\]/.test(path)) return null;
+  const upstream = new URL(`${API_ORIGIN}${path}${url.search}`);
+  return upstream.origin === API_ORIGIN ? upstream : null;
+}
+
+async function proxyApi(request: Request, fetchApi: ApiFetch): Promise<Response> {
+  const url = new URL(request.url);
+  if (!API_METHODS.has(request.method)) {
+    return Response.json({ error: "Method not allowed" }, {
+      status: 405,
+      headers: { Allow: [...API_METHODS].join(", ") },
+    });
+  }
+  const origin = request.headers.get("origin");
+  if (origin && origin !== url.origin) {
+    return Response.json({ error: "Origin not allowed" }, { status: 403 });
+  }
+  const upstreamUrl = apiUpstreamUrl(url);
+  if (!upstreamUrl) return Response.json({ error: "Not found" }, { status: 404 });
+  return fetchApi(new Request(upstreamUrl, request));
+}
+
+export async function handleRequest(request: Request, env: WorkerEnv, fetchApi: ApiFetch = fetch): Promise<Response> {
+  const url = new URL(request.url);
+  if (API_PATH.test(url.pathname)) return proxyApi(request, fetchApi);
+  // Before the GET/HEAD gate below, since plugin requests arrive as POST.
+  if (url.pathname === HTTP_PROXY_PATH) {
+    return withSecurityHeaders(await handleHttpProxy(request, {
+      sessions: proxySessions,
+      fetchApi,
+      signedOutLimit: signedOutProxyLimit(env),
+    }));
+  }
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return withSecurityHeaders(Response.json({ error: "Method not allowed" }, {
+      status: 405,
+      headers: { Allow: "GET, HEAD" },
+    }));
+  }
+
+  if (url.pathname === "/health") {
+    return withSecurityHeaders(Response.json({ status: "ok" }));
+  }
+
+  // Served before the asset handler so it cannot be shadowed by a static file
+  // or the SPA fallback, either of which would hand Apple HTML and quietly
+  // break universal links.
+  if (url.pathname === APPLE_APP_SITE_ASSOCIATION_PATH) {
+    return withSecurityHeaders(
+      Response.json(APPLE_APP_SITE_ASSOCIATION, {
+        headers: { "cache-control": "public, max-age=3600" },
+      }),
+    );
+  }
+  // Without this the SPA fallback answers with the app's HTML.
+  if (url.pathname === ROBOTS_PATH) {
+    return withSecurityHeaders(new Response(ROBOTS_TXT, {
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=3600" },
+    }));
+  }
+  const socialShare = SHARE_PATH.test(url.pathname) || LAYOUT_SHARE_PATH.test(url.pathname);
+  if (socialShare) {
+    const assetUrl = new URL("/share.html", url.origin);
+    const assetRequest = new Request(assetUrl, { method: request.method, headers: request.headers });
+    return withSecurityHeaders(await env.ASSETS.fetch(assetRequest), { share: true });
+  }
+  // Every path and query gets the same "Gloomberb" shell, so deep links such as
+  // `/?ticker=GPC&tab=executives` would be indexed as thin duplicates. Only the
+  // bare root stays indexable.
+  const deepLink = url.pathname !== "/" || url.search !== "";
+  const keep = IMMUTABLE_ASSET_PATH.test(url.pathname) ? "immutable" : DAILY_ASSET_PATH.test(url.pathname) ? "daily" : undefined;
+  return withSecurityHeaders(await env.ASSETS.fetch(request), { noindex: deepLink, keep });
+}
+
+export default {
+  fetch(request: Request, env: WorkerEnv): Promise<Response> {
+    return handleRequest(request, env);
+  },
+};

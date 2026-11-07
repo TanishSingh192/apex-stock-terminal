@@ -1,0 +1,153 @@
+import type { PaneSettingsDef } from "../../../types/plugin";
+import type { PluginModule } from "../plugin-module";
+import { DEFAULT_FLOW_FILTERS, FLOW_FILTER_OPTIONS, flowScopeSymbol } from "./flow-model";
+import FlowPane from "./flow-pane";
+import HiloPane from "./hilo-pane";
+import LiveScanPane from "./live-pane";
+import { flowHeadless, hiloHeadless } from "./headless";
+import { liveScanHeadless } from "./live-headless";
+import { flowLockNote } from "./lock-note";
+import { FLOW_PANE_ID, HILO_PANE_ID, LIVE_SCAN_PANE_ID, LIVE_SCAN_TEMPLATE_ID } from "../shared/scanner-capture";
+
+
+
+function hiloSettings(): PaneSettingsDef {
+  return {
+    title: "New Highs / Lows Settings",
+    fields: [
+      {
+        key: "minPrice",
+        label: "Minimum price",
+        description: "Sub-dollar names otherwise dominate both lists.",
+        type: "select",
+        options: [
+          { value: "off", label: "No filter" },
+          { value: "1", label: "$1" },
+          { value: "5", label: "$5" },
+        ],
+      },
+      {
+        key: "sort",
+        label: "Sort",
+        type: "select",
+        options: [
+          { value: "recent", label: "Most recent" },
+          { value: "count", label: "Highest count" },
+        ],
+      },
+    ],
+  };
+}
+
+function toSettingOptions(
+  options: readonly { value: string; label: string }[],
+): { value: string; label: string }[] {
+  return options.map(({ value, label }) => ({ value, label }));
+}
+
+function flowSettings(): PaneSettingsDef {
+  return {
+    title: "Options Flow Settings",
+    // Options come from the pane's own filter chips so the two never drift.
+    fields: [
+      { key: "minPremium", label: "Minimum premium", type: "select", options: toSettingOptions(FLOW_FILTER_OPTIONS.minPremium) },
+      { key: "side", label: "Contract side", type: "select", options: toSettingOptions(FLOW_FILTER_OPTIONS.side) },
+      { key: "kind", label: "Print kind", type: "select", options: toSettingOptions(FLOW_FILTER_OPTIONS.kind) },
+      { key: "volOi", label: "Volume / open interest floor", type: "select", options: toSettingOptions(FLOW_FILTER_OPTIONS.volOi) },
+      { key: "expiry", label: "Expiry window", type: "select", options: toSettingOptions(FLOW_FILTER_OPTIONS.expiry) },
+      {
+        key: "universe",
+        label: "Universe",
+        description: "Watchlist mode filters the same shared feed locally.",
+        type: "select",
+        options: toSettingOptions(FLOW_FILTER_OPTIONS.universe),
+      },
+    ],
+  };
+}
+
+export const scannerModule: PluginModule = {
+  panes: [
+    {
+      id: HILO_PANE_ID,
+      name: "New Highs / Lows",
+      icon: "H",
+      component: HiloPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 76, height: 26 },
+      tickerSource: true,
+      tableExport: true,
+      settings: hiloSettings(),
+    },
+    {
+      id: FLOW_PANE_ID,
+      reportLockNote: flowLockNote,
+      reportRequirements: ["Gloom Cloud Pro"],
+      name: "Options Flow",
+      icon: "F",
+      component: FlowPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 88, height: 28 },
+      tickerSource: true,
+      tableExport: true,
+      settings: flowSettings(),
+    },
+    {
+      id: LIVE_SCAN_PANE_ID,
+      name: "Live Scanner",
+      icon: "S",
+      component: LiveScanPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 100, height: 28 },
+      tickerSource: true,
+      tableExport: true,
+      headless: liveScanHeadless,
+    },
+  ],
+
+  paneTemplates: [
+    {
+      id: "scanner-hilo-pane",
+      paneId: HILO_PANE_ID,
+      label: "New Highs / Lows",
+      description: "Session new-high and new-low momentum with 30s/1m/5m counts.",
+      keywords: ["hilo", "highs", "lows", "new", "momentum", "breakout", "scanner"],
+      shortcut: { prefix: "HILO" },
+      headless: hiloHeadless,
+      createInstance: () => ({ settings: { minPrice: "1", sort: "recent" } }),
+    },
+    {
+      id: "scanner-flow-pane",
+      paneId: FLOW_PANE_ID,
+      label: "Options Flow",
+      description: "Unusual options activity: sweeps, blocks, large premium prints, and the net premium tide.",
+      keywords: ["flow", "options", "sweep", "block", "unusual", "premium", "scanner", "tide", "net premium", "market tide"],
+      shortcut: { prefix: "FLOW", argKind: "ticker", argPlaceholder: "ticker", argOptional: true, openWithoutArg: true },
+      headless: flowHeadless,
+      // One window per name, and one for the whole market.
+      createInstance: (_context, options) => {
+        const symbol = flowScopeSymbol(options?.symbol ?? options?.arg);
+        return symbol
+          ? {
+            instanceId: `${FLOW_PANE_ID}:${symbol}`,
+            title: `FLOW ${symbol}`,
+            binding: { kind: "fixed" as const, symbol },
+            settings: { ...DEFAULT_FLOW_FILTERS, symbol },
+          }
+          : { settings: { ...DEFAULT_FLOW_FILTERS } };
+      },
+    },
+    {
+      id: LIVE_SCAN_TEMPLATE_ID,
+      paneId: LIVE_SCAN_PANE_ID,
+      label: "Live Scanner",
+      description: "Your own intraday scan of US stocks: moves, volume spikes, new highs and lows, VWAP crosses and gaps, with alerts.",
+      keywords: ["scan", "scanner", "intraday", "momentum", "volume", "vwap", "gap", "breakout", "alert", "screener"],
+      shortcut: { prefix: "SCAN" },
+      headless: liveScanHeadless,
+    },
+  ],
+};

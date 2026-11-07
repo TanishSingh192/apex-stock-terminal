@@ -1,0 +1,246 @@
+import type { CliCommandDef } from "../types/plugin";
+import { CLI_EXIT_CODES } from "./exit-codes";
+import {
+  cliStyles,
+  cliTerminalWidth,
+  renderDefinitions,
+  renderSection,
+  renderTable,
+  visibleLength,
+  wrapCommandLine,
+  wrapText,
+} from "../utils/cli-output";
+
+/** `--section` of a command whose report has several tables. */
+export const TABLE_SECTION_OPTION = {
+  flags: "--section <title|n>",
+  description: "With --csv or --ndjson, write only that table, by its title, the start of it, or its number",
+};
+
+/** Headings of `gloom help`, in display order. */
+export const CLI_COMMAND_GROUPS = {
+  research: "Research",
+  companyData: "Company data",
+  markets: "Markets",
+  functions: "Functions",
+  portfolios: "Portfolios",
+  plugins: "Plugins",
+  app: "App",
+} as const;
+
+const PLUGIN_COMMANDS_GROUP = "Plugin commands";
+const OTHER_GROUP = "Other";
+const INDENT = 2;
+// Help reads best as a column of text, so wide terminals still wrap here.
+const MAX_HELP_WIDTH = 100;
+const PIPED_HELP_WIDTH = 80;
+
+/** Commands that run as written, for someone who has just installed it. */
+const START_HERE: Array<[string, string]> = [
+  ["gloom search apple", "Find a ticker from a company name"],
+  ["gloom quote AAPL", "Show the latest price"],
+  ["gloom ticker AAPL", "Open the full research report"],
+  ["gloom catalog earnings", "Find a function, then run it with fn"],
+];
+
+const GLOBAL_OPTIONS: Array<[string, string]> = [
+  ["--json", "Print the full result as JSON"],
+  ["--csv", "Print rows as CSV under the columns the text shows; fn reports and fundamentals put each table under # section: and end with # source lines"],
+  ["--ndjson", "Print one JSON object per table row"],
+  ["--limit <n>", "Show at most n rows, the first n as printed"],
+  ["--tail <n>", "Show the newest n rows of a dated series (history, fred, econ) in their printed order, or the last n of another list"],
+  ["--refresh", "Fetch fresh data instead of reading the cache"],
+  ["--dry-run", "Preview config, cache, notes, alerts, plugin on/off, and remote changes without saving"],
+  ["-q, --quiet", "Print no results or errors in text mode, for commands that print results"],
+  ["--color, --no-color", "Force or turn off colors (NO_COLOR also turns them off)"],
+  ["--plain, --no-plain", "Plain text for a screen reader or large text: no rule lines, arrows as words, every table column kept with a dash in empty cells. On by default when NO_COLOR is set or output is piped; --no-plain turns it off"],
+  ["--width <n>", "Fit tables to n columns (default: the terminal width; piped output fits COLUMNS when set, else is not fitted). shot takes its own --width in pixels"],
+];
+
+const EXIT_CODES: Array<[string, string]> = [
+  [String(CLI_EXIT_CODES.ok), "Success"],
+  [String(CLI_EXIT_CODES.error), "Failed: bad input, no data found or a failed check. fn exits 0 on partial data with warnings; --json ok is false exactly when this is 1"],
+  [String(CLI_EXIT_CODES.unusableShot), "shot --strict saved an image of a pane with no usable data"],
+];
+
+export interface CliHelpEntry {
+  command: CliCommandDef;
+  source: "core" | "plugin";
+}
+
+function helpWidth(): number {
+  return Math.min(cliTerminalWidth() ?? PIPED_HELP_WIDTH, MAX_HELP_WIDTH);
+}
+
+function commandGroup(entry: CliHelpEntry): string {
+  return entry.command.help?.group ?? (entry.source === "plugin" ? PLUGIN_COMMANDS_GROUP : OTHER_GROUP);
+}
+
+/**
+ * A usage line as typed. Plugin help written before the rename may start
+ * with the old command name, which prints as `gloom`.
+ */
+function withProgramName(invocation: string): string {
+  if (invocation.startsWith("gloom ")) return invocation;
+  return `gloom ${invocation.startsWith("gloomberb ") ? invocation.slice("gloomberb ".length) : invocation}`;
+}
+
+function renderInvocation(invocation: string, width: number): string[] {
+  return wrapCommandLine(withProgramName(invocation), width, INDENT);
+}
+
+function renderParagraph(text: string, width: number): string[] {
+  return wrapText(text, width - INDENT).map((line) => `${" ".repeat(INDENT)}${line}`.trimEnd());
+}
+
+function groupCliHelpEntries(entries: CliHelpEntry[]): Array<{ title: string; entries: CliHelpEntry[] }> {
+  const knownOrder: string[] = Object.values(CLI_COMMAND_GROUPS);
+  const groups = new Map<string, CliHelpEntry[]>();
+  for (const entry of entries) {
+    const title = commandGroup(entry);
+    groups.set(title, [...(groups.get(title) ?? []), entry]);
+  }
+  const rank = (title: string) => {
+    const known = knownOrder.indexOf(title);
+    if (known >= 0) return known;
+    // Groups a plugin invents sit after the built-in ones, with ungrouped commands last.
+    if (title === PLUGIN_COMMANDS_GROUP) return knownOrder.length + 2;
+    if (title === OTHER_GROUP) return knownOrder.length + 1;
+    return knownOrder.length;
+  };
+  return [...groups.entries()]
+    .map(([title, groupEntries]) => ({ title, entries: groupEntries }))
+    .sort((left, right) => rank(left.title) - rank(right.title));
+}
+
+export function renderCliHelp(entries: CliHelpEntry[], version: string, description: string): string {
+  const width = helpWidth();
+  const listed = entries.filter(({ command }) => command.name !== "help");
+  const nameWidth = Math.max(0, ...listed.map(({ command }) => visibleLength(command.name)));
+  const lines = [
+    `${cliStyles.bold("gloom")} ${cliStyles.muted(version)}`,
+    ...wrapText(description, width),
+    "",
+    renderSection("Start here"),
+    ...renderDefinitions(START_HERE, { width, termStyle: cliStyles.command }),
+    "",
+    renderSection("Usage"),
+    ...renderDefinitions([
+      ["gloom", "Open the terminal UI"],
+      ["gloom <command> [args]", "Run a command and print the result"],
+      ["gloom help <command>", "Show a command's usage, options, and examples"],
+      ["gloom ticker SAN:EPA", "Name the listing of a symbol that trades in several places (or --exchange EPA)"],
+    ], { width }),
+  ];
+
+  for (const group of groupCliHelpEntries(listed)) {
+    lines.push("", renderSection(group.title));
+    lines.push(...renderDefinitions(
+      group.entries.map(({ command }) => [command.name, command.description]),
+      { width, termStyle: cliStyles.command, termWidth: nameWidth },
+    ));
+  }
+
+  lines.push("", renderSection("Global options"));
+  lines.push(...renderDefinitions(GLOBAL_OPTIONS, { width, termStyle: cliStyles.command }));
+
+  lines.push("", renderSection("Exit codes"));
+  lines.push(...renderDefinitions(EXIT_CODES, { width, termStyle: cliStyles.command }));
+  return lines.join("\n");
+}
+
+export function renderCommandHelp(command: CliCommandDef): string {
+  const width = helpWidth();
+  const help = command.help ?? {};
+  const usage = help.usage?.length ? help.usage : [command.name];
+  const lines = [
+    ...wrapText(command.description, width),
+    "",
+    renderSection("Usage"),
+    ...usage.flatMap((line) => renderInvocation(line, width)),
+  ];
+
+  if (command.aliases?.length) {
+    lines.push("", renderSection("Aliases"), ...renderParagraph(command.aliases.join(", "), width));
+  }
+
+  if (help.options?.length) {
+    lines.push("", renderSection("Options"));
+    lines.push(...renderDefinitions(
+      help.options.map((option) => [option.flags, option.description]),
+      { width, termStyle: cliStyles.command },
+    ));
+  }
+
+  for (const section of help.sections ?? []) {
+    lines.push("", renderSection(section.title));
+    for (const line of section.lines ?? []) lines.push(...renderParagraph(line, width));
+    if (section.columns && section.rows) {
+      // Reference tables show every value, even past the terminal width.
+      lines.push(renderTable(section.columns, section.rows, { indent: INDENT, maxWidth: null }));
+    }
+  }
+
+  if (help.examples?.length) {
+    lines.push("", renderSection("Examples"));
+    lines.push(...help.examples.flatMap((example) => renderInvocation(example, width)));
+  }
+
+  return lines.join("\n");
+}
+
+export function describeCliCommand(command: CliCommandDef) {
+  // The first four keys predate groups, options, and examples; exports keep that order.
+  return {
+    name: command.name,
+    aliases: command.aliases ?? [],
+    description: command.description,
+    usage: command.help?.usage ?? [],
+    group: command.help?.group ?? null,
+    options: command.help?.options ?? [],
+    examples: command.help?.examples ?? [],
+  };
+}
+
+function editDistance(left: string, right: string): number {
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    for (let column = 1; column <= right.length; column += 1) {
+      const cost = left[row - 1] === right[column - 1] ? 0 : 1;
+      current[column] = Math.min(previous[column]! + 1, current[column - 1]! + 1, previous[column - 1]! + cost);
+    }
+    previous = current;
+  }
+  return previous[right.length]!;
+}
+
+function closestName(needle: string, candidates: Iterable<string>): string | null {
+  const allowed = needle.length <= 4 ? 1 : 2;
+  let best: { name: string; score: number } | null = null;
+  for (const candidate of candidates) {
+    // A clear prefix ("tick" for "ticker") beats an edit of the same size.
+    const score = needle.length >= 3 && candidate.startsWith(needle)
+      ? 0.5
+      : editDistance(needle, candidate);
+    if (score > allowed) continue;
+    if (!best || score < best.score) best = { name: candidate, score };
+  }
+  return best?.name ?? null;
+}
+
+/** The closest command token to a mistyped one, or null when nothing is plausibly meant. */
+export function suggestCliCommand(token: string, candidates: Iterable<string>): string | null {
+  const needle = token.trim().toLowerCase();
+  if (!needle || needle.startsWith("-")) return null;
+  return closestName(needle, [...candidates].filter((candidate) => !candidate.startsWith("-")));
+}
+
+/** The closest of a command's options to a mistyped one (`--rnage` for `--range`), or null. */
+export function suggestCliOption(flag: string, options: Iterable<string>): string | null {
+  const needle = flag.trim().toLowerCase().replace(/^-+/, "");
+  if (!needle) return null;
+  const byName = new Map([...options].map((option) => [option.replace(/^-+/, ""), option] as const));
+  const name = closestName(needle, byName.keys());
+  return name == null ? null : byName.get(name)!;
+}

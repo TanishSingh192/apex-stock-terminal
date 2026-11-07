@@ -1,0 +1,57 @@
+import { logFailure } from "../utils/log-failure";
+export interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** localStorage wrapper that keeps the app usable when JSON or quota is bad. */
+export class SafeJsonStorage<T> {
+  private value: T;
+
+  constructor(
+    private readonly storage: StorageLike | undefined,
+    readonly key: string,
+    fallback: T,
+    validate: (value: unknown) => value is T = (_value): _value is T => true,
+  ) {
+    this.value = fallback;
+    try {
+      const raw = storage?.getItem(key) ?? null;
+      if (raw !== null) {
+        const parsed: unknown = JSON.parse(raw);
+        if (!validate(parsed)) throw new Error("Invalid stored value");
+        this.value = parsed;
+      }
+    } catch {
+      try { storage?.removeItem(key); } catch { /* Intentional ignore: Optional browser storage may reject removal in private mode; the in-memory fallback is retained. */ }
+    }
+  }
+
+  get(): T {
+    return this.value;
+  }
+
+  set(value: T): void {
+    this.value = value;
+    try { this.storage?.setItem(this.key, JSON.stringify(value)); } catch (error) {
+      logFailure("data.json-storage", "Saving browser JSON storage failed")(error);
+    }
+  }
+
+  clear(fallback: T): void {
+    this.value = fallback;
+    try { this.storage?.removeItem(this.key); } catch { /* Intentional ignore: Optional browser storage may reject removal in private mode; the in-memory value is cleared. */ }
+  }
+}
+
+export const BROWSER_STORAGE_KEYS = {
+  config: "gloomberb.web.config.v1",
+  tickers: "gloomberb.web.tickers.v1",
+  pluginState: "gloomberb.web.plugin-state.v1",
+  session: "gloomberb.web.session.v1",
+  /** Broker account snapshots; other caches stay in memory. */
+  resources: "gloomberb.web.resources.v1",
+  /** The layout the page draws before its script loads (renderers/dom/boot-frame.ts). */
+  bootFrame: "gloomberb.web.boot-frame.v1",
+} as const;

@@ -1,0 +1,201 @@
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { act, useState } from "react";
+import { createOpenTuiTestHarness, type TestKeyEvent } from "../../../renderers/opentui/test-utils";
+import { appReducer, createInitialState, type AppAction, type AppState } from "../../../state/app/context";
+import { createTestPaneConfig, TestPaneFrame, TestPaneProvider } from "../../../test-support/pane";
+import { outage } from "../../../test-support/outage";
+import { setHttpFetchTransport } from "../../../utils/http-transport";
+import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
+import type { PluginPersistence } from "../../../types/plugin";
+import {
+  attachTreasuryAuctionsPersistence,
+  resetTreasuryAuctionsPersistence,
+} from "./cache";
+import { TreasuryAuctionsPane } from "./pane";
+import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
+import { auction, RECORDED_NOW, recordedFiscalData, recordedTreasuryDirect } from "./test-fixture";
+import type { TreasuryAuction } from "./types";
+
+const AUCTIONS: TreasuryAuction[] = [
+  auction({
+    secType: "Bond",
+    securityTerm: "20-Year",
+    auctionDate: "2026-08-19",
+    offeringAmount: 16_000_000_000,
+  }),
+  auction({
+    secType: "Bill",
+    securityTerm: "13-Week",
+    auctionDate: "2026-08-17",
+    highInvestmentRate: 3.802,
+    bidToCoverRatio: 2.86,
+    competitiveAccepted: 80_000_000_000,
+    indirectAccepted: 48_000_000_000,
+    totalAccepted: 98_725_863_900,
+  }),
+  auction({
+    secType: "Note",
+    securityTerm: "10-Year",
+    auctionDate: "2026-08-12",
+    highYield: 4.683,
+    avgMedYield: 4.63,
+    bidToCoverRatio: 2.53,
+    competitiveAccepted: 41_821_613_600,
+    indirectAccepted: 32_087_936_000,
+    directAccepted: 6_135_867_600,
+    primaryDealerAccepted: 3_597_810_000,
+    totalAccepted: 52_623_557_100,
+  }),
+];
+
+/** Fresh cache so the pane renders without touching the Treasury endpoint. */
+function seedCache(): void {
+  const record = { value: AUCTIONS, fetchedAt: Date.now(), stale: false,
+    staleAt: Date.now() + 60_000, expiresAt: Date.now() + 60_000 };
+  attachTreasuryAuctionsPersistence({
+    getResource: () => record,
+    setResource: () => record,
+  } as unknown as PluginPersistence);
+}
+
+const tui = createOpenTuiTestHarness();
+
+afterEach(() => {
+  resetTreasuryAuctionsPersistence();
+  setHttpFetchTransport(null);
+  setSystemTime();
+});
+
+const PANE_INSTANCE_ID = "treasury-auctions:test";
+const paneRuntime = createTestPluginRuntime();
+
+function Harness({ height = 20 }: { height?: number }) {
+  // The filter tab and the open auction are pane state, so the harness needs a
+  // reducer; filtering dispatches both in the same batch.
+  const [paneState, setPaneState] = useState<AppState["paneState"]>({});
+  const state = createInitialState(createTestPaneConfig("/tmp/gloomberb-auctions-pane-test", {
+    paneId: "treasury-auctions", instanceId: PANE_INSTANCE_ID,
+  }));
+  state.paneState = paneState;
+  const dispatch = (action: AppAction) => setPaneState(
+    (current) => appReducer({ ...state, paneState: current }, action).paneState,
+  );
+  return (
+    <TestPaneProvider
+      state={state}
+      dispatch={dispatch}
+      paneId={PANE_INSTANCE_ID}
+      pluginId="macro"
+      runtime={paneRuntime}
+    >
+      <TreasuryAuctionsPane
+        paneId="treasury-auctions"
+        paneType="treasury-auctions"
+        focused
+        width={92}
+        height={height}
+      />
+    </TestPaneProvider>
+  );
+}
+
+async function renderSettled() {
+  await act(async () => {
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
+  });
+}
+
+const emitKeypress = (event: TestKeyEvent) => tui.emitKeypress(event);
+
+describe("TreasuryAuctionsPane", () => {
+  test("renders auction metrics, and an announced auction's Rate as Pending", async () => {
+    seedCache();
+    await tui.render(<Harness />, { width: 92, height: 20 });
+    await renderSettled();
+
+    const frame = tui.frame();
+    expect(frame).toContain("13-Week");
+    expect(frame).toContain("3.802%");
+    expect(frame).toContain("2.86");
+    // Indirect share is derived, not reported.
+    expect(frame).toContain("60.0%");
+    // The 10-Year stops out 5.3bp above its median; direct and dealer shares sit beside indirect.
+    expect(frame).toContain("5.3bp");
+    expect(frame).toContain("14.7%");
+    expect(frame).toContain("8.6%");
+    // The 20-Year is announced but unpublished: its Rate says so, as its detail does, and its other figures read "—".
+    const announced = frame.split("\n").find((line) => line.includes("20-Year"));
+    expect(announced).toMatch(/20-Year\s+Pending\s+—/);
+  });
+
+  // Fiscal Data's board had stopped at 22 Oct with the week of 19 Oct still without results.
+  test("an auction Fiscal Data has no results for reads its results from TreasuryDirect, and the announced ones show", async () => {
+    setSystemTime(new Date(RECORDED_NOW));
+    const persistence = new MemoryPluginPersistence();
+    persistence.seedResource("treasury-auctions", "recent:120", recordedFiscalData(), { sourceKey: "treasury-fiscal-data", schemaVersion: 4 });
+    persistence.seedResource("treasury-auctions", "direct:60", recordedTreasuryDirect(), { sourceKey: "treasury-direct", schemaVersion: 1 });
+    attachTreasuryAuctionsPersistence(persistence);
+    await tui.render(<Harness height={60} />, { width: 92, height: 60 });
+    await renderSettled();
+
+    const lines = tui.frame().split("\n");
+    const row = (date: string, term: string) => lines.find((line) => line.includes(date) && line.includes(term));
+    // Fiscal Data's 22 Oct 5-year TIPS had no results: it reads its real yield, stop-out and bid-to-cover now, and the bond of the 21st its yield.
+    expect(row("Oct 22", "5-Year")).toMatch(/TIPS\s+5-Year\s+2\.367%\s+6\.7bp\s+2\.41/);
+    expect(row("Oct 21", "19-Year 10-Month")).toMatch(/Bond\s+19-Year 10-Month\s+5\.469%/);
+    // The auctions after it, through 5 Nov, are on the board; the ones announced for the next week read Pending.
+    expect(row("Nov 5", "4-Week")).toMatch(/Bill\s+4-Week\s+3\.9\d\d%/);
+    expect(row("Nov 12", "30-Year")).toMatch(/Bond\s+30-Year\s+Pending/);
+    expect(row("Nov 9", "3-Year")).toMatch(/Note\s+3-Year\s+Pending/);
+    expect(lines.filter((line) => line.includes("Pending"))).toHaveLength(6);
+  });
+
+  test("opens a detail view for the selected auction", async () => {
+    seedCache();
+    await tui.render(<Harness />, { width: 92, height: 20 });
+    await renderSettled();
+
+    await emitKeypress({ name: "down", sequence: "\u001B[B" });
+    await emitKeypress({ name: "enter", sequence: "\r" });
+    await renderSettled();
+
+    const detail = tui.frame();
+    expect(detail).toContain("Bill 13-Week");
+    expect(detail).toContain("Bid-to-cover");
+    expect(detail).toContain("Total accepted");
+  });
+
+  // The saved board said "saved copy from" after the pane's loading and error status, and over a refusal too.
+  test("a board a failed refresh left leads the footer with when it was saved; a refusal is the error", async () => {
+    const savedAt = Date.now() - 2 * 86_400_000;
+    const record = { value: AUCTIONS, fetchedAt: savedAt, stale: true, staleAt: savedAt + 60_000, expiresAt: savedAt + 60_000 };
+    attachTreasuryAuctionsPersistence({ getResource: () => record, setResource: () => record } as unknown as PluginPersistence);
+    const state = createInitialState(createTestPaneConfig("/tmp/gloomberb-auctions-pane-test", {
+      paneId: "treasury-auctions", instanceId: PANE_INSTANCE_ID,
+    }));
+    const pane = () => (
+      <TestPaneFrame state={state} paneId={PANE_INSTANCE_ID} pluginId="macro" runtime={paneRuntime} width={92} height={20}>
+        {(body) => <TreasuryAuctionsPane paneId="treasury-auctions" paneType="treasury-auctions" focused {...body} />}
+      </TestPaneFrame>
+    );
+    const footer = () => tui.frame().replace(/\n+$/, "").split("\n").at(-1)!.replace(/^└\s*|┘$/g, "").trim();
+    const settle = async () => {
+      for (let index = 0; index < 6; index += 1) {
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); await tui.setup().renderOnce(); });
+      }
+    };
+
+    setHttpFetchTransport(async () => { throw outage(); });
+    await tui.render(pane(), { width: 92, height: 20 });
+    await settle();
+    expect(tui.frame()).toContain("13-Week");
+    expect(footer()).toMatch(/^saved copy from \S+ \d+ \d\d:\d\d +\S/);
+
+    setHttpFetchTransport(async () => new Response("not found", { status: 404 }));
+    await tui.render(pane(), { width: 92, height: 20 });
+    await settle();
+    expect(tui.frame()).toContain("Treasury Fiscal Data request failed (404)");
+    expect(tui.frame()).not.toContain("saved copy");
+  });
+});

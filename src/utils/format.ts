@@ -1,0 +1,471 @@
+import { fixedUsdRate, heldCurrencyUnit, minorUnitSign } from "./currency-units";
+
+/** What a cell or figure reads when the source gave no value; an export writes it as an empty cell. */
+export const MISSING_VALUE = "—";
+
+const currencyFormatters = new Map<string, Intl.NumberFormat>();
+const numberFormatters = new Map<number, Intl.NumberFormat>();
+
+/** Currencies whose minor unit is a thousandth (ISO 4217 exponent 3): an Omani share is OMR 1.366, not OMR 1.37.
+ * IQD is left out on purpose: it has the exponent in ISO 4217 but trades in whole units. */
+const THREE_DECIMAL_CURRENCIES = new Set(["BHD", "JOD", "KWD", "LYD", "OMR", "TND"]);
+
+/** Decimals a price or amount in this currency is shown to: 3 for the thousandth currencies, 2 for everything else. */
+export function currencyPriceDigits(currency: string | undefined): 2 | 3 {
+  return currency != null && THREE_DECIMAL_CURRENCIES.has(currency.trim().toUpperCase()) ? 3 : 2;
+}
+
+function getCurrencyFormatter(currency: string, maximumFractionDigits: number = currencyPriceDigits(currency)): Intl.NumberFormat {
+  const key = `${currency}:${maximumFractionDigits}`;
+  let formatter = currencyFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency,
+      // Whole units (0) drop the cents rather than throw.
+      minimumFractionDigits: Math.min(currencyPriceDigits(currency), maximumFractionDigits),
+      maximumFractionDigits,
+    });
+    currencyFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
+function getNumberFormatter(decimals: number): Intl.NumberFormat {
+  let formatter = numberFormatters.get(decimals);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("en-US", {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    });
+    numberFormatters.set(decimals, formatter);
+  }
+  return formatter;
+}
+
+/** Format a number as currency (e.g., $1,234.56) */
+/**
+ * An amount in a currency. A code the runtime cannot format as money (USDT, a
+ * stablecoin perpetual venues quote in) reads as the code before the amount,
+ * as a price in it does: USDT101.70.
+ */
+function formatMoney(value: number, currency: string, maximumFractionDigits: number): string {
+  // A minor unit is written after the amount: 314.95¢ in US cents, 412.50p in pence.
+  const minor = minorUnitSign(currency);
+  if (minor) {
+    const body = new Intl.NumberFormat("en-US", {
+      minimumFractionDigits: Math.min(2, maximumFractionDigits),
+      maximumFractionDigits,
+    }).format(Math.abs(value));
+    return `${value < 0 && /[1-9]/.test(body) ? "-" : ""}${body}${minor}`;
+  }
+  try {
+    return getCurrencyFormatter(currency, maximumFractionDigits).format(value);
+  } catch {
+    const body = new Intl.NumberFormat("en-US", {
+      minimumFractionDigits: Math.min(currencyPriceDigits(currency), maximumFractionDigits),
+      maximumFractionDigits,
+    }).format(Math.abs(value));
+    return `${value < 0 && /[1-9]/.test(body) ? "-" : ""}${currency.trim().toUpperCase()}${body}`;
+  }
+}
+
+export function formatCurrency(
+  value: number | undefined,
+  currency = "USD",
+  maximumFractionDigits: number = currencyPriceDigits(currency),
+): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return formatMoney(value, currency, maximumFractionDigits);
+}
+
+/**
+ * An amount with its currency's code after it (259.36 USD, -5.57 CAD), for a
+ * report read by someone whose own currency shares the sign: $ alone is the
+ * US, Canadian and Australian dollar. The same decimals as `formatCurrency`;
+ * a minor unit keeps its sign (314.95¢, 412.50p).
+ */
+export function formatCurrencyCode(
+  value: number | undefined,
+  currency = "USD",
+  maximumFractionDigits: number = currencyPriceDigits(currency),
+): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  if (minorUnitSign(currency)) return formatMoney(value, currency, maximumFractionDigits);
+  const code = currency.trim().toUpperCase();
+  const body = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: Math.min(currencyPriceDigits(code), maximumFractionDigits),
+    maximumFractionDigits,
+  }).format(Math.abs(value));
+  return `${value < 0 && /[1-9]/.test(body) ? "-" : ""}${body} ${code}`;
+}
+
+/** Preserve fractional per-share distributions, including split-adjusted history. */
+export function formatDistributionAmount(value: number | undefined, currency = "USD"): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return formatMoney(value, currency, 6);
+}
+
+/** Signs a fixed-decimal move; one that rounds to zero is unsigned (0.00, never +0.00 or -0.00). */
+function signedFixed(value: number, decimals: number): string {
+  const fixed = Math.abs(value).toFixed(decimals);
+  if (!/[1-9]/.test(fixed)) return fixed;
+  return `${value > 0 ? "+" : "-"}${fixed}`;
+}
+
+/** Format a number as percentage (e.g., +1.23%) */
+export function formatPercent(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return `${signedFixed(value * 100, 2)}%`;
+}
+
+/** Format a level such as a yield or margin (0.0123 -> 1.23%). Levels are not changes, so they carry no sign. */
+export function formatLevelPercent(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  const fixed = (value * 100).toFixed(2);
+  return `${/[1-9]/.test(fixed) ? fixed : fixed.replace("-", "")}%`;
+}
+
+/** Format a percentage that's already in percent form (e.g., 1.23 -> +1.23%) */
+export function formatPercentRaw(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return `${signedFixed(value, 2)}%`;
+}
+
+let figureColumnCells = 0;
+
+/**
+ * Formats one cell of a right-aligned table column. Inside it `formatCompact`
+ * keeps its decimals unless the caller passes `fixedDecimals: false`, so a
+ * column of compact figures lines up: 12.00M over 10.73M, 10.0k over 12.5k.
+ * The table kit draws, reports and exports every right-aligned cell through
+ * this, so a pane's cell keeps the short 12M wherever else it says it (a
+ * figure, a sentence, a label).
+ */
+export function inFigureColumn<T>(format: () => T): T {
+  figureColumnCells += 1;
+  try {
+    return format();
+  } finally {
+    figureColumnCells -= 1;
+  }
+}
+
+/**
+ * Format large numbers compactly (e.g., 1.5T, 234B, 12.3M, 5k). In a table
+ * column (`inFigureColumn`), or with `fixedDecimals`, the decimals stay so
+ * 1.70T lines up with 1.33T.
+ */
+export function formatCompact(value: number | undefined, { fixedDecimals = figureColumnCells > 0 }: { fixedDecimals?: boolean } = {}): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  const { fixed, suffix } = compactParts(Math.abs(value));
+  // Strip unnecessary trailing zeros after decimal point
+  const trimmed = fixed.includes(".") && (!fixedDecimals || !suffix) ? fixed.replace(/\.?0+$/, "") : fixed;
+  // A value that rounds to zero carries no sign.
+  const sign = value < 0 && /[1-9]/.test(trimmed) ? "-" : "";
+  return `${sign}${trimmed}${suffix}`;
+}
+
+const COMPACT_UNITS = [
+  { divisor: 1e12, decimals: 2, suffix: "T" },
+  { divisor: 1e9, decimals: 2, suffix: "B" },
+  { divisor: 1e6, decimals: 2, suffix: "M" },
+  { divisor: 1e3, decimals: 1, suffix: "k" },
+  { divisor: 1, decimals: 2, suffix: "" },
+] as const;
+
+/** The unit is picked after rounding, so 999,950 is 1.00M rather than 1000.0k. */
+function compactParts(abs: number): { fixed: string; suffix: string } {
+  let index = COMPACT_UNITS.findIndex((unit) => abs >= unit.divisor);
+  if (index < 0) index = COMPACT_UNITS.length - 1;
+  let unit = COMPACT_UNITS[index]!;
+  let fixed = (abs / unit.divisor).toFixed(unit.decimals);
+  if (index > 0 && Number(fixed) >= 1000) {
+    unit = COMPACT_UNITS[index - 1]!;
+    fixed = (abs / unit.divisor).toFixed(unit.decimals);
+  }
+  return { fixed, suffix: unit.suffix };
+}
+
+/**
+ * A live money amount (market value, P&L) in compact form that keeps its
+ * decimals from tick to tick: 999.50, 12.3k, 1.23M. A signed amount always
+ * carries + or -, except one that rounds to zero.
+ */
+export function formatCompactAmount(value: number | undefined, { signed = false }: { signed?: boolean } = {}): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  const { fixed, suffix } = compactParts(Math.abs(value));
+  if (!/[1-9]/.test(fixed)) return `${fixed}${suffix}`;
+  const sign = value < 0 ? "-" : signed && value > 0 ? "+" : "";
+  return `${sign}${fixed}${suffix}`;
+}
+
+/** Format a compact value with an explicit currency code (e.g., 1.5T USD) */
+export function formatCompactCurrency(
+  value: number | undefined,
+  currency = "USD",
+  options: { fixedDecimals?: boolean } = {},
+): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return `${formatCompact(value, options)} ${currency}`;
+}
+
+/** Format a plain number with commas */
+export function formatNumber(value: number | undefined, decimals = 2): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return getNumberFormatter(decimals).format(value);
+}
+
+/**
+ * A value to a count of significant digits, so a small ratio keeps its leading
+ * digits (0.0005664, not 0.0006) while a large one reads as a plain number
+ * (1,235). Decimals follow the rounded value, so 9.9996 reads 10.00.
+ */
+export function formatSignificant(value: number | undefined, digits = 4): string {
+  if (value == null || !Number.isFinite(value)) return formatNumber(undefined);
+  if (value === 0) return getNumberFormatter(0).format(0);
+  return getNumberFormatter(significantDecimals(value, digits)).format(Number(value.toPrecision(digits)));
+}
+
+/** The decimals `formatSignificant` writes a value to: 0.8904 has 4, 1.123 has 3, 0 none. */
+export function significantDecimals(value: number, digits = 4): number {
+  if (value === 0 || !Number.isFinite(value)) return 0;
+  const rounded = Number(value.toPrecision(digits));
+  return Math.min(12, Math.max(0, digits - 1 - Math.floor(Math.log10(Math.abs(rounded)))));
+}
+
+/** A percentile rank with its window: "73 pctl 1Y", "-- pctl 1Y" when unranked, "73 pctl" without a window. */
+export function formatPercentileRank(value: number | null | undefined, window?: string): string {
+  const rank = value == null || !Number.isFinite(value) ? "--" : value.toFixed(0);
+  return window ? `${rank} pctl ${window}` : `${rank} pctl`;
+}
+
+/** Format a growth rate compactly (e.g., +12%, -5%) */
+export function formatGrowthShort(value: number): string {
+  const pct = value * 100;
+  const sign = pct > 0 ? "+" : "";
+  if (Math.abs(pct) >= 10) return `${sign}${Math.round(pct)}%`;
+  // A change that rounds to zero prints 0.0%, never -0.0%.
+  return Math.abs(pct) < 0.05 ? "0.0%" : `${sign}${pct.toFixed(1)}%`;
+}
+
+/** Pick a common unit suffix for a set of numbers */
+export function pickUnit(values: (number | undefined)[]): { suffix: string; divisor: number } {
+  const defined = values.filter((v): v is number => v != null);
+  if (!defined.length) return { suffix: "", divisor: 1 };
+  const maxAbs = Math.max(...defined.map(Math.abs));
+  if (maxAbs >= 1e12) return { suffix: "T", divisor: 1e12 };
+  if (maxAbs >= 1e9) return { suffix: "B", divisor: 1e9 };
+  if (maxAbs >= 1e6) return { suffix: "M", divisor: 1e6 };
+  if (maxAbs >= 1e3) return { suffix: "K", divisor: 1e3 };
+  return { suffix: "", divisor: 1 };
+}
+
+/** Format a number using a pre-determined divisor (no unit suffix) */
+export function formatWithDivisor(value: number | undefined, divisor: number): string {
+  if (value === undefined || value === null) return MISSING_VALUE;
+  const scaled = value / divisor;
+  const abs = Math.abs(scaled);
+  const decimals = abs >= 100 ? 1 : 2;
+  return scaled.toFixed(decimals);
+}
+
+const COMBINING_MARK_RE = /\p{Mark}/u;
+const EMOJI_PRESENTATION_RE = /\p{Emoji_Presentation}/u;
+const EXTENDED_PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
+const REGIONAL_INDICATOR_RE = /\p{Regional_Indicator}/u;
+
+/**
+ * Printable ASCII is always one cell per code unit. Table cells are mostly
+ * numbers, tickers, and dates, so this skips grapheme segmentation on the
+ * render hot path.
+ */
+const SINGLE_WIDTH_ASCII_RE = /^[\x20-\x7e]*$/;
+
+let graphemeSegmenter: { segment(value: string): Iterable<{ segment: string }> } | null | undefined;
+
+// Constructing Intl.Segmenter costs about 10us; segmenting with a shared one
+// costs a fraction of that, and the instance carries no per-call state.
+function getGraphemeSegmenter(): typeof graphemeSegmenter {
+  if (graphemeSegmenter === undefined) {
+    const Segmenter = (Intl as any).Segmenter;
+    graphemeSegmenter = typeof Segmenter === "function"
+      ? new Segmenter(undefined, { granularity: "grapheme" })
+      : null;
+  }
+  return graphemeSegmenter;
+}
+
+function segmentGraphemes(value: string): string[] {
+  const segmenter = getGraphemeSegmenter();
+  if (segmenter) {
+    return Array.from(segmenter.segment(value), (entry) => entry.segment);
+  }
+  return Array.from(value);
+}
+
+function isFullwidthCodePoint(codePoint: number): boolean {
+  return codePoint >= 0x1100 && (
+    codePoint <= 0x115f ||
+    codePoint === 0x2329 ||
+    codePoint === 0x232a ||
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
+    (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  );
+}
+
+function graphemeWidth(segment: string): number {
+  if (
+    REGIONAL_INDICATOR_RE.test(segment) ||
+    EMOJI_PRESENTATION_RE.test(segment) ||
+    EXTENDED_PICTOGRAPHIC_RE.test(segment)
+  ) {
+    return 2;
+  }
+
+  let width = 0;
+  for (const char of Array.from(segment)) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    if (
+      codePoint === 0 ||
+      codePoint < 32 ||
+      (codePoint >= 0x7f && codePoint < 0xa0) ||
+      codePoint === 0x200d ||
+      (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+      COMBINING_MARK_RE.test(char)
+    ) {
+      continue;
+    }
+    width += isFullwidthCodePoint(codePoint) ? 2 : 1;
+  }
+  return width;
+}
+
+export function displayWidth(value: string): number {
+  if (SINGLE_WIDTH_ASCII_RE.test(value)) return value.length;
+  return segmentGraphemes(value).reduce((total, segment) => total + graphemeWidth(segment), 0);
+}
+
+function truncateToWidth(value: string, width: number): string {
+  if (width <= 0) return "";
+  if (SINGLE_WIDTH_ASCII_RE.test(value)) return value.slice(0, width);
+  let output = "";
+  let used = 0;
+  for (const segment of segmentGraphemes(value)) {
+    const nextWidth = graphemeWidth(segment);
+    if (used + nextWidth > width) break;
+    output += segment;
+    used += nextWidth;
+  }
+  return output;
+}
+
+export function truncateToDisplayWidth(value: string, width: number): string {
+  if (width <= 0) return "";
+  if (displayWidth(value) <= width) return value;
+  if (width <= 3) return ".".repeat(width);
+  return `${truncateToWidth(value, width - 3)}...`;
+}
+
+/**
+ * Clips to a display width behind a single `…`, which gives a narrow cell back
+ * two characters that `...` would spend on the marker.
+ */
+export function clipToDisplayWidth(value: string, width: number): string {
+  if (width <= 0) return "";
+  if (displayWidth(value) <= width) return value;
+  if (width === 1) return "…";
+  return `${truncateToWidth(value, width - 1).trimEnd()}…`;
+}
+
+/**
+ * Clips a styled run of text to a display width. A highlighted snippet is many
+ * text nodes rather than one string, so the clipping cannot go through
+ * `truncateToDisplayWidth`; the ellipsis is built by the caller so the returned
+ * segments keep whatever styling flags the caller's segment type carries.
+ */
+export function truncateTextSegments<T extends { text: string }>(
+  segments: T[],
+  width: number,
+  makeEllipsis: (ellipsis: string) => T,
+): T[] {
+  if (width <= 0) return [];
+  const total = segments.reduce((sum, segment) => sum + displayWidth(segment.text), 0);
+  if (total <= width) return segments;
+  if (width <= 1) return [makeEllipsis("\u2026".slice(0, width))];
+
+  const budget = width - 1;
+  const clipped: T[] = [];
+  let used = 0;
+  for (const segment of segments) {
+    const remaining = budget - used;
+    if (remaining <= 0) break;
+    const segmentWidth = displayWidth(segment.text);
+    if (segmentWidth <= remaining) {
+      clipped.push(segment);
+      used += segmentWidth;
+      continue;
+    }
+    clipped.push({ ...segment, text: truncateToWidth(segment.text, remaining) });
+    break;
+  }
+  clipped.push(makeEllipsis("\u2026"));
+  return clipped;
+}
+
+/** Pad/truncate a string to a fixed display width */
+export function padTo(str: string, width: number, align: "left" | "right" | "center" = "left"): string {
+  const clipped = displayWidth(str) > width ? truncateToWidth(str, width) : str;
+  const clippedWidth = displayWidth(clipped);
+  const padding = Math.max(0, width - clippedWidth);
+  if (align === "right") return " ".repeat(padding) + clipped;
+  if (align === "center") {
+    const leftPadding = Math.floor(padding / 2);
+    const rightPadding = padding - leftPadding;
+    return " ".repeat(leftPadding) + clipped + " ".repeat(rightPadding);
+  }
+  return clipped + " ".repeat(padding);
+}
+
+/**
+ * USD per unit of a currency from USD-per-unit rates: the dollar and US cents
+ * (a grain future's USX) at their fixed rates, any other the market's; a
+ * minor unit (GBp, GBX, ZAc) without a rate of its own as its major
+ * currency's over its divisor.
+ */
+function usdPerUnit(currency: string, exchangeRates: Map<string, number>): number | undefined {
+  const own = fixedUsdRate(currency) ?? exchangeRates.get(currency);
+  if (own != null) return own;
+  const unit = heldCurrencyUnit(currency);
+  if (unit.divisor === 1) return undefined;
+  const major = fixedUsdRate(unit.currency) ?? exchangeRates.get(unit.currency);
+  return major == null ? undefined : major / unit.divisor;
+}
+
+/**
+ * Convert using USD-per-unit rates. Missing FX remains unavailable (NaN), so
+ * totals cannot silently mix source currency with base currency. Numeric
+ * formatters render this as a dash and JSON encodes it as null. Pence (GBp,
+ * GBX) count a hundredth of a pound.
+ */
+export function convertCurrency(
+  value: number,
+  fromCurrency: string,
+  baseCurrency: string,
+  exchangeRates: Map<string, number>,
+): number {
+  if (!Number.isFinite(value)) return Number.NaN;
+  if (fromCurrency === baseCurrency || value === 0) return value;
+  const fromRate = usdPerUnit(fromCurrency, exchangeRates);
+  const baseRate = usdPerUnit(baseCurrency, exchangeRates);
+  if (fromRate == null || baseRate == null || !Number.isFinite(fromRate) || !Number.isFinite(baseRate)
+    || fromRate <= 0 || baseRate <= 0) return Number.NaN;
+  return (value * fromRate) / baseRate;
+}

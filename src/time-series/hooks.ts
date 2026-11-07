@@ -1,0 +1,90 @@
+import { createContext, useContext, useMemo } from "react";
+import { apiClient } from "../api-client";
+import { loadCachedFredSeries } from "../sources/gloomberb-cloud/fred-series";
+import { instrumentFromTicker } from "../market-data/request-types";
+import { useAssetData, useCapabilityInvoker } from "../plugins/runtime";
+import { getSharedRegistry } from "../plugins/registry";
+import { createChartSeriesResolver } from "../capabilities";
+import { loadFuturesPriceUnit } from "../market-data/futures-contract";
+import { loadDailyFxCloses } from "./currency-conversion";
+import { useAppSelector } from "../state/app/context";
+import type { FredSeriesRequest } from "../sources/gloomberb-cloud/fred-series";
+import type { TickerRecord } from "../types/ticker";
+import type { ChartResolutionResult, ChartSpec } from "./types";
+import {
+  useChartResolution,
+  type UseChartResolutionOptions,
+  type UseChartResolutionResult,
+} from "./use-chart-resolution";
+
+/** A scoped, immutable model for exports that must render exactly the loaded data. */
+export const ChartSnapshotContext = createContext<ChartResolutionResult | null>(null);
+
+/** A registered series' own reload cadence, when it has one. */
+function registeredSeriesRefreshMs(source: { capabilityId: string; seriesId: string }): number | undefined {
+  const found = getSharedRegistry()?.series.findLoaded(source.capabilityId, source.seriesId);
+  const definition = found?.series.definition;
+  return definition && "refreshMs" in definition ? definition.refreshMs : undefined;
+}
+
+async function loadFred(request: FredSeriesRequest) {
+  return loadCachedFredSeries(
+    request,
+    () => apiClient.getCloudFredSeries(request.seriesId, {
+      startDate: request.startDate,
+      sortOrder: request.sortOrder,
+    }),
+  );
+}
+
+export function hydrateChartSpecInstruments(
+  spec: ChartSpec,
+  tickers: ReadonlyMap<string, TickerRecord>,
+): ChartSpec {
+  let changed = false;
+  const series = spec.series.map((entry) => {
+    if (entry.source.kind !== "security" || entry.source.instrument.exchange?.trim()) {
+      return entry;
+    }
+    const symbol = entry.source.instrument.symbol.trim().toUpperCase();
+    const instrument = instrumentFromTicker(tickers.get(symbol), symbol);
+    if (!instrument?.exchange) return entry;
+    changed = true;
+    return {
+      ...entry,
+      source: {
+        ...entry.source,
+        instrument: {
+          ...instrument,
+          ...entry.source.instrument,
+          exchange: instrument.exchange,
+        },
+      },
+    };
+  });
+  return changed ? { ...spec, series } : spec;
+}
+
+export function useResolvedChartSpec(
+  spec: ChartSpec,
+  options: UseChartResolutionOptions = {},
+): UseChartResolutionResult {
+  const snapshot = useContext(ChartSnapshotContext);
+  const dataProvider = useAssetData();
+  const capabilityInvoker = useCapabilityInvoker();
+  const tickers = useAppSelector((state) => state.tickers);
+  const hydratedSpec = useMemo(
+    () => hydrateChartSpecInstruments(spec, tickers),
+    [spec, tickers],
+  );
+  const sources = useMemo(() => ({
+    dataProvider,
+    loadFredSeries: loadFred,
+    loadEarningsHistory: (symbol: string) => apiClient.getCloudEarningsHistory(symbol, 100),
+    resolveCapabilitySeries: createChartSeriesResolver(capabilityInvoker),
+    capabilityRefreshMs: registeredSeriesRefreshMs,
+    loadFuturesPriceUnit: (symbol: string) => loadFuturesPriceUnit(symbol),
+    loadFxCloses: (currency: string, startDate: string) => loadDailyFxCloses(currency, startDate, apiClient),
+  }), [capabilityInvoker, dataProvider]);
+  return useChartResolution(hydratedSpec, sources, { ...options, snapshot });
+}

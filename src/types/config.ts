@@ -1,0 +1,1100 @@
+import type { Portfolio, Watchlist } from "./ticker";
+import type { BrokerContractRef, TickerListingRef } from "./instrument";
+import type { LanguagePreference } from "../i18n/languages";
+import { buildDockStack } from "../layout/pane-manager/dock-stack";
+
+export const CURRENT_CONFIG_VERSION = 28;
+
+type ChartRendererPreference = "auto" | "kitty" | "braille";
+
+export interface ChartPreferences {
+  renderer: ChartRendererPreference;
+}
+
+export interface BrokerInstanceConfig {
+  id: string;
+  brokerType: string;
+  label: string;
+  connectionMode?: string;
+  config: Record<string, unknown>;
+  enabled?: boolean;
+  lastSyncedAt?: number;
+  /**
+   * The user keeps this connection's data on this device: Cloud sync leaves out the profile, its
+   * accounts' portfolios and account values, and the positions in them. Daily roundups, the weekly
+   * brief, position alerts, the mobile app and Ask Gloom's portfolio context then go without it.
+   */
+  localOnly?: boolean;
+}
+
+export interface ColumnConfig {
+  id: string;
+  label: string;
+  width: number;
+  align: "left" | "right";
+  format?: "currency" | "percent" | "number" | "compact";
+}
+
+export type PaneBinding =
+  | { kind: "none" }
+  | { kind: "fixed"; symbol: string; instrument?: BrokerContractRef | null; listing?: TickerListingRef }
+  | { kind: "follow"; sourceInstanceId: string };
+
+export interface DockedPlacementMemory {
+  path?: Array<0 | 1>;
+  anchorInstanceId?: string;
+  /** "tab": a tab of the stack `anchorInstanceId` is in. */
+  position?: "left" | "right" | "above" | "below" | "tab";
+}
+
+export interface FloatingPlacementMemory {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface DetachedPlacementMemory {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PanePlacementMemory {
+  docked?: DockedPlacementMemory;
+  floating?: FloatingPlacementMemory;
+  detached?: DetachedPlacementMemory;
+}
+
+/**
+ * A ticker link Move to New Layout had to cut: the pane followed another one
+ * that stayed behind (or left with the moved pane) and was pinned on `symbol`.
+ * Move Back links it again while it is still pinned there.
+ */
+export interface PaneMovedLink {
+  instanceId: string;
+  sourceInstanceId: string;
+  symbol: string;
+  /** The title before the pin renamed it ("OPX" for "OPX NVDA"), when it did. */
+  title?: string;
+}
+
+/** Where Move to New Layout took a pane from, so Move Back can return it. */
+export interface PaneMovedFrom {
+  /** `SavedLayout.id` of the layout it left. */
+  layoutId: string;
+  /** Set when it was docked there: its place in the tree and its share of the split. */
+  docked?: DockedPlacementMemory & { ratio?: number };
+  /** Set when it was floating there. */
+  floating?: FloatingPlacementMemory;
+  links?: PaneMovedLink[];
+}
+
+export interface PaneInstanceConfig {
+  instanceId: string;
+  paneId: string;
+  title?: string;
+  binding?: PaneBinding;
+  params?: Record<string, string>;
+  settings?: Record<string, unknown>;
+  placementMemory?: PanePlacementMemory;
+  /** Pinned by the user: the keyboard close shortcuts leave this pane alone. */
+  locked?: boolean;
+  /** Set by Move to New Layout and cleared by Move Back; never published. */
+  movedFrom?: PaneMovedFrom;
+}
+
+interface DockPaneNode {
+  kind: "pane";
+  instanceId: string;
+}
+
+export interface DockSplitNode {
+  kind: "split";
+  axis: "horizontal" | "vertical";
+  ratio: number;
+  first: DockLayoutNode;
+  second: DockLayoutNode;
+  /**
+   * Set on every split of a stack of tabs, with the pane it shows: the panes
+   * under it share one spot (see layout/pane-manager/dock-stack.ts).
+   */
+  tabs?: { active: string };
+}
+
+export type DockLayoutNode = DockPaneNode | DockSplitNode;
+
+export interface FloatingPaneEntry {
+  instanceId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  zIndex?: number;
+  /**
+   * Floating windows stacked as tabs share this key and one rect; the one
+   * in front (highest z) is shown (layout/pane-manager/floating-stack.ts).
+   */
+  stack?: string;
+}
+
+interface DetachedPaneEntry {
+  instanceId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutConfig {
+  dockRoot: DockLayoutNode | null;
+  instances: PaneInstanceConfig[];
+  floating: FloatingPaneEntry[];
+  detached: DetachedPaneEntry[];
+}
+
+/**
+ * Where a tab's content came from when it is linked to a team layout. The
+ * revision and fingerprint say whether the local copy drifted and whether the
+ * team has something newer; the arrangement on screen is never part of it.
+ */
+export interface LayoutOrigin {
+  kind: "team";
+  teamId: string;
+  layoutId: string;
+  /** The team revision this tab last matched. */
+  revision: number;
+  /** Fingerprint of the content at `revision`, so edits can be detected offline. */
+  contentHash: string;
+  syncedAt: string;
+}
+
+export interface SavedLayout {
+  id?: string;
+  name: string;
+  layout: LayoutConfig;
+  paneState?: Record<string, Record<string, unknown>>;
+  focusedPaneId?: string | null;
+  /**
+   * @deprecated Ignored on read and no longer written. The app has no left or
+   * right panel state; `focusedPaneId` is the saved focus.
+   */
+  activePanel?: "left" | "right";
+  origin?: LayoutOrigin;
+}
+
+export type OnboardingStage =
+  | "welcome"
+  | "portfolio"
+  | "add-ticker"
+  | "desks"
+  | "research"
+  | "verify"
+  | "account"
+  | "upgrade"
+  | "ready";
+
+export interface OnboardingProgress {
+  version: 1;
+  stage: OnboardingStage;
+  path?: "manual" | "broker";
+  portfolioId?: string;
+  tickerSymbol?: string;
+  brokerName?: string;
+  positionsImported?: number;
+  accountStatus?: "signed-in" | "skipped";
+  checkoutOpenedAt?: string;
+  /** Desks picked at "What do you trade most?", in the order picked; empty when skipped. */
+  desks?: string[];
+  /**
+   * Opened again from Settings (Run Setup Again) after setup was done: every
+   * step can be left, and the layouts are rebuilt in place.
+   */
+  rerun?: boolean;
+}
+
+/**
+ * User key overrides. Bindings use the accelerator grammar the menus already
+ * speak (`CmdOrCtrl+Shift+F`, `Alt+1`, `F5`, `` ` ``). Kept local to the machine:
+ * a laptop with a German layout and a desk with a US keyboard want different keys.
+ */
+export interface KeybindingsConfig {
+  /**
+   * Built-in actions keyed by action id (`ticker-search`, `command-bar`,
+   * `pane-close`, `plugin:<shortcutId>`). A string or list replaces the default
+   * chords; `null` unbinds the action.
+   */
+  actions?: Record<string, string | string[] | null>;
+  /**
+   * Command bar text to run when a chord is pressed, keyed by chord. The text is
+   * submitted exactly as if typed, so `DES AAPL` opens the security and `NEWS`
+   * infers the focused ticker.
+   */
+  commands?: Record<string, string>;
+}
+
+/** What the app sends home on its own. Absent means every default applies. */
+export interface TelemetryConfig {
+  /**
+   * Automatic crash reports (uncaught errors, render crashes, plugin load
+   * failures) to Gloom's API. `false` turns them off; absent means on.
+   */
+  crashReports?: boolean;
+  /**
+   * Anonymous counts of which functions are opened and which are on screen
+   * at launch, to Gloom's API, and, when signed in, the searches finished in
+   * the command bar, kept with the account to improve search. `false` turns
+   * both off; absent means on.
+   */
+  usage?: boolean;
+  /**
+   * Ticker-level research counts (Attention Counts). On by default: `false`
+   * turns them off and `true` is an explicit on. While unset, an account is
+   * counted only once this installation has shown it the one-time notice.
+   * Cloud sync carries only whether it is off, so an off reaches the
+   * account's other devices.
+   */
+  attention?: boolean;
+  /**
+   * The accounts this installation has shown the Attention Counts notice to,
+   * oldest first. Kept on this device; never synced or sent.
+   */
+  attentionNoticeShownTo?: string[];
+}
+
+/**
+ * Which builds the app updates to. `stable` is the tagged releases; `nightly`
+ * adds the daily prerelease built from main.
+ */
+export type UpdateChannel = "stable" | "nightly";
+
+/** How this machine updates the app. Absent means the stable channel. */
+export interface UpdatesConfig {
+  /** Only `nightly` is saved; stable is the default. `GLOOMBERB_UPDATE_CHANNEL` overrides it. */
+  channel?: UpdateChannel;
+}
+
+/**
+ * The one-time line in the terminal's status bar asking to star Gloomberb on
+ * GitHub. Absent means on and not shown yet. Kept on this machine only.
+ */
+export interface StarPromptConfig {
+  /** `false` turns the line off; absent means on. */
+  enabled?: boolean;
+  /** Local days (`YYYY-MM-DD`) the terminal app was opened on, oldest first, until the line shows. */
+  days?: string[];
+  /** When the line showed. Once set it never shows again. */
+  shownAt?: string;
+  /** How it ended: the repository was opened, the line was dismissed, or it timed out. */
+  outcome?: "opened" | "dismissed" | "expired";
+}
+
+/**
+ * One recent command-bar run: `id` is `pane-template:<templateId>`, `label`
+ * its name when it ran, and `arg` a ticker it ran with (never free text).
+ */
+export interface RecentCommand {
+  id: string;
+  label: string;
+  arg?: string;
+}
+
+/** What a launch's plugin seed could not install. */
+export interface PluginSeedFailure {
+  /** Extracted plugin ids, sorted. */
+  plugins: string[];
+  gitMissing: boolean;
+}
+
+export interface AppConfig {
+  dataDir: string;
+  configVersion: number;
+  baseCurrency: string;
+  refreshIntervalMinutes: number;
+  portfolios: Portfolio[];
+  watchlists: Watchlist[];
+  layout: LayoutConfig;
+  layouts: SavedLayout[];
+  activeLayoutIndex: number;
+  brokerInstances: BrokerInstanceConfig[];
+  disabledPlugins: string[];
+  /**
+   * Plugins that used to ship inside Gloomberb and have since moved to their own
+   * repositories. Recorded once installed, so an upgrade restores them without
+   * re-installing on every launch, and so a user who removes one on purpose is
+   * not fought with.
+   */
+  seededPlugins?: string[];
+  /**
+   * The extracted plugins the last launch's seed could not install, and
+   * whether git was missing then. Absent until a seed fails, and again once
+   * one installs everything. `doctor` fails on it, and the launch notice that
+   * Gloom tries again is said once per failure.
+   */
+  pluginSeedFailure?: PluginSeedFailure;
+  /**
+   * Manual portfolios have taken the one currency their positions share. Runs
+   * once per install, so later holdings never move a portfolio's currency.
+   */
+  portfolioCurrenciesAdopted?: boolean;
+  disabledSources: string[];
+  pluginConfig: Record<string, Record<string, unknown>>;
+  theme: string;
+  chartPreferences: ChartPreferences;
+  valueFlashingEnabled: boolean;
+  fontSize: number;
+  recentTickers: string[];
+  /** Pane templates recently run from the command bar, newest first. */
+  recentCommands: RecentCommand[];
+  /**
+   * How many times the empty command bar has opened, counted to one past its
+   * introduction (see `command-bar-intro.ts`). A new config starts at 0; one
+   * from an earlier build has none and reads as past it. Kept on this machine only.
+   */
+  commandBarOpens?: number;
+  language?: LanguagePreference;
+  onboardingComplete?: boolean;
+  /** App version at the last launch, used to show release notes after an update. */
+  lastLaunchedVersion?: string;
+  /** Local, resumable progress. This is intentionally not cloud-synced. */
+  onboardingProgress?: OnboardingProgress;
+  /** Key overrides for this machine. Absent means every default applies. */
+  keybindings?: KeybindingsConfig;
+  telemetry?: TelemetryConfig;
+  starPrompt?: StarPromptConfig;
+  /** The update channel. Kept on this machine only. */
+  updates?: UpdatesConfig;
+  /**
+   * The IANA zone (`Asia/Tokyo`) the CLI and function reports show a local
+   * time in, beside every UTC time. Absent prints UTC alone. Trading-day dates
+   * are never shifted by it.
+   */
+  timezone?: string;
+  /**
+   * Presentation mode: the panes fill the window, without the header or the
+   * status bar, for a screen that is shown rather than worked at. Absent is off.
+   */
+  presentationMode?: boolean;
+  /**
+   * The market the header shows. Absent until the user picks one: the
+   * benchmark of this machine's time zone. Kept on this machine only.
+   */
+  headerMarket?: HeaderMarketChoice;
+}
+
+/** A benchmark the header offers, by its id (`hang-seng`), or any listing the user searched for. */
+export type HeaderMarketChoice = { benchmark: string } | { symbol: string; exchange?: string };
+
+export const TICKER_RESEARCH_PANE_ID = "ticker-research";
+export const LEGACY_TICKER_DETAIL_PANE_ID = "ticker-detail";
+export const CHART_COMPOSER_PANE_ID = "chart-composer";
+
+export function normalizePaneId(paneId: string): string {
+  if (paneId === LEGACY_TICKER_DETAIL_PANE_ID) return TICKER_RESEARCH_PANE_ID;
+  if (paneId === "comparison-chart" || paneId === "ticker-chart" || paneId === "fundamental-graph") {
+    return CHART_COMPOSER_PANE_ID;
+  }
+  // Thematic baskets became the Themes tab of Sector Performance; the saved
+  // theme param and pane state open that tab where the pane left off.
+  if (paneId === "themes") return "sectors";
+  return paneId;
+}
+
+const TICKER_PANE_IDS = new Set([
+  TICKER_RESEARCH_PANE_ID,
+  LEGACY_TICKER_DETAIL_PANE_ID,
+  "financial-analysis",
+  "quote-monitor",
+  "ticker-news",
+  "notes",
+  "options",
+  "holders",
+  "sec",
+  "insider",
+  "analyst-research",
+  "corporate-actions",
+  "earnings-estimates",
+  "historical-prices",
+  "returns",
+  "ibkr-trading",
+]);
+
+/**
+ * Ticker panes that also have a view without a ticker, which an unbound
+ * instance shows: INS alone ranks the market's insider buying. Normalizing a
+ * layout leaves such an instance unbound instead of removing it or linking it
+ * to a list.
+ */
+const TICKERLESS_VIEW_PANE_IDS = new Set(["insider"]);
+
+export const DEFAULT_COLUMNS: ColumnConfig[] = [
+  { id: "ticker", label: "TICKER", width: 8, align: "left" },
+  { id: "price", label: "LAST", width: 10, align: "right", format: "currency" },
+  { id: "change_pct", label: "CHG%", width: 8, align: "right", format: "percent" },
+  { id: "market_cap", label: "MCAP", width: 10, align: "right", format: "compact" },
+  { id: "pe", label: "P/E", width: 7, align: "right", format: "number" },
+  { id: "forward_pe", label: "FWD P/E", width: 8, align: "right", format: "number" },
+  { id: "latency", label: "AGE", width: 6, align: "right" },
+];
+
+// A portfolio dates each row by the price its value uses (AS OF), where a
+// watchlist shows the quote's age (AGE).
+export const DEFAULT_PORTFOLIO_COLUMN_IDS = [
+  ...DEFAULT_COLUMNS.map((column) => column.id === "latency" ? "as_of" : column.id),
+  "sparkline",
+  "shares",
+  "avg_cost",
+  "cost_basis",
+  "mkt_value",
+  "day_pnl",
+  "pnl",
+  "pnl_pct",
+];
+
+const DEFAULT_HOME_LAYOUT: LayoutConfig = {
+  dockRoot: {
+    kind: "split",
+    axis: "horizontal",
+    ratio: 0.34,
+    first: {
+      kind: "split",
+      axis: "vertical",
+      ratio: 0.6,
+      first: { kind: "pane", instanceId: "portfolio-list:main" },
+      second: { kind: "pane", instanceId: "chat:main" },
+    },
+    second: { kind: "split", axis: "vertical", ratio: 0.76,
+      first: { kind: "pane", instanceId: "ticker-detail:main" },
+      second: { kind: "pane", instanceId: "attention-trending:home" } },
+  },
+  instances: [
+    { instanceId: "attention-trending:home", paneId: "attention-trending", binding: { kind: "none" } },
+    {
+      instanceId: "portfolio-list:main",
+      paneId: "portfolio-list",
+      params: { collectionId: "main" },
+      settings: {
+        columnIds: [...DEFAULT_PORTFOLIO_COLUMN_IDS],
+        collectionScope: "all",
+        visibleCollectionIds: [],
+        viewMode: "table",
+      },
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "ticker-detail:main",
+      paneId: TICKER_RESEARCH_PANE_ID,
+      settings: {
+        hideTabs: false,
+        lockedTabId: "overview",
+      },
+      binding: { kind: "follow", sourceInstanceId: "portfolio-list:main" },
+    },
+    {
+      instanceId: "chat:main",
+      paneId: "chat",
+      settings: {
+        hideTabs: false,
+      },
+      binding: { kind: "none" },
+    },
+  ],
+  floating: [],
+  detached: [],
+};
+
+/**
+ * One screen for "where are we": valuation and the economy in the wide slots,
+ * with the faster sentiment, volatility and credit reads beside them. These stay
+ * separate panes because each measures a different thing on a different horizon;
+ * the layout is what puts them on one screen.
+ */
+const DEFAULT_MACRO_LAYOUT: LayoutConfig = {
+  dockRoot: {
+    kind: "split",
+    axis: "vertical",
+    ratio: 0.54,
+    first: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.58,
+      first: { kind: "pane", instanceId: "market-valuation:macro" },
+      second: { kind: "pane", instanceId: "fear-greed:macro" },
+    },
+    second: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.58,
+      first: { kind: "pane", instanceId: "econ-statistics:macro" },
+      second: {
+        kind: "split",
+        axis: "vertical",
+        ratio: 0.5,
+        first: { kind: "pane", instanceId: "volatility-term-structure:macro" },
+        second: { kind: "pane", instanceId: "credit-conditions:macro" },
+      },
+    },
+  },
+  instances: [
+    {
+      instanceId: "market-valuation:macro",
+      paneId: "market-valuation",
+      binding: { kind: "none" },
+      settings: { indicator: "buffett", range: "25Y" },
+    },
+    {
+      instanceId: "econ-statistics:macro",
+      paneId: "econ-statistics",
+      binding: { kind: "none" },
+      settings: { stat: "cpi-yoy", range: "20Y" },
+    },
+    {
+      instanceId: "fear-greed:macro",
+      paneId: "fear-greed",
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "volatility-term-structure:macro",
+      paneId: "volatility-term-structure",
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "credit-conditions:macro",
+      paneId: "credit-conditions",
+      binding: { kind: "none" },
+    },
+  ],
+  floating: [],
+  detached: [],
+};
+
+const DEFAULT_MONITOR_LAYOUT: LayoutConfig = {
+  dockRoot: {
+    kind: "split",
+    axis: "vertical",
+    ratio: 0.48,
+    first: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.42,
+      first: { kind: "pane", instanceId: "news-top:main" },
+      second: { kind: "pane", instanceId: "market-movers:main" },
+    },
+    second: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.42,
+      first: { kind: "pane", instanceId: "world-indices:main" },
+      second: { kind: "pane", instanceId: "econ-calendar:main" },
+    },
+  },
+  instances: [
+    {
+      instanceId: "news-top:main",
+      paneId: "news-top",
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "market-movers:main",
+      paneId: "market-movers",
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "world-indices:main",
+      paneId: "world-indices",
+      binding: { kind: "none" },
+    },
+    {
+      instanceId: "econ-calendar:main",
+      paneId: "econ-calendar",
+      binding: { kind: "none" },
+    },
+  ],
+  floating: [],
+  detached: [],
+};
+
+export const DEFAULT_LAYOUT = DEFAULT_HOME_LAYOUT;
+const BLANK_LAYOUT: LayoutConfig = {
+  dockRoot: null,
+  instances: [],
+  floating: [],
+  detached: [],
+};
+
+let nextPaneInstanceSeq = 0;
+
+function clampDockRatio(ratio: number | undefined): number {
+  if (typeof ratio !== "number" || !Number.isFinite(ratio)) return 0.5;
+  return Math.max(0.1, Math.min(0.9, ratio));
+}
+
+function isDockAxis(value: unknown): value is DockSplitNode["axis"] {
+  return value === "horizontal" || value === "vertical";
+}
+
+function cloneDockNode(node: DockLayoutNode): DockLayoutNode {
+  if (node.kind === "pane") {
+    return { kind: "pane", instanceId: node.instanceId };
+  }
+  return {
+    kind: "split",
+    axis: node.axis,
+    ratio: node.ratio,
+    first: cloneDockNode(node.first),
+    second: cloneDockNode(node.second),
+    ...(node.tabs ? { tabs: { active: node.tabs.active } } : {}),
+  };
+}
+
+function normalizeDockNode(
+  node: DockLayoutNode | null | undefined,
+  validInstanceIds: Set<string>,
+  seenPaneIds: Set<string>,
+): DockLayoutNode | null {
+  if (!node || typeof node !== "object") return null;
+
+  if ((node as DockPaneNode).kind === "pane") {
+    const instanceId = (node as DockPaneNode).instanceId;
+    if (typeof instanceId !== "string" || !validInstanceIds.has(instanceId) || seenPaneIds.has(instanceId)) {
+      return null;
+    }
+    seenPaneIds.add(instanceId);
+    return { kind: "pane", instanceId };
+  }
+
+  if ((node as DockSplitNode).kind !== "split") return null;
+  const split = node as DockSplitNode;
+  if (split.tabs) {
+    // Whatever is under a stack is its tabs, nested or not: a pane put back
+    // at a place inside it (its remembered spot) joins it.
+    const plain: DockSplitNode = { kind: "split", axis: split.axis, ratio: split.ratio, first: split.first, second: split.second };
+    const flat = normalizeDockNode(plain, validInstanceIds, seenPaneIds);
+    const active = typeof split.tabs.active === "string" ? split.tabs.active : null;
+    return flat ? buildDockStack(getDockedPaneIdsFromNode(flat), active) : null;
+  }
+  const first = normalizeDockNode(split.first, validInstanceIds, seenPaneIds);
+  const second = normalizeDockNode(split.second, validInstanceIds, seenPaneIds);
+  if (!first && !second) return null;
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    kind: "split",
+    axis: isDockAxis(split.axis) ? split.axis : "horizontal",
+    ratio: clampDockRatio(split.ratio),
+    first,
+    second,
+  };
+}
+
+function getDockedPaneIdsFromNode(node: DockLayoutNode | null, result: string[] = []): string[] {
+  if (!node) return result;
+  if (node.kind === "pane") {
+    result.push(node.instanceId);
+    return result;
+  }
+  getDockedPaneIdsFromNode(node.first, result);
+  getDockedPaneIdsFromNode(node.second, result);
+  return result;
+}
+
+export function getPlacedPaneInstanceIds(layout: LayoutConfig): string[] {
+  return [...new Set([
+    ...getDockedPaneIdsFromNode(layout.dockRoot),
+    ...layout.floating.map((entry) => entry.instanceId),
+    ...(layout.detached ?? []).map((entry) => entry.instanceId),
+  ])];
+}
+
+export function createPaneInstanceId(paneId: string): string {
+  nextPaneInstanceSeq += 1;
+  return `${paneId}:${Date.now().toString(36)}${nextPaneInstanceSeq.toString(36)}`;
+}
+
+function clonePaneBinding(binding: PaneBinding | undefined): PaneBinding | undefined {
+  if (!binding) return undefined;
+  return { ...binding };
+}
+
+export function clonePlacementMemory(memory: PanePlacementMemory | undefined): PanePlacementMemory | undefined {
+  if (!memory) return undefined;
+  return {
+    docked: memory.docked ? {
+      path: memory.docked.path ? [...memory.docked.path] : undefined,
+      anchorInstanceId: memory.docked.anchorInstanceId,
+      position: memory.docked.position,
+    } : undefined,
+    floating: memory.floating ? { ...memory.floating } : undefined,
+    detached: memory.detached ? { ...memory.detached } : undefined,
+  };
+}
+
+function clonePaneMovedFrom(movedFrom: PaneMovedFrom): PaneMovedFrom {
+  return {
+    layoutId: movedFrom.layoutId,
+    ...(movedFrom.docked ? {
+      docked: { ...movedFrom.docked, ...(movedFrom.docked.path ? { path: [...movedFrom.docked.path] } : {}) },
+    } : {}),
+    ...(movedFrom.floating ? { floating: { ...movedFrom.floating } } : {}),
+    ...(movedFrom.links ? { links: movedFrom.links.map((link) => ({ ...link })) } : {}),
+  };
+}
+
+function cloneUnknownValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((entry) => cloneUnknownValue(entry)) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, cloneUnknownValue(entry)]),
+    ) as T;
+  }
+  return value;
+}
+
+export function clonePaneSettings(settings: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!settings) return undefined;
+  return cloneUnknownValue(settings);
+}
+
+export function isTickerPaneId(paneId: string): boolean {
+  return TICKER_PANE_IDS.has(paneId);
+}
+
+function isTickerPaneInstance(instance: PaneInstanceConfig): boolean {
+  return isTickerPaneId(instance.paneId);
+}
+
+export function isFixedTickerPane(instance: PaneInstanceConfig): boolean {
+  return isTickerPaneInstance(instance) && instance.binding?.kind === "fixed";
+}
+
+export function findPrimaryPaneInstance(layout: LayoutConfig, paneId: string): PaneInstanceConfig | undefined {
+  const normalizedPaneId = normalizePaneId(paneId);
+  const instances = layout.instances.filter((instance) => instance.paneId === normalizedPaneId);
+  if (instances.length === 0) return undefined;
+  if (!isTickerPaneId(normalizedPaneId)) return instances[0];
+  return instances.find((instance) => instance.instanceId === `${paneId}:main` && instance.binding?.kind !== "fixed")
+    ?? instances.find((instance) => instance.instanceId === `${normalizedPaneId}:main` && instance.binding?.kind !== "fixed")
+    ?? instances.find((instance) => instance.binding?.kind !== "fixed");
+}
+
+export function resolvePaneInstance(layout: LayoutConfig, paneIdOrInstanceId: string): PaneInstanceConfig | undefined {
+  return findPaneInstance(layout, paneIdOrInstanceId) ?? findPrimaryPaneInstance(layout, paneIdOrInstanceId);
+}
+
+export function resolveFollowBindingInstance(
+  layout: LayoutConfig,
+  paneIdOrInstanceId: string | null | undefined,
+  matcher: (instance: PaneInstanceConfig) => boolean,
+  seen = new Set<string>(),
+): PaneInstanceConfig | undefined {
+  if (!paneIdOrInstanceId) return undefined;
+  const instance = resolvePaneInstance(layout, paneIdOrInstanceId);
+  if (!instance || seen.has(instance.instanceId)) return undefined;
+  seen.add(instance.instanceId);
+  if (matcher(instance)) return instance;
+  if (instance.binding?.kind === "follow") {
+    return resolveFollowBindingInstance(layout, instance.binding.sourceInstanceId, matcher, seen);
+  }
+  return undefined;
+}
+
+export function createPaneInstance(
+  paneId: string,
+  options: Partial<PaneInstanceConfig> = {},
+): PaneInstanceConfig {
+  const normalizedPaneId = normalizePaneId(paneId);
+  return {
+    instanceId: options.instanceId ?? createPaneInstanceId(normalizedPaneId),
+    paneId: normalizedPaneId,
+    title: options.title,
+    binding: clonePaneBinding(options.binding) ?? { kind: "none" },
+    params: options.params ? { ...options.params } : undefined,
+    settings: clonePaneSettings(options.settings),
+    placementMemory: clonePlacementMemory(options.placementMemory),
+    locked: options.locked === true ? true : undefined,
+  };
+}
+
+export function removePaneInstances(layout: LayoutConfig, instanceIds: Iterable<string>): LayoutConfig {
+  const removedIds = new Set(instanceIds);
+  if (removedIds.size === 0) return layout;
+
+  const retainedInstances = layout.instances.filter((instance) => !removedIds.has(instance.instanceId));
+  const validInstanceIds = new Set(retainedInstances.map((instance) => instance.instanceId));
+  const instances = retainedInstances
+    .map((instance) => {
+      const memory = clonePlacementMemory(instance.placementMemory);
+      if (!memory?.docked?.anchorInstanceId || validInstanceIds.has(memory.docked.anchorInstanceId)) {
+        return instance;
+      }
+      const docked = {
+        ...memory.docked,
+        anchorInstanceId: undefined,
+      };
+      const nextDocked = docked.path || docked.position ? docked : undefined;
+      const placementMemory = nextDocked || memory.floating || memory.detached
+        ? { ...memory, docked: nextDocked }
+        : undefined;
+      return { ...instance, placementMemory };
+    });
+  const dockRoot = normalizeDockNode(layout.dockRoot, validInstanceIds, new Set<string>());
+  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
+  const detached = layout.detached ?? [];
+  return {
+    ...layout,
+    instances,
+    dockRoot,
+    floating: layout.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
+    detached: detached.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
+  };
+}
+
+export function removeUnreachablePaneInstances(layout: LayoutConfig): LayoutConfig {
+  const instancesById = new Map(layout.instances.map((instance) => [instance.instanceId, instance] as const));
+  const reachableIds = new Set(getPlacedPaneInstanceIds(layout));
+  const pendingIds = [...reachableIds];
+
+  for (let index = 0; index < pendingIds.length; index += 1) {
+    const instance = instancesById.get(pendingIds[index]!);
+    if (instance?.binding?.kind !== "follow") continue;
+    const sourceId = instance.binding.sourceInstanceId;
+    if (!instancesById.has(sourceId) || reachableIds.has(sourceId)) continue;
+    reachableIds.add(sourceId);
+    pendingIds.push(sourceId);
+  }
+
+  return removePaneInstances(
+    layout,
+    layout.instances
+      .filter((instance) => !reachableIds.has(instance.instanceId))
+      .map((instance) => instance.instanceId),
+  );
+}
+
+export function normalizePaneLayout(
+  layout: LayoutConfig,
+  options?: {
+    defaultFollowSourceInstanceId?: string | null;
+    /** Last resolved symbol used to pin an orphaned follower; otherwise it remains safely unlinked. */
+    resolveOrphanSymbol?: (instanceId: string) => string | null;
+    /** Pins an orphaned follower on its last symbol; by default only its binding changes. */
+    pinOrphan?: (instance: PaneInstanceConfig, symbol: string | null) => PaneInstanceConfig;
+    /**
+     * Panes outside this layout that a pane here may follow: on another
+     * desktop window's tab. A link to one is not orphaned.
+     */
+    externalSourceIds?: ReadonlySet<string>;
+  },
+): LayoutConfig {
+  const fallbackSourceId = options?.defaultFollowSourceInstanceId ?? null;
+  const fallbackAvailable = !!fallbackSourceId && layout.instances.some((instance) => instance.instanceId === fallbackSourceId);
+
+  let nextLayout = layout;
+  if (fallbackAvailable) {
+    const nextInstances: PaneInstanceConfig[] = layout.instances.map((instance) => {
+      if (!isTickerPaneInstance(instance) || TICKERLESS_VIEW_PANE_IDS.has(instance.paneId)) return instance;
+      if (instance.binding?.kind === "fixed" || instance.binding?.kind === "follow") return instance;
+      return {
+        ...instance,
+        binding: { kind: "follow", sourceInstanceId: fallbackSourceId! },
+      };
+    });
+    if (nextInstances.some((instance, index) => instance !== layout.instances[index])) {
+      nextLayout = {
+        ...layout,
+        instances: nextInstances,
+      };
+    }
+  }
+
+  for (;;) {
+    const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
+    const removedIds = new Set<string>();
+    const orphanPins = new Map<string, PaneInstanceConfig>();
+
+    for (const instance of nextLayout.instances) {
+      if (
+        instance.binding?.kind === "follow"
+        && !validInstanceIds.has(instance.binding.sourceInstanceId)
+        && !options?.externalSourceIds?.has(instance.binding.sourceInstanceId)
+      ) {
+        // Structural helpers remove the source before the app can resolve its last ticker. Preserve
+        // the dangling binding until the runtime normalizes again with a resolver.
+        if (!options?.resolveOrphanSymbol) continue;
+        const orphanSymbol = options.resolveOrphanSymbol(instance.instanceId)?.trim() || null;
+        orphanPins.set(instance.instanceId, options.pinOrphan?.(instance, orphanSymbol) ?? {
+          ...instance,
+          binding: orphanSymbol ? { kind: "fixed", symbol: orphanSymbol } : { kind: "none" },
+        });
+        continue;
+      }
+
+      if (
+        isTickerPaneInstance(instance)
+        && instance.paneId !== TICKER_RESEARCH_PANE_ID
+        && !TICKERLESS_VIEW_PANE_IDS.has(instance.paneId)
+        && instance.binding?.kind !== "follow"
+        && instance.binding?.kind !== "fixed"
+      ) {
+        removedIds.add(instance.instanceId);
+        continue;
+      }
+
+      if (instance.binding?.kind === "fixed" && instance.binding.symbol.trim().length === 0) {
+        removedIds.add(instance.instanceId);
+      }
+    }
+
+    if (orphanPins.size > 0) {
+      nextLayout = {
+        ...nextLayout,
+        instances: nextLayout.instances.map((instance) => orphanPins.get(instance.instanceId) ?? instance),
+      };
+    }
+
+    if (removedIds.size > 0) {
+      nextLayout = removePaneInstances(nextLayout, removedIds);
+      continue;
+    }
+    if (orphanPins.size === 0) break;
+  }
+
+  const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
+  const dockRoot = normalizeDockNode(nextLayout.dockRoot, validInstanceIds, new Set<string>());
+  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
+  const detached = (nextLayout.detached ?? [])
+    .filter((entry) => validInstanceIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId))
+    .filter((entry, index, entries) => entries.findIndex((candidate) => candidate.instanceId === entry.instanceId) === index)
+    .map((entry) => ({
+      instanceId: entry.instanceId,
+      x: entry.x,
+      y: entry.y,
+      width: entry.width,
+      height: entry.height,
+    }));
+  const detachedPaneIds = new Set(detached.map((entry) => entry.instanceId));
+
+  return {
+    dockRoot,
+    instances: nextLayout.instances.map((instance) => ({
+      ...instance,
+      binding: clonePaneBinding(instance.binding),
+      params: instance.params ? { ...instance.params } : undefined,
+      settings: clonePaneSettings(instance.settings),
+      placementMemory: clonePlacementMemory(instance.placementMemory),
+      ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
+    })),
+    floating: nextLayout.floating
+      .filter((entry) => (
+        validInstanceIds.has(entry.instanceId)
+        && !dockedPaneIds.has(entry.instanceId)
+        && !detachedPaneIds.has(entry.instanceId)
+      ))
+      .map((entry) => ({ ...entry })),
+    detached,
+  };
+}
+
+export function cloneLayout(layout: LayoutConfig): LayoutConfig {
+  const detached = layout.detached ?? [];
+  return {
+    dockRoot: layout.dockRoot ? cloneDockNode(layout.dockRoot) : null,
+    instances: layout.instances.map((instance) => ({
+      ...instance,
+      binding: clonePaneBinding(instance.binding),
+      params: instance.params ? { ...instance.params } : undefined,
+      settings: clonePaneSettings(instance.settings),
+      placementMemory: clonePlacementMemory(instance.placementMemory),
+      ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
+    })),
+    floating: layout.floating.map((entry) => ({ ...entry })),
+    detached: detached.map((entry) => ({ ...entry })),
+  };
+}
+
+export function createBlankLayout(): LayoutConfig {
+  return cloneLayout(BLANK_LAYOUT);
+}
+
+// Every pane hook selects its instance on every store update, so a linear
+// scan multiplies by subscriber count times dispatch rate. Layout updates
+// replace the instances array, which keys the index; the entry is verified on
+// read so an in-place edit can only cost a rebuild, never a stale hit.
+const paneInstanceIndexes = new WeakMap<readonly PaneInstanceConfig[], Map<string, number>>();
+
+function buildPaneInstanceIndex(instances: readonly PaneInstanceConfig[]): Map<string, number> {
+  const index = new Map<string, number>();
+  instances.forEach((instance, position) => {
+    if (!index.has(instance.instanceId)) index.set(instance.instanceId, position);
+  });
+  paneInstanceIndexes.set(instances, index);
+  return index;
+}
+
+export function findPaneInstance(layout: LayoutConfig, instanceId: string): PaneInstanceConfig | undefined {
+  const instances = layout.instances;
+  let index = paneInstanceIndexes.get(instances) ?? buildPaneInstanceIndex(instances);
+  let position = index.get(instanceId);
+  let candidate = position === undefined ? undefined : instances[position];
+  if (candidate?.instanceId === instanceId) return candidate;
+  index = buildPaneInstanceIndex(instances);
+  position = index.get(instanceId);
+  candidate = position === undefined ? undefined : instances[position];
+  return candidate?.instanceId === instanceId ? candidate : undefined;
+}
+
+export function createDefaultConfig(dataDir: string): AppConfig {
+  const layout = cloneLayout(DEFAULT_HOME_LAYOUT);
+  return {
+    dataDir,
+    configVersion: CURRENT_CONFIG_VERSION,
+    baseCurrency: "USD",
+    refreshIntervalMinutes: 30,
+    portfolios: [{ id: "main", name: "Main Portfolio", currency: "USD" }],
+    watchlists: [{ id: "watchlist", name: "Watchlist" }],
+    layout,
+    layouts: [
+      { name: "Home", layout: cloneLayout(layout), paneState: {} },
+      { name: "Monitor", layout: cloneLayout(DEFAULT_MONITOR_LAYOUT), paneState: {} },
+      { name: "Macro", layout: cloneLayout(DEFAULT_MACRO_LAYOUT), paneState: {} },
+    ],
+    activeLayoutIndex: 0,
+    brokerInstances: [],
+    disabledPlugins: [],
+    seededPlugins: [],
+    disabledSources: [],
+    pluginConfig: {},
+    theme: "white",
+    chartPreferences: {
+      renderer: "auto",
+    },
+    valueFlashingEnabled: true,
+    fontSize: 12,
+    recentTickers: [],
+    recentCommands: [],
+    commandBarOpens: 0,
+  };
+}
+
+export function materializeDetachedPanesAsFloating(layout: LayoutConfig): LayoutConfig {
+  const detached = layout.detached ?? [];
+  if (detached.length === 0) return cloneLayout(layout);
+
+  return normalizePaneLayout({
+    ...cloneLayout(layout),
+    floating: [
+      ...layout.floating.map((entry) => ({ ...entry })),
+      ...detached.map((entry) => ({
+        instanceId: entry.instanceId,
+        x: entry.x,
+        y: entry.y,
+        width: entry.width,
+        height: entry.height,
+      })),
+    ],
+    detached: [],
+  });
+}

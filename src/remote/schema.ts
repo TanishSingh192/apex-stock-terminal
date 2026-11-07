@@ -1,0 +1,545 @@
+import type {
+  RemoteControlSchema,
+  RemoteJsonSchema,
+  RemoteOperationDescriptor,
+  RemoteOperationSchema,
+  RemoteResourceSchema,
+  RemoteSideEffectLevel,
+  RemoteWriteTier,
+} from "./types";
+import {
+  PANE_SCREENSHOT_MAX_BYTES,
+  PANE_SCREENSHOT_MAX_EDGE,
+  PANE_SCREENSHOT_MIN_WIDTH,
+} from "./pane-screenshot";
+
+export const REMOTE_RESOURCES: RemoteResourceSchema[] = [
+  { uri: "app://snapshot", description: "Current app snapshot including layout, focus, panes, command bar, and plugin/capability catalogs. app.activePanel is deprecated and always \"left\"; read app.focusedPaneId." },
+  { uri: "app://config", description: "Current app config.", patchable: true },
+  { uri: "app://layout/current", description: "Current active layout.", patchable: true },
+  { uri: "app://layouts", description: "Saved layouts." },
+  { uri: "app://panes", description: "Current pane instances with placement and runtime state." },
+  { uri: "app://pane-types", description: "Registered pane types from core and plugins." },
+  { uri: "app://pane-templates", description: "Registered pane templates from core and plugins." },
+  { uri: "app://pane-state/{paneId}", description: "Runtime state for a pane instance.", patchable: true },
+  { uri: "app://pane-settings/{paneId}", description: "Persisted settings for a pane instance.", patchable: true },
+  { uri: "app://commands", description: "Registered command-bar commands." },
+  { uri: "app://command-bar", description: "Current command-bar state and semantic result rows." },
+  { uri: "app://command-bar/results", description: "Current semantic command-bar result rows." },
+  { uri: "app://form", description: "The open form or confirm: kind, title, fields with values and options, error, pending state, and submit label, with covered: true while another dialog sits over it; { open: false } when none is open, with otherDialogOpen: true while another dialog (pane settings) is." },
+  { uri: "app://capabilities", description: "Registered plugin capability manifests." },
+  { uri: "app://accounts", description: "Broker profiles and their accounts: net liquidation, cash by currency, margin requirements, margin loan, leverage, day and unrealized P&L, with source and as-of times." },
+  { uri: "app://auth", description: "What the client believes about its cloud session: credential present, checked, cached user plan and verification. No secrets." },
+  { uri: "app://remote/help", description: "Agent-oriented remote usage guide with efficient recipes and caveats." },
+  { uri: "ui://tree", description: "Live semantic UI node tree populated by shared controls and interactive primitives." },
+];
+
+const stringSchema = { type: "string" } satisfies RemoteJsonSchema;
+const requiredStringSchema = { type: "string", minLength: 1 } satisfies RemoteJsonSchema;
+const booleanSchema = { type: "boolean" } satisfies RemoteJsonSchema;
+const indexSchema = { type: "integer", minimum: 0 } satisfies RemoteJsonSchema;
+const openObjectSchema = { type: "object", additionalProperties: true } satisfies RemoteJsonSchema;
+const anySchema = {} satisfies RemoteJsonSchema;
+
+function objectSchema(
+  properties: Record<string, RemoteJsonSchema> = {},
+  required: string[] = [],
+): RemoteJsonSchema {
+  return {
+    type: "object",
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+    additionalProperties: false,
+  };
+}
+
+const paneIdInput = objectSchema({ paneId: requiredStringSchema }, ["paneId"]);
+const watchlistChangeInput = objectSchema({
+  symbol: { type: "string", minLength: 1, maxLength: 32, description: "Ticker symbol, such as MSFT." },
+  exchange: {
+    type: "string",
+    minLength: 1,
+    maxLength: 16,
+    description: "Listing exchange, for a symbol that trades in several places, such as NASDAQ or LSE.",
+  },
+  watchlist: {
+    type: "string",
+    minLength: 1,
+    maxLength: 120,
+    description: "Watchlist id or name from app://config. Without it, the default watchlist: the first personal one.",
+  },
+}, ["symbol"]);
+
+export const REMOTE_OPERATIONS: RemoteOperationSchema[] = [
+  op(
+    "app.openCommandBar",
+    "Open the command bar with an optional query and optional mode. Fails while a dialog (a form, a confirm, pane settings) is open.",
+    "{ query?: string, mode?: 'command' | 'ticker' | 'default' }",
+    "local-write",
+    objectSchema({
+      query: stringSchema,
+      mode: { type: "string", enum: ["command", "ticker", "default"] },
+    }),
+  ),
+  op("app.closeCommandBar", "Close the command bar.", "{}", "local-write", objectSchema()),
+  op(
+    "app.closeDialog",
+    "Close the dialog on top, as Esc would: a form, a confirm, pane settings, or a picker opened over a form. Fails when no dialog is open.",
+    "{}",
+    "local-write",
+    objectSchema(),
+  ),
+  op(
+    "app.setCommandBarQuery",
+    "Set the command bar query.",
+    "{ query: string }",
+    "local-write",
+    objectSchema({ query: requiredStringSchema }, ["query"]),
+  ),
+  op(
+    "app.search",
+    "Open command-bar search without requiring UI prefix syntax. Fails while a dialog is open.",
+    "{ mode?: 'command' | 'ticker' | 'default', query?: string }",
+    "local-write",
+    objectSchema({
+      mode: { type: "string", enum: ["command", "ticker", "default"] },
+      query: stringSchema,
+    }),
+  ),
+  op(
+    "app.switchPanel",
+    "Focus the leftmost or rightmost docked pane.",
+    "{ panel: 'left' | 'right' }",
+    "local-write",
+    objectSchema({ panel: { type: "string", enum: ["left", "right"] } }, ["panel"]),
+  ),
+  op(
+    "app.notify",
+    "Show an in-app notification.",
+    "{ body: string, type?: 'info' | 'success' | 'error' }",
+    "local-write",
+    objectSchema({
+      body: requiredStringSchema,
+      type: { type: "string", enum: ["info", "success", "error"] },
+    }, ["body"]),
+  ),
+  op(
+    "commandBar.activateResult",
+    "Activate a visible command-bar result by zero-based index, node id, item id, or label.",
+    "{ index?: number, nodeId?: string, itemId?: string, label?: string }",
+    "local-write",
+    objectSchema({ index: indexSchema, nodeId: stringSchema, itemId: stringSchema, label: stringSchema }),
+  ),
+  op("pane.show", "Show or focus a pane type.", "{ paneId: string }", "local-write", paneIdInput),
+  op("pane.focus", "Focus a pane instance or pane type.", "{ paneId: string }", "local-write", paneIdInput),
+  op("pane.close", "Close a pane instance or pane type.", "{ paneId: string }", "local-write", paneIdInput),
+  {
+    ...op(
+      "pane.screenshot",
+      "Capture one pane as a PNG, as it looks on screen now: the focused pane, or paneId (an instance id or pane type from app://panes). "
+        + "It only reads what is already on the person's own screen. Desktop app only: the terminal (TUI) app draws text, not pixels. "
+        + `The image is twice the pane's on-screen size by default, at most ${PANE_SCREENSHOT_MAX_EDGE} px on its longer side and ${PANE_SCREENSHOT_MAX_BYTES / 1024} KB; `
+        + `width asks for another width (${PANE_SCREENSHOT_MIN_WIDTH} to ${PANE_SCREENSHOT_MAX_EDGE} px). `
+        + "A pane in its own window, behind another tab or in another layout is not drawn here and cannot be captured.",
+      "{ paneId?: string, width?: number }",
+      "none",
+      objectSchema({
+        paneId: { type: "string", minLength: 1, description: "Pane instance id or pane type. Defaults to the focused pane." },
+        width: {
+          type: "integer",
+          minimum: PANE_SCREENSHOT_MIN_WIDTH,
+          maximum: PANE_SCREENSHOT_MAX_EDGE,
+          description: "Image width in pixels; the height keeps the pane's proportions.",
+        },
+      }),
+    ),
+    returnsImage: true,
+  },
+  op(
+    "pane.createFromTemplate",
+    "Open a pane from a registered template. It only opens the pane: it adds nothing to a portfolio or watchlist.",
+    "{ templateId: string, options?: object }",
+    "local-write",
+    objectSchema({ templateId: requiredStringSchema, options: openObjectSchema }, ["templateId"]),
+  ),
+  op(
+    "view.create",
+    "Create a custom view pane: a table from a data function with columns, a filter, and a sort. "
+      + "The source loads once first; if it cannot, no pane opens and the answer is its error. "
+      + "spec = { source: { pane: <function code>, argument?: <one string>, options?: { <flag>: <value> } }, projection: { columns?: [{ key, label?, transform? }], filters?: [{ key, op, value }], sort?: { by, direction }, limit? }, presentation?: { title?, symbolKey? } }. "
+      + "pane is a function code (app://pane-templates says what each does), never an invented name; an unknown one is answered with the closest codes and the valid ones. "
+      + "argument is always one string, several tickers separated by spaces: \"CME AAPL\". "
+      + "options sets the function's own flags; a wrong flag or value is answered with the ones it takes. "
+      + "Column, filter and sort keys are keys the source's rows carry; one they do not is answered with the keys they do, and no pane opens.",
+    "{ name?: string, spec: object }",
+    "local-write",
+    objectSchema({ name: stringSchema, spec: openObjectSchema }, ["spec"]),
+  ),
+  op(
+    "view.update",
+    "Replace the spec of an existing custom view pane. Same spec and sources as view.create; a source that cannot load leaves the view as it was.",
+    "{ paneId: string, spec: object, name?: string }",
+    "local-write",
+    objectSchema({ paneId: requiredStringSchema, spec: openObjectSchema, name: stringSchema }, ["paneId", "spec"]),
+  ),
+  op(
+    "pane.setState",
+    "Patch pane runtime state.",
+    "{ paneId: string, patch: object }",
+    "local-write",
+    objectSchema({ paneId: requiredStringSchema, patch: openObjectSchema }, ["paneId", "patch"]),
+  ),
+  op(
+    "pane.setSetting",
+    "Set one pane setting using the pane's registered setting field when available.",
+    "{ paneId: string, key: string, value: any }",
+    "local-write",
+    objectSchema({ paneId: requiredStringSchema, key: requiredStringSchema, value: anySchema }, ["paneId", "key", "value"]),
+  ),
+  op(
+    "ticker.navigate",
+    "Show any ticker in the ticker research pane the user is on, or the best available one, as in \"switch to MSFT\".",
+    "{ symbol: string, sourcePaneId?: string }",
+    "local-write",
+    objectSchema({ symbol: requiredStringSchema, sourcePaneId: stringSchema }, ["symbol"]),
+  ),
+  op(
+    "ticker.pin",
+    "Open or focus a fixed ticker research pane.",
+    "{ symbol: string, floating?: boolean, forceNewPane?: boolean, paneType?: string }",
+    "local-write",
+    objectSchema({
+      symbol: requiredStringSchema,
+      floating: booleanSchema,
+      forceNewPane: booleanSchema,
+      paneType: stringSchema,
+    }, ["symbol"]),
+  ),
+  op(
+    "ticker.select",
+    "Move the cursor of a portfolio or watchlist pane to a ticker on its list, so the panes that follow the list show it. "
+      + "To show any ticker in a ticker pane, use ticker.navigate.",
+    "{ symbol: string, paneId?: string }",
+    "local-write",
+    objectSchema({ symbol: requiredStringSchema, paneId: stringSchema }, ["symbol"]),
+  ),
+  op(
+    "ticker.switchTab",
+    "Switch ticker research tab.",
+    "{ tabId: string, paneId?: string }",
+    "local-write",
+    objectSchema({ tabId: requiredStringSchema, paneId: stringSchema }, ["tabId"]),
+  ),
+  op(
+    "watchlist.add",
+    "Add a ticker to one of the person's own watchlists. The app asks them first, naming the list, ticker and exchange. "
+      + "The result says what changed: added, already on the list, or declined. Team watchlists and portfolios are refused.",
+    "{ symbol: string, exchange?: string, watchlist?: string }",
+    "local-write",
+    watchlistChangeInput,
+    "user-data",
+  ),
+  op(
+    "watchlist.remove",
+    "Remove a ticker from one of the person's own watchlists. The app asks them first, naming the list, ticker and exchange. "
+      + "The result says what changed: removed, not on the list, or declined. Team watchlists and portfolios are refused.",
+    "{ symbol: string, exchange?: string, watchlist?: string }",
+    "local-write",
+    watchlistChangeInput,
+    "user-data",
+  ),
+  op(
+    "layout.switch",
+    "Switch active layout by index.",
+    "{ index: number }",
+    "local-write",
+    objectSchema({ index: indexSchema }, ["index"]),
+  ),
+  op(
+    "layout.new",
+    "Create a new blank layout.",
+    "{ name: string }",
+    "local-write",
+    objectSchema({ name: requiredStringSchema }, ["name"]),
+  ),
+  op(
+    "layout.rename",
+    "Rename a layout.",
+    "{ index: number, name: string }",
+    "local-write",
+    objectSchema({ index: indexSchema, name: requiredStringSchema }, ["index", "name"]),
+  ),
+  op(
+    "layout.duplicate",
+    "Duplicate a layout.",
+    "{ index: number }",
+    "local-write",
+    objectSchema({ index: indexSchema }, ["index"]),
+  ),
+  op(
+    "layout.delete",
+    "Delete a layout.",
+    "{ index: number }",
+    "local-write",
+    objectSchema({ index: indexSchema }, ["index"]),
+    "user-data",
+  ),
+  op("layout.undo", "Undo last layout change.", "{}", "local-write", objectSchema()),
+  op("layout.redo", "Redo last layout change.", "{}", "local-write", objectSchema()),
+  op("layout.gridlock", "Tidy all panes into a dense layout.", "{}", "local-write", objectSchema()),
+  op(
+    "layout.closeFloating",
+    "Close all floating panes in the active layout.",
+    "{}",
+    "local-write",
+    objectSchema(),
+  ),
+  op(
+    "layout.placePane",
+    "Move a pane to a layout region.",
+    "{ paneId: string, region: 'left' | 'right' | 'top' | 'bottom' | 'floating', relativeTo?: string }",
+    "local-write",
+    objectSchema({
+      paneId: requiredStringSchema,
+      region: { type: "string", enum: ["left", "right", "top", "bottom", "floating"] },
+      relativeTo: stringSchema,
+    }, ["paneId", "region"]),
+  ),
+  op(
+    "layout.focusRegion",
+    "Focus a pane by visual layout region.",
+    "{ region: 'left' | 'right' | 'top' | 'bottom' | 'center' }",
+    "local-write",
+    objectSchema({
+      region: { type: "string", enum: ["left", "right", "top", "bottom", "center"] },
+    }, ["region"]),
+  ),
+  op(
+    "layout.setGrid",
+    "Dock visible or specified panes into a simple grid.",
+    "{ paneIds?: string[], columns?: number }",
+    "local-write",
+    objectSchema({
+      paneIds: { type: "array", items: requiredStringSchema },
+      columns: { type: "integer", minimum: 1 },
+    }),
+  ),
+  op("desktop.popOutPane", "Pop a pane into a detached desktop window.", "{ paneId: string }", "local-write", paneIdInput),
+  op("desktop.dockPane", "Dock a detached desktop pane.", "{ paneId: string }", "local-write", paneIdInput),
+  op(
+    "desktop.closeDetachedPane",
+    "Close a detached desktop pane.",
+    "{ paneId: string }",
+    "local-write",
+    paneIdInput,
+  ),
+  op(
+    "desktop.focusDetachedPane",
+    "Focus a detached desktop pane.",
+    "{ paneId: string }",
+    "local-write",
+    paneIdInput,
+  ),
+  op(
+    "capability.invoke",
+    "Invoke a registered plugin capability operation.",
+    "{ capabilityId: string, operationId: string, payload?: object }",
+    "external-side-effect",
+    objectSchema({
+      capabilityId: requiredStringSchema,
+      operationId: requiredStringSchema,
+      payload: openObjectSchema,
+    }, ["capabilityId", "operationId"]),
+  ),
+  op(
+    "ui.invoke",
+    "Invoke an action on a live semantic UI node.",
+    "{ nodeId: string, action?: string, input?: any }",
+    "local-write",
+    objectSchema({ nodeId: requiredStringSchema, action: stringSchema, input: anySchema }, ["nodeId"]),
+  ),
+  op(
+    "ui.invokeMatching",
+    "Invoke an action on the first semantic UI node matching role, label, index, or metadata. While a form or confirm is open, its own nodes (metadata.scope 'form') match first; while another dialog covers it, they do not match.",
+    "{ role?: string, label?: string, contains?: string, index?: number, action?: string, input?: any, metadata?: object }",
+    "local-write",
+    objectSchema({
+      role: stringSchema,
+      label: stringSchema,
+      contains: stringSchema,
+      index: indexSchema,
+      action: stringSchema,
+      input: anySchema,
+      metadata: openObjectSchema,
+    }),
+  ),
+];
+
+export const REMOTE_AGENT_HELP = {
+  title: "Gloom remote control guide",
+  quickStart: [
+    "Read app://snapshot once to orient; it includes schema, current layout, panes, command bar state, and semantic UI nodes.",
+    "Prefer app-level operations such as app.search, layout.setGrid, layout.closeFloating, and ticker.pin before falling back to ui.invoke.",
+    "Use commandBar.activateResult with label, itemId, or index after app.search; avoid raw node ids unless there is no stable semantic selector.",
+    "For list-like surfaces, prefer semantic list activation through commandBar.activateResult or ui.invokeMatching.",
+    "Use batch for multi-step flows; steps run sequentially and can return a compact final state so a separate read is not required.",
+  ],
+  resources: [
+    { uri: "app://command-bar", use: "Current command-bar query, open state, selected row, and semantic result rows." },
+    { uri: "app://command-bar/results", use: "Just the visible command-bar result/list rows." },
+    { uri: "app://form", use: "The open form or confirm, with field ids, values, options, error and pending state, or whether another dialog is open. Every call includes it as `form`." },
+    { uri: "ui://tree", use: "Low-level live semantic controls; use when no app-level operation exists." },
+    { uri: "app://panes", use: "Pane instances, placement, focus, and runtime state." },
+  ],
+  recipes: [
+    {
+      goal: "Search for a ticker and open the first result",
+      requests: [
+        { type: "call", operation: "app.search", input: { mode: "ticker", query: "google" } },
+        { type: "call", operation: "commandBar.activateResult", input: { index: 0 } },
+      ],
+      batch: {
+        type: "batch",
+        include: ["commandBar", "panes"],
+        requests: [
+          { type: "call", operation: "app.search", input: { mode: "ticker", query: "google" } },
+          { type: "call", operation: "commandBar.activateResult", input: { index: 0 } },
+        ],
+      },
+    },
+    {
+      goal: "Run a command-bar command",
+      requests: [
+        { type: "call", operation: "app.search", input: { mode: "command", query: "theme" } },
+        { type: "call", operation: "commandBar.activateResult", input: { label: "Change Theme" } },
+      ],
+    },
+    {
+      goal: "Fill and submit a form",
+      requests: [
+        { type: "call", operation: "app.search", input: { mode: "command", query: "New Watchlist" } },
+        { type: "call", operation: "commandBar.activateResult", input: { label: "New Watchlist" } },
+        { type: "call", operation: "ui.invokeMatching", input: { role: "form-field", metadata: { fieldId: "name" }, action: "setValue", input: "Semis" } },
+        { type: "call", operation: "ui.invokeMatching", input: { role: "form", action: "submit" } },
+      ],
+    },
+    {
+      goal: "Activate a visible semantic control without knowing its node id",
+      request: { type: "call", operation: "ui.invokeMatching", input: { role: "button", label: "Done", action: "press" } },
+    },
+    {
+      goal: "Arrange current panes",
+      request: { type: "call", operation: "layout.setGrid", input: { columns: 2 }, include: ["layout", "panes"] },
+    },
+    {
+      goal: "Move a chart cursor without mouse/keyboard control",
+      request: { type: "call", operation: "ui.invokeMatching", input: { role: "chart", action: "moveCursor", input: { x: 20, y: 4 } } },
+    },
+    {
+      goal: "Pan a chart through its semantic scroll action",
+      request: { type: "call", operation: "ui.invokeMatching", input: { role: "chart", action: "scroll", input: { direction: "down", delta: 3 } } },
+    },
+  ],
+  batching: {
+    requestShape: "{ type: 'batch', requests: RemoteControlRequest[], haltOnError?: boolean, settle?: 'none' | 'afterEach' | 'afterBatch', include?: RemoteStateInclude[] }",
+    behavior: "Requests run sequentially. By default the batch stops on the first failed step and returns a compact final state.",
+  },
+  caveats: [
+    "Capability manifests are for plugin services; UI control should rely on app-level operations and shared semantic UI nodes so plugins remain remote-agnostic.",
+    "If an operation changes UI, request include: ['commandBar'] or use batch include to avoid a follow-up get.",
+    "For charts, use visible semantic chart nodes with actions such as moveCursor, press, drag, release, and scroll.",
+    "A command with hasWizard in app://commands opens a form in a centered dialog when activated, and the command bar closes. Read `form` in the response, set fields with ui.invokeMatching { role: 'form-field', metadata: { fieldId }, action: 'setValue' }, then send with { role: 'form', action: 'submit' } or close with action 'cancel'. Selects take an option value, toggles a boolean; neither needs to be opened.",
+    "While a dialog is open (form.open or form.otherDialogOpen), app.openCommandBar and app.search fail; close a form or confirm with { role: 'form', action: 'cancel' }, and any dialog on top with app.closeDialog.",
+    "A form with covered: true has another dialog over it, such as a listing picker or a sign-in; its controls wait until that one is answered or closed with app.closeDialog.",
+    "Pane settings open in their own dialog, not as command-bar rows; change one with pane.setSetting, read them from app://pane-settings/{paneId}, and close the dialog with app.closeDialog.",
+    "watchlist.add and watchlist.remove wait while the person answers a confirmation in the app and return what changed; with dryRun they return what would change without asking.",
+    "pane.screenshot returns the pane's PNG as base64 in image.data, with its pixel size; the terminal (TUI) app answers that it needs the desktop app.",
+    "Use ui.invokeMatching only after checking app-level operations; it is intentionally generic and depends on visible semantic controls.",
+  ],
+};
+
+export function remoteControlSchema(): RemoteControlSchema {
+  return {
+    protocolVersion: 1,
+    resources: REMOTE_RESOURCES,
+    operations: REMOTE_OPERATIONS,
+    help: REMOTE_AGENT_HELP,
+  };
+}
+
+export function writeTierForSideEffectLevel(
+  sideEffectLevel: RemoteSideEffectLevel,
+): RemoteWriteTier {
+  switch (sideEffectLevel) {
+    case "none":
+      return "read";
+    case "local-write":
+      return "ui-write";
+    case "network-write":
+      return "user-data";
+    case "external-side-effect":
+    case "external-trade":
+      return "broker";
+  }
+}
+
+/**
+ * An operation's description with what only the running app knows. `viewSources`
+ * is the list of functions a custom view can read (`describeViewSources`), said
+ * once, in the operation that creates a view.
+ */
+export function remoteOperationDescription(
+  { id, description }: Pick<RemoteOperationSchema, "id" | "description">,
+  viewSources = "",
+): string {
+  return id === "view.create" && viewSources ? `${description} ${viewSources}` : description;
+}
+
+export function remoteOperationDescriptors(viewSources = ""): RemoteOperationDescriptor[] {
+  return REMOTE_OPERATIONS.map((operation) => ({
+    name: remoteOperationToolName(operation.id),
+    title: operation.title,
+    description: remoteOperationDescription(operation, viewSources),
+    writeTier: operation.writeTier,
+    inputSchema: operation.inputSchema,
+  }));
+}
+
+export function remoteOperationToolName(id: string): string {
+  return id
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+}
+
+function operationTitle(id: string): string {
+  const [scope = "", action = ""] = id.split(".");
+  return `${humanizeIdentifier(scope)}: ${humanizeIdentifier(action)}`;
+}
+
+function humanizeIdentifier(value: string): string {
+  if (value === "ui") return "UI";
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/^./, (character) => character.toUpperCase());
+}
+
+function op(
+  id: string,
+  description: string,
+  inputShape: string,
+  sideEffectLevel: RemoteSideEffectLevel,
+  inputSchema: RemoteJsonSchema,
+  writeTier = writeTierForSideEffectLevel(sideEffectLevel),
+): RemoteOperationSchema {
+  return {
+    id,
+    title: operationTitle(id),
+    description,
+    inputShape,
+    inputSchema,
+    sideEffectLevel,
+    writeTier,
+    requiresConfirmation: writeTier === "user-data" || writeTier === "broker",
+    dryRun: sideEffectLevel !== "none",
+  };
+}

@@ -1,0 +1,1188 @@
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Box,
+  ScrollBox,
+  useRendererHost,
+  useUiCapabilities,
+  type ScrollBoxRenderable,
+} from "../../../ui";
+import { withCompanyLogo } from "../../../components/company-logo";
+import {
+  Button,
+  confirmDialog,
+  DataTableStackView,
+  DataTableView,
+  KeyValueRow,
+  Notice,
+  PageStackView,
+  PaneStatusBody,
+  QueryBar,
+  TextField,
+  usePaneFooter,
+  usePaneNoticeFooter,
+  usePaneTabs,
+  useRowNotes,
+  useTableLoadMore,
+  type DataTableColumn,
+  type DataTableVisibleRange,
+  type SelectControl,
+} from "../../../components";
+import {
+  useAppSelector,
+  useAsyncResource,
+  useAutoRefresh,
+  usePaneSettingValue,
+  usePluginAppActions,
+  usePluginPaneState,
+  useShortcut,
+} from "../../../public/react";
+import { useDialog } from "../../../ui/dialog";
+import { useThemeColors } from "../../../theme/theme-context";
+import { priceColor, shownPriceColor } from "../../../theme/colors";
+import { apiClient } from "../../../api-client";
+import {
+  LETTER_GRADE_FIELDS,
+  NUMERIC_FIELDS,
+  type NumericField,
+  type ScreenCriterion,
+  type ScreenDefinition,
+  type ScreenField,
+} from "../../../api-client/equity-screener";
+import type { PaneProps } from "../../../types/plugin";
+import { formatPercentileRank, formatPercentRaw } from "../../../utils/format";
+import { wrapTextLines } from "../../../utils/text-wrap";
+import { EXTENDED_SESSION_LABELS, extendedSessionStateLabel, type ExtendedSession } from "../../../market-data/market/status";
+import { useOpenDescription } from "../shared/open-description";
+import { useMembersMenu } from "../shared/members-menu";
+import { useResearchCloudSession } from "../shared/research-cloud-session";
+import { INITIAL_STREAM_RANGE, streamWindowRows } from "../shared/use-quote-board";
+import { useSampledValue } from "../../../state/hooks/live-ticker-financials";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
+import { SignInWall } from "../cloud/auth-actions";
+import { CriterionEditor } from "./criterion-editor";
+import { ideaMetricSetting, SCREEN_IDEAS, screenIdea } from "./ideas";
+import { screenNotices, screenResultInfo } from "./footer";
+import { ScreenTickerCheck } from "./ticker-check";
+import {
+  fetchSavedScreens,
+  fetchScreenFields,
+  screenerApi,
+  validateSavedScreen,
+} from "./client";
+import {
+  columnWidth,
+  criterionText,
+  DEFAULT_SCREEN,
+  dividendYieldBasis,
+  formatScreenMetric,
+  formatScreenValue,
+  GRADE_DISPLAY_FIELDS,
+  MAX_SYMBOL_VALUES,
+  gradeRankText,
+  metricDate,
+  parseScreenDefinition,
+  pickerFields,
+  resultFields,
+  screenMetricSetting,
+  screenColumnLabel,
+  screenCurrencyEmpty,
+  screenDefinitionKey,
+  screenDetailValue,
+  screenLabel,
+  screenRowId,
+  screenSignValue,
+  screenSymbols,
+  screenYtdBase,
+  splitGradeReason,
+} from "./model";
+import { findNamedCollection, readWatchlistArgument } from "../../../portfolio/collection-name";
+import { useScreenResults } from "./results";
+import { screenWatchlistList } from "./watchlist";
+import { unmatchedCategoryText, unmatchedCategoryValues } from "./categories";
+import { overlayLiveScreenRows, screenExtendedMove, screenExtendedSessions, sortLiveScreenRows, type LiveScreenRow } from "./live";
+import { useLiveQuoteEntries } from "../../../state/hooks/quote-streaming";
+import { buildScreenerQuoteTargets } from "../../../market-data/quotes/screener-live-quotes";
+import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
+import { getTableWidth } from "../../../components/ui/table-layout";
+
+/** How often a live sort re-reads the figures it orders by. */
+const LIVE_ORDER_SAMPLE_MS = 5_000;
+const TABS = [
+  { value: "results", label: "Results" },
+  { value: "criteria", label: "Criteria" },
+  { value: "saved", label: "Saved" },
+  { value: "ideas", label: "Ideas" },
+];
+const errorText = (error: unknown) =>
+  error instanceof Error ? error.message : "Request failed.";
+const date = (value: string | null) => value?.slice(0, 10) ?? "--";
+const rank = (value: number | null) =>
+  value == null ? "--" : value.toFixed(0);
+
+const EXTENDED_COLUMN_PREFIX = "ext:";
+
+/**
+ * Symbol and name, then the focus metric with its covered-universe percentile
+ * and date, then the screen's criteria and context metrics as width allows.
+ * A PRE-MKT, AFTER-HRS or OVERNIGHT column, named as MOST names it, follows
+ * CHG% for each session in `extendedSessions`, and is added only whole, as
+ * the metrics are.
+ */
+export function resultColumns(
+  width: number,
+  definition: ScreenDefinition,
+  metric: NumericField,
+  asOf: boolean,
+  extendedSessions: readonly ExtendedSession[] = [],
+  ytdBase: string | null = null,
+  /** Other metrics `--metric` asked for, shown first after the focus metric. */
+  otherMetrics: readonly NumericField[] = [],
+): DataTableColumn[] {
+  const [focus, ...others] = resultFields(definition, metric, otherMetrics);
+  const metricColumn = (field: NumericField, form: "pane" | "compact"): DataTableColumn => {
+    const label = screenColumnLabel(field, ytdBase, form);
+    return { id: `m:${field}`, label, width: columnWidth(field, label), align: "right" };
+  };
+  const extendedColumns = extendedSessions.map((session): DataTableColumn => ({
+    id: `${EXTENDED_COLUMN_PREFIX}${session}`,
+    label: extendedSessionStateLabel(session),
+    width: 9,
+    align: "right",
+  }));
+  // The extended move reads beside CHG%, or first after the focus metric when that is CHG%.
+  const extras = (form: "pane" | "compact") => [
+    ...(focus === "changePercent" ? extendedColumns : []),
+    ...others.flatMap((field) => field === "changePercent" ? [metricColumn(field, form), ...extendedColumns] : [metricColumn(field, form)]),
+  ];
+  const build = (
+    extra: DataTableColumn[],
+    exchange: boolean,
+    sector: boolean,
+    form: "pane" | "compact",
+  ): DataTableColumn[] => [
+    { id: "symbol", label: "SYMBOL", width: 8, align: "left" },
+    { id: "name", label: "NAME", width: 18, flexGrow: 1, align: "left" },
+    ...(exchange ? [{ id: "exchange", label: "EXCH", width: 7, align: "left" as const }] : []),
+    ...(sector ? [{ id: "sector", label: "SECTOR", width: 22, align: "left" as const }] : []),
+    metricColumn(focus!, form),
+    { id: "percentile", label: "PCTL", width: 4, align: "right" },
+    ...(asOf ? [{ id: "date", label: "AS OF", width: 10, align: "left" as const }] : []),
+    ...extra,
+  ];
+  // Measured the way the table draws them (header floor, gaps, lead gaps), so a
+  // column is only added when it fits whole.
+  const fits = (columns: DataTableColumn[]) => getTableWidth(columns) <= width;
+  // Columns are chosen with YTD's short header (`YTD% 31 Dec`), which reads
+  // `YTD% vs 31 Dec` when that still fits: naming the close never costs a column.
+  const compact = extras("compact");
+  let shown = 0;
+  while (shown < compact.length && fits(build(compact.slice(0, shown + 1), false, false, "compact"))) shown++;
+  const exchange = fits(build(compact.slice(0, shown), true, false, "compact"));
+  const sector = exchange && fits(build(compact.slice(0, shown), true, true, "compact"));
+  const named = build(extras("pane").slice(0, shown), exchange, sector, "pane");
+  return fits(named) ? named : build(compact.slice(0, shown), exchange, sector, "compact");
+}
+const loadFields = () => fetchScreenFields();
+const criterionRowId = (row: { id: string }) => row.id;
+const criterionSignature = (row: { criterion: ScreenCriterion }) => JSON.stringify(row.criterion);
+const DETAIL_LABEL_WIDTH = 24;
+/** A long note under a value, wrapped to the detail's width rather than cut: one row per line, the label on the first. */
+function WrappedDetailRows({ label, text, width }: { label: string; text: string; width: number }) {
+  // The detail's padding, the label column and the gap after it.
+  const lines = wrapTextLines(text, Math.max(16, width - 2 - DETAIL_LABEL_WIDTH - 1));
+  return (
+    <>
+      {lines.map((line, index) => (
+        <KeyValueRow key={index} label={index === 0 ? label : ""} labelWidth={DETAIL_LABEL_WIDTH} value={line} emphasis={false} />
+      ))}
+    </>
+  );
+}
+function ScreenDetail({
+  row,
+  width,
+  height,
+}: {
+  row: LiveScreenRow;
+  width: number;
+  height: number;
+}) {
+  return (
+    <ScrollBox width={width} height={height} scrollY>
+      <Box paddingX={1} flexDirection="column">
+        <KeyValueRow
+          label="Listing"
+          value={`${row.symbol}:${row.exchange}`}
+          detail={[row.currency, row.sector, row.industry].filter(Boolean).join(" \u00b7 ") || "--"}
+        />
+        {NUMERIC_FIELDS.map((field) => {
+          const metric = row.metrics[field];
+          const stamp = metricDate(metric);
+          // A grade's company note (graded on another line of the company) is said once, above the grades.
+          const reason = GRADE_DISPLAY_FIELDS.has(field) ? splitGradeReason(metric.reason).own : metric.reason;
+          const company = field === LETTER_GRADE_FIELDS[0] ? splitGradeReason(metric.reason).company : null;
+          const extended = field === "changePercent" ? row.extended : undefined;
+          const basis = field === "dividendYieldPercent" ? dividendYieldBasis(metric) : null;
+          // A grade's rank in its sector and the inputs it read, and its notes: peers, N/M or stale inputs, its company.
+          const graded = GRADE_DISPLAY_FIELDS.has(field) && metric.value !== null ? gradeRankText(metric) : null;
+          return (
+            <Fragment key={field}>
+              {company ? <WrappedDetailRows label="Grades" text={company} width={width} /> : null}
+              <KeyValueRow
+                label={screenLabel(field)}
+                labelWidth={24}
+                value={screenDetailValue(field, metric)}
+                detail={
+                  metric.value === null
+                    ? (reason ?? "unavailable")
+                    : [
+                        graded || metric.percentile.value == null ? null : formatPercentileRank(metric.percentile.value),
+                        stamp.collected ? `collected ${stamp.text}` : stamp.text,
+                        metric.state === "available" ? null : metric.state,
+                      ].filter(Boolean).join(" \u00b7 ")
+                }
+              />
+              {extended ? (
+                // The pre-market, after-hours or overnight print, from the close in Price.
+                <KeyValueRow
+                  label={EXTENDED_SESSION_LABELS[extended.session]}
+                  labelWidth={24}
+                  value={`${formatScreenValue("price", extended.price)} ${row.metrics.price.unit}`}
+                  detail={`${formatPercentRaw(extended.changePercent)}${extended.mark ? " mid" : ""}`}
+                />
+              ) : null}
+              {basis ? <KeyValueRow label="Yield basis" labelWidth={24} value={basis} /> : null}
+              {graded ? <WrappedDetailRows label="Ranked" text={graded} width={width} /> : null}
+              {graded && reason ? <WrappedDetailRows label="Note" text={reason} width={width} /> : null}
+            </Fragment>
+          );
+        })}
+      </Box>
+    </ScrollBox>
+  );
+}
+export function EquityScreenerPane(props: PaneProps) {
+  const session = useResearchCloudSession();
+  const [seed] = usePaneSettingValue<string | undefined>(
+    "definition",
+    undefined,
+  );
+  // A ready screen from Ideas (`--preset`), which opens on its own metric.
+  const [presetId] = usePaneSettingValue<string | undefined>("preset", undefined);
+  const preset = screenIdea(presetId);
+  let initial: ScreenDefinition;
+  try {
+    initial = preset?.definition ?? (seed ? parseScreenDefinition(JSON.parse(seed)) : DEFAULT_SCREEN);
+  } catch (error) {
+    return (
+      <PaneStatusBody subject="screen definition" error={errorText(error)} />
+    );
+  }
+  return (
+    <EquityScreenView
+      key={`${preset?.id ?? seed ?? "default"}:${session.requestKey}`}
+      {...props}
+      initial={initial}
+      initialMetric={preset?.metric ?? "marketCap"}
+      initialMetricSetting={preset ? ideaMetricSetting(preset) : undefined}
+    />
+  );
+}
+function EquityScreenView({
+  width,
+  height,
+  focused,
+  initial,
+  initialMetric,
+  initialMetricSetting,
+}: PaneProps & { initial: ScreenDefinition; initialMetric: NumericField; initialMetricSetting?: string }) {
+  const colors = useThemeColors(),
+    dialog = useDialog(),
+    host = useRendererHost();
+  const logos = useUiCapabilities().nativePaneChrome === true;
+  const { notify } = usePluginAppActions();
+  const openDescription = useOpenDescription();
+  const session = useResearchCloudSession(),
+    access = usePlanAccess();
+  const [definition, setDefinition] = usePluginPaneState("definition", initial);
+  const [metricSetting, setMetric] = usePaneSettingValue<string>(
+    "metric",
+    initialMetricSetting ?? initialMetric,
+  );
+  // `--metric trailingPE,dividendYieldPercent` leads with the first and adds the others as columns.
+  const [metric, ...otherMetrics] = screenMetricSetting(metricSetting, initialMetric);
+  const [mode, setMode] = usePluginPaneState("mode", "results");
+  const [selectedId, setSelectedId] = usePluginPaneState<string | null>(
+    "selected",
+    null,
+  );
+  const [openId, setOpenId] = usePluginPaneState<string | null>("open", null);
+  const [selectedCriterion, setSelectedCriterion] = usePluginPaneState(
+    "criterion",
+    "0",
+  );
+  const [editing, setEditing] = useState<number | null>(null);
+  const [savedSelectedId, setSavedSelectedId] = usePluginPaneState<
+    string | null
+  >("savedSelected", null);
+  const [ideaSelectedId, setIdeaSelectedId] = usePluginPaneState(
+    "ideaSelected",
+    SCREEN_IDEAS[0]!.id,
+  );
+  const [currentSavedId, setCurrentSavedId] = usePluginPaneState<string | null>(
+    "currentSaved",
+    null,
+  );
+  const [saving, setSaving] = useState(false),
+    [exporting, setExporting] = useState(false);
+  const [saveFocus, setSaveFocus] = useState("name");
+  const [saveForm, setSaveForm] = useState(false),
+    [name, setName] = useState("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [check, setCheck] = useState<{
+    definition: ScreenDefinition;
+    snapshotId?: string;
+  } | null>(null);
+  const fields = useAsyncResource(loadFields);
+  const savedLoader = useCallback(
+    () => fetchSavedScreens(),
+    [session.requestKey],
+  );
+  const saved = useAsyncResource(
+    access.emailVerified && (mode === "saved" || saveForm) ? savedLoader : null,
+  );
+  const results = useScreenResults(definition, session.requestKey);
+  const data = results.data;
+  const snapshotRows = data?.rows ?? [];
+  // Price, change, volume and market cap stream for the rows on screen; the
+  // screen itself (membership, order, percentiles) stays the snapshot's.
+  const liveStreaming = useLiveStreamingSetting();
+  const [visibleRange, setVisibleRange] = useState<DataTableVisibleRange>(INITIAL_STREAM_RANGE);
+  const streamTargets = useMemo(() => {
+    const selectedRow = snapshotRows.find((row) => screenRowId(row) === selectedId);
+    return buildScreenerQuoteTargets(streamWindowRows(snapshotRows, visibleRange, selectedRow), selectedRow?.symbol ?? null);
+  }, [selectedId, snapshotRows, visibleRange]);
+  const { entries: liveEntries } = useLiveQuoteEntries(streamTargets, {
+    freshnessScopeKey: `equity-screener:${JSON.stringify(definition)}`,
+    liveStreaming,
+  });
+  const liveRows = useMemo(() => overlayLiveScreenRows(snapshotRows, liveEntries), [liveEntries, snapshotRows]);
+  // A sort on a field the quotes move is redone on the figures shown, so the
+  // column reads monotone. Re-sorting on every tick would reshuffle rows under
+  // the cursor; the order is taken from values sampled every few seconds,
+  // and at once when the screen or its pages change.
+  const orderRows = useSampledValue(
+    liveRows,
+    LIVE_ORDER_SAMPLE_MS,
+    `${data?.snapshot?.id ?? ""}:${JSON.stringify(definition.sort)}:${snapshotRows.length}`,
+  );
+  const rows = useMemo(() => {
+    const order = new Map(sortLiveScreenRows(orderRows, definition.sort).map((row, index) => [screenRowId(row), index]));
+    return liveRows
+      .map((row, index) => ({ row, index, place: order.get(screenRowId(row)) ?? Number.POSITIVE_INFINITY }))
+      .sort((a, b) => a.place - b.place || a.index - b.index)
+      .map(({ row }) => row);
+  }, [definition.sort, liveRows, orderRows]);
+  const opened = rows.find((row) => screenRowId(row) === openId);
+  const selected =
+    opened ?? rows.find((row) => screenRowId(row) === selectedId) ?? rows[0];
+  const currentSaved = saved.data?.find((row) => row.id === currentSavedId);
+  // The pane menu's Save to Watchlist… takes the matches loaded, in the order shown (the first page is 100). A live
+  // quote changes the rows but not who they are, so the menu is rebuilt only when the order does.
+  const shownOrder = rows.map(screenRowId).join(" ");
+  const watchlistList = useMemo(
+    () => mode === "results" && !openId && data && screenDefinitionKey(data.definition) === screenDefinitionKey(definition)
+      ? screenWatchlistList({ definition, rows, matched: data.universe.matched, savedName: currentSaved?.name })
+      : null,
+    [currentSaved?.name, data, definition, mode, openId, shownOrder], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  useMembersMenu("equity-screener:watchlist", watchlistList);
+  // A watchlist's name typed for the symbol field reads as its symbols, as `fn EQS` reads it.
+  const watchlists = useAppSelector((state) => state.config.watchlists);
+  const tickers = useAppSelector((state) => state.tickers);
+  const readWatchlist = useCallback((typed: string) => {
+    const watchlist = findNamedCollection(watchlists, typed);
+    if (!watchlist) return null;
+    const members = screenSymbols([...tickers.values()]
+      .filter((ticker) => ticker.metadata.watchlists.includes(watchlist.id))
+      .map((ticker) => ticker.metadata.ticker));
+    return members.length ? readWatchlistArgument(typed, watchlist, members, MAX_SYMBOL_VALUES) : null;
+  }, [tickers, watchlists]);
+  // How a saved criterion read a watchlist's name stays on its row until the criterion changes.
+  const criterionRows = useMemo(
+    () => definition.criteria.map((criterion, index) => ({ id: String(index), criterion })),
+    [definition.criteria],
+  );
+  const criterionNotes = useRowNotes<(typeof criterionRows)[number], string>(criterionRows, {
+    key: criterionRowId,
+    signature: criterionSignature,
+  });
+  const selectedSaved =
+    saved.data?.find((row) => row.id === savedSelectedId) ?? saved.data?.[0];
+  useEffect(() => {
+    if (
+      openId &&
+      data &&
+      !opened &&
+      data.nextCursor &&
+      !results.loading &&
+      !results.loadingMore
+    )
+      void results.loadMore();
+  }, [
+    openId,
+    data,
+    opened,
+    results.loading,
+    results.loadingMore,
+    results.loadMore,
+  ]);
+  const tableScroll = useRef<ScrollBoxRenderable>(null);
+  const queryControl = useRef<SelectControl>(null);
+  const loadMore = useTableLoadMore(
+    tableScroll,
+    !opened && !results.loading && !results.loadingMore && !!data?.nextCursor,
+    results.loadMore,
+  );
+  const metricFields = pickerFields(
+    fields.data?.fields.filter((field) => field.kind === "number") ?? [],
+    [metric],
+  );
+  // AS OF earns its column only when some row's focus metric is stale; the
+  // snapshot decides, so a live quote freshening a row does not reflow the table.
+  const staleFocus = snapshotRows.some((row) => row.metrics[metric]?.state === "stale");
+  // A pre-market, after-hours or overnight column only while a row has such a print.
+  const extendedSessions = screenExtendedSessions(rows);
+  // YTD names the close it is measured from, `31 Dec`.
+  const ytdBase = screenYtdBase(snapshotRows, data?.snapshot?.assembledAt);
+  // A screen its currency emptied says so, not that no company matches.
+  const currencyEmpty = data && data.rows.length === 0 ? screenCurrencyEmpty(data.definition, data.universe) : null;
+  // A criterion's name that matches nothing (`Utility`) says so with the names it was likely meant as.
+  const unmatchedNames = data && data.rows.length === 0
+    ? unmatchedCategoryValues(data.definition, data).map(unmatchedCategoryText).join(" ") || null
+    : null;
+  const columns = resultColumns(width, definition, metric, staleFocus, extendedSessions, ytdBase, otherMetrics);
+  const apply = (next: ScreenDefinition) => {
+    try {
+      setDefinition(parseScreenDefinition(next));
+      setOpenId(null);
+      setCheck(null);
+      setActionError(null);
+    } catch (error) {
+      setActionError(errorText(error));
+    }
+  };
+  const switchMode = (next: string) => {
+    setMode(next);
+    setEditing(null);
+    setSaveForm(false);
+    setCheck(null);
+    setActionError(null);
+  };
+  const research = () => {
+    if (selected) openDescription(selected.symbol, selected.exchange);
+  };
+  const startCheck = () => {
+    setCheck({
+      definition,
+      snapshotId: data?.snapshot && screenDefinitionKey(data.definition) === screenDefinitionKey(definition)
+        ? data.snapshot.id
+        : undefined,
+    });
+    setActionError(null);
+  };
+  const checkHint = { id: "check", key: "t", label: "check ticker", title: "Check ticker", onPress: startCheck, disabled: false };
+  const startSave = () => {
+    if (!access.emailVerified) { switchMode("saved"); return; }
+    setName(currentSaved?.name ?? "");
+    setSaveForm(true);
+    setSaveFocus("name");
+    setActionError(null);
+  };
+  const save = async (copy = false) => {
+    if (saving || !name.trim()) return;
+    setSaving(true);
+    setActionError(null);
+    const requestSession = session.requestKey;
+    try {
+      const entry = validateSavedScreen(
+        currentSaved && !copy
+          ? await screenerApi.update(
+              currentSaved.id,
+              currentSaved.revision,
+              name.trim(),
+              definition,
+            )
+          : await screenerApi.create(
+              name.trim(),
+              definition,
+            ),
+      );
+      if (
+        requestSession !==
+        JSON.stringify([
+          apiClient.getCurrentUser()?.id ?? null,
+          access.emailVerified,
+        ])
+      )
+        return;
+      setCurrentSavedId(entry.id);
+      setSavedSelectedId(entry.id);
+      setSaveForm(false);
+      setMode("saved");
+      await saved.reload();
+      notify({ body: `Saved ${entry.name}`, type: "success" });
+    } catch (error) {
+      setActionError(errorText(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const removeSaved = async () => {
+    const entry = selectedSaved;
+    if (!entry || saving) return;
+    const confirmed = await confirmDialog(dialog, {
+      closeOnClickOutside: false,
+      title: "Delete saved screen?",
+      body: [entry.name],
+      confirmLabel: "Delete",
+    });
+    if (!confirmed) return;
+    setSaving(true);
+    try {
+      await screenerApi.remove(entry.id, entry.revision);
+      await saved.reload();
+      if (currentSavedId === entry.id) setCurrentSavedId(null);
+      notify({ body: "Screen deleted", type: "success" });
+    } catch (error) {
+      setActionError(errorText(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const exportAll = async () => {
+    if (!data?.snapshot || exporting) return;
+    setExporting(true);
+    setActionError(null);
+    try {
+      if (!host.saveTextFile)
+        throw new Error("File export is unavailable in this renderer.");
+      const file = await screenerApi.export(
+        data.definition,
+        data.snapshot.id,
+      );
+      if (file.snapshotId !== data.snapshot.id || typeof file.csv !== "string")
+        throw new Error("Export snapshot did not match the displayed screen.");
+      const location = await host.saveTextFile({
+        name: file.filename,
+        text: file.csv,
+        mimeType: "text/csv",
+      });
+      notify({ body: `Exported ${location}`, type: "success" });
+    } catch (error) {
+      setActionError(errorText(error));
+    } finally {
+      setExporting(false);
+    }
+  };
+  useAutoRefresh(results.updatedAt, results.load);
+  const openQueryControl = () => queryControl.current?.open();
+  const hints =
+    saveForm || editing !== null || check || mode === "ideas"
+      ? []
+      : mode === "criteria"
+        ? [
+            {
+              id: "add",
+              key: "a",
+              label: "dd criterion",
+              onPress: () => setEditing(-1),
+              disabled: !fields.data || definition.criteria.length >= 20,
+            },
+            ...(fields.data
+              ? [{ id: "currency", key: "c", label: "urrency", onPress: openQueryControl }]
+              : []),
+            {
+              id: "remove",
+              key: "d",
+              label: "elete criterion",
+              onPress: () =>
+                apply({
+                  ...definition,
+                  criteria: definition.criteria.filter(
+                    (_, index) => index !== Number(selectedCriterion),
+                  ),
+                }),
+              disabled: !definition.criteria.length,
+            },
+            checkHint,
+          ]
+        : mode === "saved"
+          ? [
+              {
+                id: "delete",
+                key: "d",
+                label: "elete",
+                onPress: () => {
+                  void removeSaved();
+                },
+                disabled: !selectedSaved || saving,
+              },
+            ]
+          : [
+              // The ranking metric's menu; the query bar hides while a row is open.
+              ...(data && !opened
+                ? [{ id: "metric", key: "m", label: "etric", onPress: openQueryControl }]
+                : []),
+              { id: "save", key: "s", label: "ave screen", onPress: startSave },
+              checkHint,
+              {
+                id: "export",
+                key: "x",
+                label: "port all",
+                title: "Export All",
+                onPress: () => {
+                  void exportAll();
+                },
+                disabled: !data?.snapshot || exporting,
+              },
+              {
+                id: "research",
+                key: "o",
+                label: "pen research",
+                onPress: research,
+                disabled: !selected,
+              },
+            ];
+  // Signed out or free, the quotes streamed over the snapshot's rows are delayed ones.
+  const quoteDelay = useQuoteDelayFooter(Array.from(liveEntries.values(), (entry) => entry.data ?? entry.lastGoodData), "screener-delay");
+  usePaneFooter(
+    "equity-screener",
+    () => check ? null : ({
+      info: [
+        ...(results.loading || results.loadingMore
+          ? [
+              {
+                id: "loading",
+                parts: [
+                  {
+                    text: results.loadingMore
+                      ? "loading more"
+                      : "loading screen",
+                    tone: "muted" as const,
+                  },
+                ],
+              },
+            ]
+          : []),
+        ...screenResultInfo(data),
+        ...(saving || exporting
+          ? [
+              {
+                id: "busy",
+                parts: [
+                  {
+                    text: saving ? "saving" : "exporting",
+                    tone: "muted" as const,
+                  },
+                ],
+              },
+            ]
+          : []),
+        ...(quoteDelay ? [quoteDelay] : []),
+      ],
+      hints,
+    }),
+    [
+      quoteDelay,
+      results.loading,
+      results.loadingMore,
+      data,
+      saving,
+      exporting,
+      hints,
+      check,
+    ],
+  );
+  usePaneNoticeFooter({
+    registrationId: "equity-screener:notices",
+    focused,
+    enabled: !check,
+    notices: [
+      ...screenNotices(data?.warnings),
+      ...screenNotices(opened?.warnings),
+      ...[
+        results.error,
+        fields.error,
+        mode === "saved" ? saved.error : null,
+        actionError,
+      ].filter((value): value is string => !!value),
+    ],
+  });
+  useShortcut(
+    (event) => {
+      if (!saveForm) return;
+      const ring = [
+        "name",
+        "save",
+        ...(currentSaved ? ["copy"] : []),
+        "cancel",
+      ];
+      if (event.name === "tab") {
+        event.preventDefault();
+        event.stopPropagation();
+        setSaveFocus((current) => ring[(ring.indexOf(current) + (event.shift ? -1 : 1) + ring.length) % ring.length]!);
+      } else if (event.name === "escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setSaveForm(false);
+      } else if (
+        ["enter", "return"].includes(event.name ?? "") &&
+        !event.targetEditable
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (saveFocus === "cancel") setSaveForm(false);
+        else void save(saveFocus === "copy");
+      }
+    },
+    {
+      enabled: focused && saveForm,
+      allowEditable: true,
+      phase: "before",
+      scope: "equity-screen-save",
+    },
+  );
+  useShortcut((event) => {
+    if (
+      !focused ||
+      event.targetEditable ||
+      event.ctrl ||
+      event.meta ||
+      check ||
+      editing !== null
+    )
+      return;
+    if (saveForm) {
+      if (event.name === "escape") {
+        event.preventDefault();
+        setSaveForm(false);
+      }
+      return;
+    }
+    if (event.name === "r") {
+      event.preventDefault();
+      void results.load();
+      if (mode === "saved") void saved.reload();
+      return;
+    }
+    // Hint keys are single unmodified letters.
+    const hint = event.shift || event.alt || event.super ? undefined : hints.find(
+      (hint) => hint.key === event.name && !hint.disabled,
+    );
+    if (hint) {
+      event.preventDefault();
+      hint.onPress();
+    }
+  });
+  const { strip: tabStrip, rows: tabRows } = usePaneTabs({
+    tabs: TABS,
+    activeValue: mode,
+    onSelect: switchMode,
+    focused: focused && !saveForm && editing === null && !check,
+    dense: true,
+  });
+  const bodyHeight = Math.max(5, height - 1 - tabRows);
+  const saveContent = !access.emailVerified ? (
+    <SignInWall
+      placement="eqs-save-signin"
+      action="save and open your screens"
+      needsVerification={session.needsVerification}
+    />
+  ) : (
+    <Box paddingX={1} paddingTop={1} flexDirection="column" gap={1}>
+      <TextField
+        label="Screen name"
+        value={name}
+        onChange={setName}
+        onSubmit={() => {
+          void save();
+        }}
+        focused={focused && saveFocus === "name"}
+        onMouseDown={() => setSaveFocus("name")}
+        width={Math.min(45, width - 4)}
+      />
+      {actionError ? (
+        <Notice tone="negative">{actionError}</Notice>
+      ) : null}
+      <Box flexDirection="row" gap={1}>
+        <Button
+          label={currentSaved ? "Update screen" : "Save screen"}
+          variant="primary"
+          active={focused && saveFocus === "save"}
+          disabled={saving || !name.trim()}
+          onPress={() => {
+            void save();
+          }}
+        />
+        {currentSaved ? (
+          <Button
+            label="Save copy"
+            variant="secondary"
+            active={focused && saveFocus === "copy"}
+            disabled={saving || !name.trim()}
+            onPress={() => {
+              void save(true);
+            }}
+          />
+        ) : null}
+        <Button
+          label="Cancel"
+          variant="secondary"
+          active={focused && saveFocus === "cancel"}
+          onPress={() => setSaveForm(false)}
+        />
+      </Box>
+    </Box>
+  );
+  const editingCriterion =
+    editing !== null && editing >= 0 ? definition.criteria[editing] : undefined;
+  const body =
+    mode === "criteria" ? (
+      <PaneStatusBody
+        loading={fields.loading && !fields.data}
+        error={!fields.data ? fields.error : null}
+        subject="screen fields"
+      >
+        {fields.data ? (
+          <PageStackView
+            focused={focused && !saveForm}
+            detailOpen={editing !== null}
+            onBack={() => setEditing(null)}
+            detailTitle={
+              editingCriterion ? criterionText(editingCriterion) : "New criterion"
+            }
+            detailContent={
+              editing !== null ? (
+                <CriterionEditor
+                  key={editing}
+                  fields={pickerFields(fields.data.fields, editingCriterion ? [editingCriterion.field] : [])}
+                  value={editingCriterion ?? null}
+                  focused={focused}
+                  width={width}
+                  readWatchlist={readWatchlist}
+                  onCancel={() => setEditing(null)}
+                  onSave={(criterion, note) => {
+                    const criteria = [...definition.criteria];
+                    if (editing < 0) criteria.push(criterion);
+                    else criteria[editing] = criterion;
+                    apply({ ...definition, criteria });
+                    criterionNotes.setNote(String(editing < 0 ? criteria.length - 1 : editing), note);
+                    setEditing(null);
+                  }}
+                />
+              ) : null
+            }
+            rootContent={
+              <>
+                <QueryBar
+                  width={width}
+                  filters={[{
+                    id: "currency",
+                    label: "Currency",
+                    controlRef: queryControl,
+                    value: definition.currency ?? "all",
+                    defaultValue: "all",
+                    options: [
+                      { value: "all", label: "All currencies" },
+                      ...[
+                        ...new Set([
+                          definition.currency ?? "USD",
+                          "USD",
+                          "EUR",
+                          "GBP",
+                          "JPY",
+                          ...(data?.universe.currencies ?? []),
+                        ]),
+                      ].map((value) => ({ value, label: value })),
+                    ],
+                    onChange: (value: string) =>
+                      apply({
+                        ...definition,
+                        currency: value === "all" ? null : value,
+                      }),
+                  }]}
+                />
+                <DataTableView
+                  columns={[
+                    {
+                      id: "criterion",
+                      label: "CRITERION",
+                      width: 20,
+                      flexGrow: 1,
+                      align: "left",
+                    },
+                  ]}
+                  items={criterionRows}
+                  focused={focused && editing === null && !saveForm}
+                  rootWidth={width}
+                  rootHeight={bodyHeight - 1}
+                  getItemKey={(row) => row.id}
+                  selection={{
+                    kind: "id",
+                    selectedId: selectedCriterion,
+                    getId: (row) => row.id,
+                    onChange: setSelectedCriterion,
+                  }}
+                  onActivate={(row) => setEditing(Number(row.id))}
+                  renderCell={(row) => {
+                    const note = criterionNotes.noteFor(row);
+                    return { text: criterionText(row.criterion), ...(note ? { note } : {}) };
+                  }}
+                  sortColumnId={null}
+                  sortDirection="asc"
+                  emptyStateTitle="No criteria. All covered equities match."
+                />
+              </>
+            }
+          />
+        ) : null}
+      </PaneStatusBody>
+    ) : mode === "ideas" ? (
+      <DataTableView
+        columns={[
+          { id: "name", label: "SCREEN", width: 28, align: "left" },
+          { id: "criteria", label: "CRITERIA", width: 20, flexGrow: 1, align: "left" },
+        ]}
+        items={SCREEN_IDEAS}
+        focused={focused && !saveForm}
+        rootWidth={width}
+        rootHeight={bodyHeight}
+        getItemKey={(row) => row.id}
+        selection={{
+          kind: "id",
+          selectedId: ideaSelectedId,
+          getId: (row) => row.id,
+          onChange: setIdeaSelectedId,
+        }}
+        onActivate={(row) => {
+          setMetric(ideaMetricSetting(row));
+          apply(row.definition);
+          setCurrentSavedId(null);
+          setMode("results");
+        }}
+        renderCell={(row, column) => ({
+          text: column.id === "name" ? row.name : row.definition.criteria.map(criterionText).join("; "),
+        })}
+        sortColumnId={null}
+        sortDirection="asc"
+        emptyStateTitle="No ideas."
+      />
+    ) : mode === "saved" ? (
+      !access.emailVerified ? (
+        <SignInWall
+          placement="eqs-signin"
+          action="save and open your screens"
+          needsVerification={session.needsVerification}
+        />
+      ) : (
+        <PaneStatusBody
+          loading={saved.loading && !saved.data}
+          error={!saved.data ? saved.error : null}
+          subject="saved screens"
+        >
+          <DataTableView
+            columns={[
+              { id: "name", label: "SCREEN", width: 28, align: "left" },
+              {
+                id: "criteria",
+                label: "CRITERIA",
+                width: 20,
+                flexGrow: 1,
+                align: "left",
+              },
+              { id: "updatedAt", label: "UPDATED", width: 11, align: "left" },
+            ]}
+            items={saved.data ?? []}
+            focused={focused && !saveForm}
+            rootWidth={width}
+            rootHeight={bodyHeight}
+            getItemKey={(row) => row.id}
+            selection={{
+              kind: "id",
+              selectedId: selectedSaved?.id ?? null,
+              getId: (row) => row.id,
+              onChange: setSavedSelectedId,
+            }}
+            onActivate={(row) => {
+              apply(row.definition);
+              setCurrentSavedId(row.id);
+              setMode("results");
+            }}
+            renderCell={(row, column) => ({
+              text:
+                column.id === "name"
+                  ? row.name
+                  : column.id === "updatedAt"
+                    ? date(row.updatedAt)
+                    : row.definition.criteria.map(criterionText).join("; "),
+            })}
+            sortColumnId={null}
+            sortDirection="asc"
+            emptyStateTitle="No saved screens."
+          />
+        </PaneStatusBody>
+      )
+    ) : (
+      // The metric stays above the results while a new sort loads.
+      <>
+        {!opened ? (
+          <QueryBar
+            width={width}
+            filters={[{
+              id: "metric",
+              label: "Metric",
+              controlRef: queryControl,
+              value: metric,
+              options: metricFields.length
+                ? metricFields.map((field) => ({
+                    value: field.id as NumericField,
+                    label: field.label,
+                  }))
+                : [{ value: metric, label: screenLabel(metric) }],
+              onChange: (value: string) => {
+                setMetric(value as NumericField);
+                apply({
+                  ...definition,
+                  sort: { field: value as NumericField, direction: "desc" },
+                });
+              },
+            }]}
+          />
+        ) : null}
+        <PaneStatusBody
+          loading={results.loading && !data}
+          error={!data ? results.error : null}
+          subject="equity screen"
+        >
+          <DataTableStackView
+            columns={columns}
+            items={rows}
+            focused={focused && !saveForm}
+            rootWidth={width}
+            rootHeight={bodyHeight - 1}
+            scrollRef={tableScroll}
+            onBodyScrollActivity={loadMore}
+            resetScrollKey={JSON.stringify(definition)}
+            visibleRangeKey={JSON.stringify(definition)}
+            onVisibleRangeChange={setVisibleRange}
+            getItemKey={screenRowId}
+            selection={{
+              kind: "id",
+              selectedId: selectedId ?? (rows[0] ? screenRowId(rows[0]) : null),
+              getId: screenRowId,
+              onChange: setSelectedId,
+            }}
+            onActivate={(row) => setOpenId(screenRowId(row))}
+            detailOpen={!!opened}
+            onBack={() => setOpenId(null)}
+            detailTitle={opened?.name ?? opened?.symbol}
+            detailContent={
+              opened ? (
+                <ScreenDetail
+                  row={opened}
+                  width={width}
+                  height={bodyHeight - 2}
+                />
+              ) : null
+            }
+            renderCell={(row, column) => {
+              if (column.id.startsWith(EXTENDED_COLUMN_PREFIX)) {
+                // The extended print's move from the close in PRICE and CHG%.
+                const move = screenExtendedMove(row, column.id.slice(EXTENDED_COLUMN_PREFIX.length) as ExtendedSession);
+                return move == null
+                  ? { text: "--", color: colors.textDim }
+                  : { text: formatPercentRaw(move), color: shownPriceColor(move, 2, colors) };
+              }
+              const field = column.id.startsWith("m:")
+                ? (column.id.slice(2) as NumericField)
+                : null;
+              if (field) {
+                const observation = row.metrics[field];
+                // A move by its sign (one that prints 0.0 stays neutral), a grade by its side of the middle.
+                const sign = screenSignValue(field, observation.value);
+                const change = sign == null ? undefined : priceColor(sign, colors);
+                return {
+                  text: formatScreenMetric(field, observation),
+                  color: observation.state === "stale" ? colors.warning : change,
+                };
+              }
+              const focus = row.metrics[metric];
+              if (column.id === "percentile")
+                return { text: rank(focus.percentile.value) };
+              if (column.id === "date")
+                return focus.state === "stale"
+                  ? { text: metricDate(focus).text, color: colors.warning }
+                  : { text: "" };
+              if (column.id === "name") return withCompanyLogo({ text: row.name ?? "--" }, row.name ? row : null, logos);
+              return { text: String(row[column.id as "symbol"] ?? "--") };
+            }}
+            sortColumnId={
+              (NUMERIC_FIELDS as readonly string[]).includes(definition.sort.field)
+                ? `m:${definition.sort.field}`
+                : definition.sort.field
+            }
+            sortDirection={definition.sort.direction}
+            onHeaderClick={(id) => {
+              const field = id.startsWith("m:")
+                ? (id.slice(2) as NumericField)
+                : id === "percentile" || id === "date"
+                  ? metric
+                  : ["symbol", "sector", "exchange"].includes(id)
+                    ? (id as ScreenField)
+                    : null;
+              if (!field) return;
+              if ((NUMERIC_FIELDS as readonly string[]).includes(field))
+                setMetric(field as NumericField);
+              apply({
+                ...definition,
+                sort: {
+                  field,
+                  direction:
+                    definition.sort.field === field &&
+                    definition.sort.direction === "desc"
+                      ? "asc"
+                      : "desc",
+                },
+              });
+            }}
+            emptyStateTitle={(unmatchedNames ? null : currencyEmpty?.title) ?? "No equities match this screen."}
+            emptyStateHint={unmatchedNames
+              ?? (currencyEmpty ? `${currencyEmpty.detail} Choose ${currencyEmpty.base.currency} to screen in the base currency.` : undefined)}
+          />
+        </PaneStatusBody>
+      </>
+    );
+  return (
+    <Box width={width} height={height} flexDirection="column">
+      {tabStrip}
+      <PageStackView
+        focused={focused}
+        detailOpen={saveForm || !!check}
+        onBack={() => { setSaveForm(false); setCheck(null); }}
+        detailTitle={check ? "Check ticker" : "Save screen"}
+        rootContent={body}
+        detailContent={check ? (
+          <ScreenTickerCheck
+            definition={check.definition}
+            snapshotId={check.snapshotId}
+            width={width}
+            height={bodyHeight - 1}
+            focused={focused}
+          />
+        ) : saveForm ? saveContent : null}
+      />
+    </Box>
+  );
+}

@@ -1,0 +1,169 @@
+import { useEffect, useMemo, useState } from "react";
+import { createTtlCache } from "../../../data/ttl-cache";
+import type { DataProvider } from "../../../types/data-provider";
+import { isNoSourceAnswer } from "../../../sources/provider-errors";
+import type { PricePoint } from "../../../types/financials";
+import { logFailure } from "../../../utils/log-failure";
+import { PERIOD_BASE_MAX_GAP_DAYS, periodBaseDay } from "../../../market-data/market/period-return";
+import { coalescedBump } from "./coalesced-bump";
+import { readsInBatches } from "../../../market-data/batched-reads";
+import { boardReadGate } from "./board-reads";
+import type { BoardQuoteMap } from "../shared/use-quote-board";
+import type { FuturesContract } from "../../../market-data/futures-board";
+import {
+  frontContractCandidates,
+  frontContractPeriodReturns,
+  NO_FUTURES_RETURNS,
+  pickFrontContract,
+  type FuturesReturnBases,
+  type FuturesReturnValues,
+} from "./returns";
+
+interface FrontReturnsState {
+  /** A candidate contract's history is still loading. */
+  loading: boolean;
+  values: FuturesReturnValues;
+  /** The day each return's base close is from, once the contract's history is read. */
+  bases?: FuturesReturnBases;
+}
+
+export type FrontReturnsMap = ReadonlyMap<string, FrontReturnsState>;
+
+/**
+ * The baselines are earlier days' closes, so a contract's history is reused
+ * for half an hour; the live quote moves the returns in between.
+ */
+const HISTORY_TTL_MS = 30 * 60_000;
+/**
+ * A read that failed is asked again after this: one blip leaves a row without
+ * returns for a minute, not for the TTL, and a service that is down is asked
+ * once a minute, not once a tick.
+ */
+const HISTORY_RETRY_MS = 60_000;
+
+/**
+ * Null when the source has no history for the contract (delisted, unknown),
+ * which is an answer and is kept like any other. A read that fails is not kept
+ * as one: it rejects, and the cache holds the rejection for `HISTORY_RETRY_MS`.
+ */
+const historyCache = createTtlCache<readonly PricePoint[] | null>({ ttlMs: HISTORY_TTL_MS, rejectionMs: HISTORY_RETRY_MS });
+
+const DAY_MS = 86_400_000;
+function dayOf(point: PricePoint): string | null {
+  const time = new Date(point.date as Date | string | number).getTime();
+  return Number.isFinite(time) ? new Date(time).toISOString().slice(0, 10) : null;
+}
+
+/**
+ * A year's read starts on the day a year back, so when that day did not trade
+ * (a weekend, a holiday) it holds no close on or before it, and the 1Y return
+ * has no base. The weeks before it are read too, for a contract that traded
+ * from the start of the year; one listed since has no close a year back to find.
+ */
+async function withYearBackClose(provider: DataProvider, symbol: string, points: PricePoint[]): Promise<PricePoint[]> {
+  const read = provider.getDetailedPriceHistoryWithMetadata;
+  const first = points[0] ? dayOf(points[0]) : null;
+  const yearBack = periodBaseDay(new Date().toISOString().slice(0, 10), "1Y");
+  if (!read || !first || first <= yearBack || Date.parse(`${first}T00:00:00Z`) - Date.parse(`${yearBack}T00:00:00Z`) > 7 * DAY_MS) return points;
+  const start = new Date(Date.parse(`${yearBack}T00:00:00Z`) - PERIOD_BASE_MAX_GAP_DAYS * DAY_MS);
+  const earlier = await read.call(provider, symbol, "", start, new Date(`${first}T00:00:00Z`), "1d")
+    .then((result) => result.points.filter((point) => (dayOf(point) ?? first) < first), logFailure("futures", "Read a futures contract's close a year back failed", []));
+  return earlier.length > 0 ? [...earlier, ...points] : points;
+}
+
+/** `batch`: asked with every other row's, from a source that batches them (`DataProvider.batchesReads`). */
+function readHistory(provider: DataProvider, symbol: string, batch: boolean): Promise<readonly PricePoint[] | null> {
+  return provider.getPriceHistory(symbol, "", "1Y", batch ? { batch } : undefined).then(async (points) => points.length > 0 ? withYearBackClose(provider, symbol, points) : null, (error: unknown) => {
+    if (isNoSourceAnswer(error)) return null;
+    throw error;
+  });
+}
+
+/** Whether the contract has an answer; false when the read failed. */
+function loadHistory(provider: DataProvider, symbol: string, batch: boolean): Promise<boolean> {
+  return historyCache.load(symbol, () => readHistory(provider, symbol, batch))
+    .then(() => true, logFailure("futures", "Read a futures contract's history failed", false));
+}
+
+/**
+ * 1W, 1M and YTD returns for each board row, measured on the contract its
+ * quote prices rather than on the continuous alias. Histories load only for
+ * `contracts`, the rows the board lists, and only while `enabled` (a returns
+ * column is on screen and the pane can be seen).
+ */
+export function useFrontContractReturns(
+  contracts: readonly FuturesContract[],
+  quotes: BoardQuoteMap,
+  provider: DataProvider | null | undefined,
+  enabled: boolean,
+): FrontReturnsMap {
+  // Candidates change on a roll, not on a tick: the key keeps the loader still.
+  const candidateKey = contracts
+    .map((contract) => `${contract.symbol}\u001f${frontContractCandidates(contract, quotes.get(contract.symbol)?.quote).join(",")}`)
+    .join("\u001e");
+  const candidates = useMemo(() => new Map(candidateKey.split("\u001e").map((entry) => {
+    const [symbol = "", list = ""] = entry.split("\u001f");
+    return [symbol, list ? list.split(",") : []] as const;
+  })), [candidateKey]);
+  const [version, setVersion] = useState(0);
+  // Bumped once the retry delay has passed after a failed read, to ask again.
+  const [retry, setRetry] = useState(0);
+  // A board left open overnight reloads once the day turns.
+  const today = new Date().toISOString().slice(0, 10);
+
+  useEffect(() => {
+    if (!enabled || !provider) return;
+    const queue = [...new Set([...candidates.values()].flat())].filter((symbol) => historyCache.peek(symbol) === undefined);
+    if (queue.length === 0) return;
+    let cancelled = false;
+    let failed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const landed = coalescedBump(() => {
+      if (!cancelled) setVersion((current) => current + 1);
+    });
+    // Twelve reads at a time, shared with the rows' terms (`boardRead`), or all at once from a source that
+    // batches them (`DataProvider.batchesReads`); a board that moved on skips its turn.
+    void readsInBatches(provider, "getPriceHistory").then((batch) => Promise.all(queue.map((symbol) => boardReadGate(batch)(async () => {
+      if (cancelled) return;
+      if (!await loadHistory(provider, symbol, batch)) failed = true;
+      landed.bump();
+    })))).then(() => {
+      landed.flush();
+      if (failed && !cancelled) retryTimer = setTimeout(() => setRetry((current) => current + 1), HISTORY_RETRY_MS);
+    });
+    return () => {
+      cancelled = true;
+      landed.cancel();
+      clearTimeout(retryTimer);
+    };
+  }, [candidates, enabled, provider, today, retry]);
+
+  return useMemo(() => {
+    const result = new Map<string, FrontReturnsState>();
+    if (!enabled) return result;
+    for (const contract of contracts) {
+      const quote = quotes.get(contract.symbol)?.quote;
+      const symbols = candidates.get(contract.symbol) ?? [];
+      // A contract keeps the history it had past its TTL until the next load lands,
+      // and one whose read failed counts as having none rather than waiting on a retry.
+      const loaded = symbols.map((symbol) => ({ symbol, history: historyCache.peek(symbol, { stale: true }), failed: historyCache.failed(symbol) }));
+      if (loaded.some((entry) => entry.history === undefined && !entry.failed)) {
+        result.set(contract.symbol, { loading: true, values: NO_FUTURES_RETURNS });
+        continue;
+      }
+      const available = loaded.flatMap((entry) => entry.history ? [{ symbol: entry.symbol, history: entry.history }] : []);
+      const front = pickFrontContract(available, quote?.price);
+      const history = available.find((entry) => entry.symbol === front)?.history;
+      result.set(contract.symbol, history
+        ? { loading: false, ...frontContractPeriodReturns(history, quote?.price, quote?.lastUpdated) }
+        : { loading: false, values: NO_FUTURES_RETURNS });
+    }
+    return result;
+    // `version` re-reads the history cache as loads land.
+  }, [candidates, contracts, enabled, quotes, version]);
+}
+
+/** Forgets every cached contract's history (tests). */
+export function resetFrontContractReturns(): void {
+  historyCache.clear();
+}

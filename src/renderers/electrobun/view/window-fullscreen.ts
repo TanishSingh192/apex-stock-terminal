@@ -1,0 +1,66 @@
+import { setWindowFullscreen, setWindowMaximized } from "../../../components/layout/window-fullscreen";
+import { detectPlatform } from "../../../utils/platform";
+import { backendRequest } from "./backend-rpc";
+import { logFailure } from "../../../utils/log-failure";
+
+/**
+ * Long enough that dragging a window edge does not ask the host on every
+ * frame, short enough that the header has moved by the time the fullscreen
+ * animation finishes.
+ */
+const RESIZE_SETTLE_MS = 120;
+
+/**
+ * Keeps the view's idea of its window's fullscreen state current. Electrobun
+ * emits no fullscreen event and a webview cannot see its window's style mask,
+ * but entering and leaving fullscreen always resizes the window, so the host
+ * is asked every time the size settles. On Windows, so is maximizing, which
+ * takes away the window's top edge.
+ */
+export function installElectrobunWindowFullscreenTracking(): () => void {
+  let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  let reading = false;
+  let readAgain = false;
+
+  const read = async (): Promise<void> => {
+    if (reading) {
+      readAgain = true;
+      return;
+    }
+    reading = true;
+    try {
+      const [fullscreen, maximized] = await Promise.all([
+        backendRequest("host.windowFullscreen"),
+        detectPlatform() === "win32" ? backendRequest("host.windowMaximized") : false,
+      ]);
+      setWindowFullscreen(fullscreen === true);
+      setWindowMaximized(maximized === true);
+    } catch (error) {
+      // A host too old to answer has the window chrome the header already
+      // assumes, so leaving the last known state alone is the safe read.
+      logFailure("desktop-window", "Could not read the window's fullscreen state")(error);
+    } finally {
+      reading = false;
+      if (readAgain) {
+        readAgain = false;
+        void read();
+      }
+    }
+  };
+
+  const scheduleRead = (): void => {
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      settleTimer = null;
+      void read();
+    }, RESIZE_SETTLE_MS);
+  };
+
+  window.addEventListener("resize", scheduleRead);
+  void read();
+
+  return () => {
+    window.removeEventListener("resize", scheduleRead);
+    if (settleTimer) clearTimeout(settleTimer);
+  };
+}

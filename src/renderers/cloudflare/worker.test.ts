@@ -1,0 +1,329 @@
+import { describe, expect, test } from "bun:test";
+import { handleRequest, SECURITY_HEADERS, signedOutProxyLimit, type WorkerEnv } from "./worker";
+import { REGISTRY_ORIGIN } from "../../plugins/marketplace/feed";
+import { DOCS_SITE } from "../../docs/content";
+
+function fixture() {
+  const requests: Request[] = [];
+  const env: WorkerEnv = {
+    ASSETS: {
+      async fetch(request) {
+        requests.push(request);
+        return new Response("<!doctype html>", { headers: { "content-type": "text/html" } });
+      },
+    },
+  };
+  return { env, requests };
+}
+
+describe("static Cloudflare host", () => {
+  test("reports health without invoking static assets", async () => {
+    const { env, requests } = fixture();
+    const response = await handleRequest(new Request("https://term.example/health"), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "ok" });
+    expect(requests).toHaveLength(0);
+  });
+
+  test("serves app assets with an enforced CSP and security headers", async () => {
+    const { env } = fixture();
+    const response = await handleRequest(new Request("https://term.example/"), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-security-policy")).toBe(SECURITY_HEADERS["content-security-policy"]);
+    expect(response.headers.has("content-security-policy-report-only")).toBe(false);
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+    expect(response.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("rewrites valid pane and layout share paths to the slim document", async () => {
+    const id = "0123456789abcdef0123456789abcdef";
+    for (const prefix of ["s", "l"]) {
+      const { env, requests } = fixture();
+      const response = await handleRequest(new Request(`https://term.example/${prefix}/${id}`), env);
+      expect(new URL(requests[0]!.url).pathname).toBe("/share.html");
+      expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow, noarchive");
+    }
+  });
+
+  test("keeps only the bare root indexable", async () => {
+    const { env } = fixture();
+    const root = await handleRequest(new Request("https://term.example/"), env);
+    expect(root.headers.has("x-robots-tag")).toBe(false);
+
+    // Deep links from gloom.sh CTAs were showing up in search as duplicate
+    // "Gloomberb" pages.
+    for (const path of ["/?ticker=GPC&tab=executives", "/?ticker=AAPL", "/settings"]) {
+      const response = await handleRequest(new Request(`https://term.example${path}`), env);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-robots-tag")).toBe("noindex");
+    }
+  });
+
+  test("leaves robots headers off deep-link assets that are not HTML", async () => {
+    const env: WorkerEnv = {
+      ASSETS: {
+        async fetch() {
+          return new Response("export {}", { headers: { "content-type": "text/javascript" } });
+        },
+      },
+    };
+    const response = await handleRequest(new Request("https://term.example/assets/app/main.js"), env);
+    expect(response.headers.has("x-robots-tag")).toBe(false);
+  });
+
+  test("keeps files named after their contents for a year, the icons for a day, and nothing else", async () => {
+    const served = (body: string, type: string): WorkerEnv => ({
+      ASSETS: { async fetch() { return new Response(body, { headers: { "content-type": type, "cache-control": "public, max-age=0, must-revalidate" } }); } },
+    });
+    const script = served("export {}", "text/javascript");
+    for (const path of ["/assets/app/main-0123456789abcdef.js", "/assets/app/main-0123456789abcdef.css", "/assets/plugins/gloom-polls/index-0123456789abcdef.js"]) {
+      const response = await handleRequest(new Request(`https://term.example${path}`), script);
+      expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    }
+    // Only the build's own hash: a name that merely ends in letters and digits is revalidated.
+    for (const path of ["/assets/app/boot-frame-cgqhseqiov4g-tr2eugf187e4.js", "/assets/app/main-0123456789abcdeg.js", "/assets/app/main-0123456789abcd.js"]) {
+      const response = await handleRequest(new Request(`https://term.example${path}`), script);
+      expect(response.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    }
+    const icon = await handleRequest(new Request("https://term.example/favicon.svg"), served("<svg/>", "image/svg+xml"));
+    expect(icon.headers.get("cache-control")).toBe("public, max-age=86400");
+    // A lazy chunk keeps its name across builds, so it is still revalidated.
+    const chunk = await handleRequest(new Request("https://term.example/assets/app/natural-earth/index.chunk.js"), script);
+    expect(chunk.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    // A name an older build had falls back to the app's page, which must not be kept.
+    const gone = await handleRequest(new Request("https://term.example/assets/app/main-fedcba9876543210.js"), served("<!doctype html>", "text/html"));
+    expect(gone.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("serves a robots.txt that lets crawlers reach the noindex header", async () => {
+    const { env, requests } = fixture();
+    const response = await handleRequest(new Request("https://term.example/robots.txt"), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toStartWith("text/plain");
+    expect(requests).toHaveLength(0);
+
+    // A Disallow would hide the noindex header from crawlers and leave pages
+    // that are already indexed stuck in the index.
+    const body = await response.text();
+    expect(body).toBe("User-agent: *\nAllow: /\n");
+    expect(body).not.toMatch(/disallow/i);
+  });
+
+  test("serves the Apple app site association without touching static assets", async () => {
+    const { env, requests } = fixture();
+    const response = await handleRequest(
+      new Request("https://term.example/.well-known/apple-app-site-association"),
+      env,
+    );
+
+    // Apple's fetcher accepts none of: a redirect, an HTML body, a 404. Any of
+    // those disables universal links silently, so pin the exact contract.
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(requests).toHaveLength(0);
+
+    const body = (await response.json()) as {
+      applinks: { details: { appIDs: string[]; components: { "/": string }[] }[] };
+    };
+    const detail = body.applinks.details[0]!;
+    expect(detail.appIDs).toEqual(["3XQML3UV65.sh.gloom.companion"]);
+    // Only share links are claimed; everything else must stay in the browser.
+    expect(detail.components[0]!["/"]).toBe("/s/*");
+  });
+
+  test("claims exactly the share paths the worker itself rewrites", async () => {
+    const { env } = fixture();
+    const response = await handleRequest(
+      new Request("https://term.example/.well-known/apple-app-site-association"),
+      env,
+    );
+    const body = (await response.json()) as {
+      applinks: { details: { components: { "/": string }[] }[] };
+    };
+    const claimed = body.applinks.details[0]!.components[0]!["/"];
+
+    // A real share id must match the pattern advertised to Apple, otherwise the
+    // app is claiming links the site does not serve, or missing ones it does.
+    const shareId = "0123456789abcdef0123456789abcdef";
+    const pattern = new RegExp(`^${claimed.replace("*", ".*")}$`);
+    expect(pattern.test(`/s/${shareId}`)).toBe(true);
+    expect(pattern.test("/settings")).toBe(false);
+  });
+
+  test("proxies only the same-origin API path to api.gloom.sh", async () => {
+    const { env, requests } = fixture();
+    let upstream: Request | undefined;
+    const response = await handleRequest(new Request("https://term.example/api/chat/channels/everyone/messages?limit=1", {
+      method: "POST",
+      headers: {
+        Cookie: "session=browser-cookie",
+        Origin: "https://term.example",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content: "hello" }),
+    }), env, async (request) => {
+      upstream = request;
+      return Response.json({ ok: true });
+    });
+
+    expect(response.status).toBe(200);
+    expect(requests).toHaveLength(0);
+    expect(upstream?.url).toBe("https://api.gloom.sh/chat/channels/everyone/messages?limit=1");
+    expect(upstream?.method).toBe("POST");
+    expect(upstream?.headers.get("cookie")).toBe("session=browser-cookie");
+    expect(upstream?.headers.get("origin")).toBe("https://term.example");
+    expect(await upstream?.text()).toBe('{"content":"hello"}');
+  });
+
+  test("rejects cross-origin API requests before proxying", async () => {
+    const { env } = fixture();
+    let proxied = false;
+    const response = await handleRequest(new Request("https://term.example/api/auth/sign-out", {
+      method: "POST",
+      headers: { Origin: "https://attacker.example" },
+    }), env, async () => {
+      proxied = true;
+      return new Response();
+    });
+    expect(response.status).toBe(403);
+    expect(proxied).toBe(false);
+  });
+
+  test("keeps every proxied API request on api.gloom.sh", async () => {
+    const { env } = fixture();
+    const proxy = async (path: string) => {
+      const upstream: string[] = [];
+      const response = await handleRequest(new Request(`https://term.example${path}`, {
+        headers: { Cookie: "session=browser-cookie" },
+      }), env, async (request) => {
+        upstream.push(request.url);
+        return Response.json({ ok: true });
+      });
+      return { status: response.status, upstream };
+    };
+
+    // A path starting with two slashes (the URL parser reads `\` as `/`) names
+    // another host when resolved against the API origin.
+    for (const path of [
+      "/api//example.com/x",
+      "/api/\\example.com/x",
+      "/api/\\/example.com/x",
+      "/api//\\example.com/x",
+      "/api///example.com/x",
+      "/api/\t/example.com/x",
+      "/api//example.com/x?next=/",
+    ]) {
+      expect(await proxy(path)).toEqual({ status: 404, upstream: [] });
+    }
+
+    // Encoded separators are path text on the API host, not an authority.
+    for (const [path, expected] of [
+      ["/api/%2F%2Fexample.com/x", "https://api.gloom.sh/%2F%2Fexample.com/x"],
+      ["/api/%5Cexample.com/x", "https://api.gloom.sh/%5Cexample.com/x"],
+      ["/api/%5C%5Cexample.com/x", "https://api.gloom.sh/%5C%5Cexample.com/x"],
+      ["/api/@example.com/x", "https://api.gloom.sh/@example.com/x"],
+      ["/api", "https://api.gloom.sh/"],
+      ["/api/", "https://api.gloom.sh/"],
+      ["/api/auth/get-session", "https://api.gloom.sh/auth/get-session"],
+      ["/api/news?q=//example.com&limit=2", "https://api.gloom.sh/news?q=//example.com&limit=2"],
+    ] as const) {
+      expect(await proxy(path)).toEqual({ status: 200, upstream: [expected] });
+    }
+  });
+
+  test("checks plugin proxy sessions with api.gloom.sh, sending only the session cookie", async () => {
+    const { env, requests } = fixture();
+    const checks: Request[] = [];
+    const response = await handleRequest(new Request("https://term.example/http-proxy", {
+      method: "POST",
+      headers: {
+        Origin: "https://term.example",
+        Cookie: "theme=dark; __Secure-gloomberb.session_token=worker-route-test",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: "https://api.github.com/repos/gloom-sh/gloomberb" }),
+    }), env, async (request) => {
+      checks.push(request);
+      // What the API answers for a token it does not know.
+      return new Response(null, { status: 200 });
+    });
+
+    // Signed out is served too; this target is simply not on the allowlist.
+    expect(response.status).toBe(403);
+    expect(checks).toHaveLength(1);
+    expect(checks[0]?.url).toBe("https://api.gloom.sh/auth/get-session");
+    expect(checks[0]?.headers.get("cookie")).toBe("__Secure-gloomberb.session_token=worker-route-test");
+    expect(requests).toHaveLength(0);
+  });
+
+  test("rejects every non-API mutation without invoking assets or outbound fetch", async () => {
+    const { env, requests } = fixture();
+    const response = await handleRequest(new Request("https://term.example/shares", {
+      method: "POST",
+      headers: { Origin: "https://term.example" },
+    }), env);
+    expect(response.status).toBe(405);
+    expect(requests).toHaveLength(0);
+  });
+});
+
+/**
+ * The hosted build can only reach origins listed in `connect-src`. A blocked
+ * fetch is not an error the user can act on: the plugin marketplace just shows
+ * an empty catalog. This shipped that way once, because the pane was verified
+ * on the terminal and desktop but not on the web build, so the two values are
+ * pinned to each other here.
+ */
+describe("content security policy", () => {
+  test("allows the plugin registry the marketplace fetches and the docs DOCS reads", () => {
+    const connectSrc = SECURITY_HEADERS["content-security-policy"]
+      .split(";")
+      .map((directive) => directive.trim())
+      .find((directive) => directive.startsWith("connect-src"));
+
+    expect(connectSrc).toContain(REGISTRY_ORIGIN);
+    expect(connectSrc?.split(/\s+/)).toContain(DOCS_SITE);
+  });
+
+  test("lets Google One Tap load, and only Google's sign-in paths", () => {
+    const directives = new Map(SECURITY_HEADERS["content-security-policy"]
+      .split(";")
+      .map((directive) => directive.trim().split(/\s+/))
+      .map(([name, ...sources]) => [name!, sources]));
+    expect(directives.get("script-src")).toEqual(["'self'", "https://accounts.google.com/gsi/client"]);
+    expect(directives.get("frame-src")).toEqual(["'self'", "https://accounts.google.com/gsi/"]);
+    expect(directives.get("style-src")).toContain("https://accounts.google.com/gsi/style");
+    expect(directives.get("connect-src")).toContain("https://accounts.google.com/gsi/");
+    expect(directives.get("frame-ancestors")).toEqual(["'none'"]);
+  });
+});
+
+test("a signed-out proxy call is counted by its address and with everyone's, and refused once either is spent", async () => {
+  const counted: string[] = [];
+  const binding = (name: string, allow: (key: string) => boolean) => ({
+    async limit({ key }: { key: string }) {
+      counted.push(`${name}:${key}`);
+      return { success: allow(key) };
+    },
+  });
+  const { env } = fixture();
+  const request = (ip: string) => new Request("https://term.example/http-proxy", { method: "POST", headers: { "cf-connecting-ip": ip } });
+  expect(signedOutProxyLimit(env)).toBeUndefined();
+  const limit = signedOutProxyLimit({
+    ...env,
+    SIGNED_OUT_PROXY_PER_ADDRESS: binding("address", (key) => key !== "ip:203.0.113.9"),
+    SIGNED_OUT_PROXY_TOTAL: binding("total", () => counted.length < 4),
+  })!;
+  expect(await limit(request("203.0.113.1"))).toBe(true);
+  expect(await limit(request("203.0.113.9"))).toBe(false);
+  expect(await limit(request("2001:db8:1:2::5"))).toBe(false);
+  expect(counted).toEqual([
+    "address:ip:203.0.113.1",
+    "total:signed-out",
+    "address:ip:203.0.113.9",
+    "address:ip6:2001:db8:1:2",
+    "total:signed-out",
+  ]);
+});
+

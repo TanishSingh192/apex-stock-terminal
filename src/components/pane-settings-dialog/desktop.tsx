@@ -1,0 +1,261 @@
+import { Box, Text } from "../../ui";
+import { useEffect, useId, type ReactNode } from "react";
+import type { PaneSettingField, PaneSettingRowNote } from "../../types/plugin";
+import { colors } from "../../theme/colors";
+import { SelectField, type SelectFieldHandle } from "../ui/select-field";
+import { Checkbox } from "../ui/checkbox";
+import { Button } from "../ui/button";
+import { Badge } from "../ui/display";
+import { DialogFrame } from "../ui/frame";
+import { isPaneSettingDisabled, noteColor, summarizePaneSettingValue } from "./value";
+
+const DESKTOP_TEXT_STYLE = {
+  letterSpacing: 0,
+  lineHeight: "var(--cell-h)",
+} as const;
+
+export function desktopText(weight?: number) {
+  return weight ? { ...DESKTOP_TEXT_STYLE, fontWeight: weight } : DESKTOP_TEXT_STYLE;
+}
+
+
+/** Pane settings dialogs: the kit DialogFrame at the settings width. */
+export function DesktopDialogSurface({
+  title,
+  subtitle,
+  dismiss,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  dismiss: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <Box width={68} maxWidth="calc(100vw - 72px)" flexDirection="column">
+      <DialogFrame title={title} subtitle={subtitle} onClose={dismiss}>
+        {children}
+      </DialogFrame>
+    </Box>
+  );
+}
+
+type FocusableNode = {
+  contains?(node: unknown): boolean;
+  matches?(selector: string): boolean;
+  scrollIntoView?(options: { block: "nearest" }): void;
+};
+type FocusedNode = { blur?(): void; closest?(selector: string): unknown; matches?(selector: string): boolean };
+type SettingsDocument = { activeElement: FocusedNode | null; getElementById(id: string): FocusableNode | null };
+
+/**
+ * The highlighted row is where the keyboard acts. A control a click or a closed
+ * menu left focused elsewhere in the dialog would take Enter for its own row,
+ * so it lets go when the highlight moves away from it. Returns the DOM id the
+ * row carries: a Box ref is cell geometry, not the element.
+ */
+function useFollowHighlight(selected: boolean): string {
+  const rowId = `pane-setting-row-${useId()}`;
+  useEffect(() => {
+    if (!selected) return;
+    const doc = (globalThis as { document?: SettingsDocument }).document;
+    const row = doc?.getElementById(rowId);
+    const active = doc?.activeElement;
+    // Only a control in another row; the dialog surface keeps its focus.
+    if (active && !row?.contains?.(active) && !active.matches?.(".gloom-dialog") && active.closest?.(".gloom-dialog")) active.blur?.();
+    // The pointer highlighted it: scrolling now would slide another row under it.
+    if (row?.matches?.(":hover")) return;
+    row?.scrollIntoView?.({ block: "nearest" });
+  }, [rowId, selected]);
+  return rowId;
+}
+
+function DesktopSettingsRow({
+  field,
+  selected,
+  currentValue,
+  note,
+  onHover,
+  onEdit,
+  onSelectRef,
+  onApply,
+}: {
+  field: PaneSettingField;
+  selected: boolean;
+  currentValue: unknown;
+  /** What its action said on it: the state beside its button, the reason in place of its description. */
+  note: PaneSettingRowNote | null;
+  onHover: () => void;
+  onEdit: () => void;
+  onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
+  onApply: (field: PaneSettingField, value: unknown) => void;
+}) {
+  const isToggle = field.type === "toggle";
+  const disabled = isPaneSettingDisabled(field);
+  const rowId = useFollowHighlight(selected);
+  const summary = summarizePaneSettingValue(field, currentValue);
+  const description = note?.text ?? field.description;
+  const control = field.type === "toggle" ? (
+    <Checkbox label={field.label} displayLabel="" checked={currentValue === true} onChange={(checked) => onApply(field, checked)} />
+  ) : field.type === "select" ? (
+    <SelectField
+      value={typeof currentValue === "string" ? currentValue : ""}
+      options={field.options}
+      includeUnsetOption
+      restoreFocus={false}
+      selectRef={(element) => onSelectRef(field.key, element)}
+      onChange={(value) => onApply(field, value)}
+    />
+  ) : field.type === "action" ? (
+    // The button says what pressing the row does, and presses it: the row's own press is not repeated.
+    <Box flexDirection="row" alignItems="center" gap={1}>
+      {note ? <Text fg={noteColor(note)} style={desktopText()}>{note.status}</Text> : null}
+      <Button label={summary} variant="secondary" disabled={disabled} onPress={onEdit} stopPropagation />
+    </Box>
+  ) : (
+    <Box flexDirection="row" alignItems="center" gap={1}>
+      <Badge label={summary} />
+      <Text fg={colors.textMuted} style={desktopText()}>Edit</Text>
+    </Box>
+  );
+
+  return (
+    <Box
+      id={rowId}
+      flexDirection="column"
+      minHeight={description ? undefined : 2}
+      data-gloom-role="pane-setting-row"
+      data-selected={selected ? "true" : "false"}
+      backgroundColor={selected ? "var(--gloom-hover-fill)" : "transparent"}
+      onMouseOver={disabled ? undefined : onHover}
+      onMouseDown={field.type === "select" ? undefined : (event: any) => {
+        event.stopPropagation?.();
+        event.preventDefault?.();
+        if (disabled) return;
+        if (isToggle) onApply(field, currentValue !== true);
+        else onEdit();
+      }}
+      data-gloom-interactive={field.type === "select" || disabled ? undefined : "true"}
+      style={{
+        borderRadius: "var(--gloom-radius-md)",
+        cursor: field.type === "select" || disabled ? "default" : "pointer",
+        opacity: disabled ? 0.6 : 1,
+        padding: "var(--gloom-space-sm)",
+        transition: "background-color 100ms ease",
+      }}
+    >
+      <Box flexDirection="row" alignItems="center" width="100%">
+        <Box flexDirection="row" flexGrow={1} minWidth={0} style={{ paddingRight: "var(--gloom-space-md)" }}>
+          <Text fg={colors.text} style={desktopText()}>{field.label}</Text>
+        </Box>
+        {control}
+      </Box>
+      {description && (
+        <Text fg={note?.text ? noteColor(note) : colors.textMuted} wrapText style={desktopText()}>
+          {description}
+        </Text>
+      )}
+    </Box>
+  );
+}
+
+function DesktopSettingsList({
+  fields,
+  selectedIndex,
+  settings,
+  noteFor,
+  onHover,
+  onEdit,
+  onSelectRef,
+  onApply,
+}: {
+  fields: PaneSettingField[];
+  selectedIndex: number;
+  settings: Record<string, unknown>;
+  noteFor?: (field: PaneSettingField) => PaneSettingRowNote | null;
+  onHover: (field: PaneSettingField, index: number) => void;
+  onEdit: (field: PaneSettingField, index: number) => void;
+  onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
+  onApply: (field: PaneSettingField, value: unknown, index: number) => void;
+}) {
+  return (
+    <Box
+      flexDirection="column"
+      style={{
+        marginTop: 2,
+      }}
+    >
+      {fields.map((field, index) => (
+        <DesktopSettingsRow
+          key={field.key}
+          field={field}
+          selected={index === selectedIndex}
+          currentValue={settings[field.key]}
+          note={noteFor?.(field) ?? null}
+          onHover={() => onHover(field, index)}
+          onEdit={() => onEdit(field, index)}
+          onSelectRef={onSelectRef}
+          onApply={(targetField, value) => onApply(targetField, value, index)}
+        />
+      ))}
+    </Box>
+  );
+}
+
+export function DesktopUnavailablePaneSettingsDialog({ dismiss }: { dismiss: () => void }) {
+  return (
+    <DesktopDialogSurface title="Pane Settings" dismiss={dismiss}>
+      <Text fg={colors.textDim} wrapText style={desktopText()}>
+        This pane is no longer configurable.
+      </Text>
+    </DesktopDialogSurface>
+  );
+}
+
+export function DesktopPaneSettingsDialogBody({
+  title,
+  dismiss,
+  fields,
+  selectedIndex,
+  settings,
+  noteFor,
+  onHover,
+  onEdit,
+  onSelectRef,
+  onApply,
+}: {
+  title: string;
+  dismiss: () => void;
+  fields: PaneSettingField[];
+  selectedIndex: number;
+  settings: Record<string, unknown>;
+  noteFor?: (field: PaneSettingField) => PaneSettingRowNote | null;
+  onHover: (field: PaneSettingField, index: number) => void;
+  onEdit: (field: PaneSettingField, index: number) => void;
+  onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
+  onApply: (field: PaneSettingField, value: unknown, index: number) => void;
+}) {
+  return (
+    <DesktopDialogSurface
+      title={title}
+      dismiss={dismiss}
+    >
+      {fields.length === 0 ? (
+        <Text fg={colors.textDim} wrapText style={desktopText()}>
+          No settings available.
+        </Text>
+      ) : (
+        <DesktopSettingsList
+          fields={fields}
+          selectedIndex={selectedIndex}
+          settings={settings}
+          noteFor={noteFor}
+          onHover={onHover}
+          onEdit={onEdit}
+          onSelectRef={onSelectRef}
+          onApply={onApply}
+        />
+      )}
+    </DesktopDialogSurface>
+  );
+}

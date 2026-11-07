@@ -1,0 +1,436 @@
+import { useCallback, useMemo } from "react";
+import type {
+  CloudExecutiveRowPayload,
+  CloudProxyStatementPayload,
+} from "../../../api-client";
+import {
+  BulletList,
+  DataTableView,
+  EmptyState, FigureList, PaneStatusBody, Prose, QueryBar, READING_WIDTH, SectionHeading,
+  usePaneFooter,
+  type DataTableCell,
+  type DataTableColumn,
+  type PaneFooterSegment,
+  type PaneHint,
+} from "../../../components";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { useAsyncResource } from "../../../react/async-resource";
+import { usePaneStateValue } from "../../../state/app/context";
+import { colors, getChartIndicatorColor } from "../../../theme/colors";
+import {
+  Box,
+  ScrollBox,
+  Text,
+  TextAttributes,
+  useRendererHost,
+  useUiCapabilities,
+} from "../../../ui";
+import { isPermanentClientError } from "../../../api-client/errors";
+import type { IssuerListingParams } from "../../../api-client/paths";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
+import { useFilingYearReader } from "../shared/filing-year-reader";
+import { UpgradeLabel } from "../shared/locked-rows";
+import { useProFeatureWall, type ProFeatureWallCopy, type ReadGuard } from "../shared/pro-feature-wall";
+import { useBoundTicker, useIssuerListing } from "../shared/ticker-request";
+import { SplitBar } from "../../../components/ui/split-bar";
+import { loadProxyStatement, loadProxyStatements, type ProxyTier } from "./data";
+import {
+  equityShare,
+  formatChange,
+  formatFiled,
+  formatPay,
+  formatRatio,
+} from "./format";
+
+export const EXECUTIVES_PANE_ID = "executives";
+
+const PAY_PARTS: Array<{ key: keyof CloudExecutiveRowPayload; label: string }> =
+  [
+    { key: "salary", label: "Salary" },
+    { key: "bonus", label: "Bonus" },
+    { key: "stockAwards", label: "Stock" },
+    { key: "optionAwards", label: "Options" },
+    { key: "nonEquityIncentive", label: "Incentive" },
+    { key: "pensionAndDeferred", label: "Pension" },
+    { key: "allOther", label: "Other" },
+  ];
+
+/**
+ * How the chief executive's pay was made up, as one bar. Salary is usually
+ * a sliver and equity most of it; seeing that beats the table.
+ */
+function PayMixBar({
+  row,
+  width,
+}: {
+  row: CloudExecutiveRowPayload;
+  width: number;
+}) {
+  const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
+  // Colours follow the pieces that are drawn, so the common salary and stock
+  // pair never lands on two neighbouring shades of the palette.
+  const parts = PAY_PARTS.map((part) => ({
+    ...part,
+    value: (row[part.key] as number | null) ?? 0,
+  })).filter((part) => part.value > 0).map((part, index) => ({ ...part, color: getChartIndicatorColor(index) }));
+  const sum = parts.reduce((total, part) => total + part.value, 0);
+  if (sum <= 0) return null;
+  const barWidth = Math.max(10, Math.min(width, 60));
+  return (
+    <Box flexDirection="column">
+      <SplitBar parts={parts.map((part) => ({ id: part.key, value: part.value, color: part.color }))} width={barWidth} />
+      <Box flexDirection="row" flexWrap="wrap">
+        {parts.map((part) => (
+          <Box key={part.key} flexDirection="row" alignItems="center" marginRight={2}>
+            {isDesktopWeb ? (
+              <Box
+                width={1}
+                height={1}
+                marginRight={1}
+                backgroundColor={part.color}
+                style={{ width: "8px", height: "8px", borderRadius: "2px" }}
+              />
+            ) : <Text fg={part.color}>■ </Text>}
+            <Text fg={colors.textDim}>{part.label} </Text>
+            <Text fg={colors.text}>
+              {Math.round((part.value / sum) * 100)}%
+            </Text>
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  );
+}
+
+type OfficerColumn = DataTableColumn & { id: "name" | "title" | "equity" | "total" };
+const OFFICER_COLUMNS: OfficerColumn[] = [
+  { id: "name", label: "NAME", width: 18, align: "left" },
+  { id: "title", label: "TITLE", width: 16, align: "left", flexGrow: 1 },
+  { id: "equity", label: "EQ%", width: 4, align: "right" },
+  { id: "total", label: "TOTAL", width: 8, align: "right" },
+];
+
+function renderOfficerCell(row: CloudExecutiveRowPayload, column: OfficerColumn): DataTableCell {
+  switch (column.id) {
+    case "name": return { text: row.name, color: colors.textBright };
+    case "title": return { text: row.title.replace(/\s+/g, " ").trim(), color: colors.textDim };
+    case "equity": return { text: equityShare(row), color: colors.textDim };
+    case "total": return { text: formatPay(row.total, { fixedDecimals: true }), color: colors.text, attributes: TextAttributes.BOLD };
+  }
+}
+
+function ExecutiveRows({
+  rows,
+  width,
+  breakdown,
+}: {
+  rows: CloudExecutiveRowPayload[];
+  width: number;
+  /** False on the free preview, whose rows carry the total alone: no EQ% column. */
+  breakdown: boolean;
+}) {
+  const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
+  if (width < 52) {
+    return <Box flexDirection="column">
+      {rows.map((row) => <Prose
+        key={`${row.name}-${row.total}`}
+        text={[row.name, row.title, equityShare(row) ? `${equityShare(row)} equity` : null].filter(Boolean).join(" · ")}
+        width={width}
+        prefix={`${formatPay(row.total).padEnd(9)} `}
+        prefixColor={colors.textBright}
+        color={colors.textDim}
+      />)}
+    </Box>;
+  }
+  // The name column fits the longest name so the title starts after a kit gutter.
+  const nameWidth = Math.min(24, Math.max(10, ...rows.map((row) => row.name.length)));
+  const columns = OFFICER_COLUMNS
+    .filter((column) => breakdown || column.id !== "equity")
+    .map((column) => column.id === "name" ? { ...column, width: nameWidth } : column);
+  const height = rows.length + 1;
+  return (
+    <Box flexDirection="column" height={isDesktopWeb ? undefined : height} flexShrink={0}>
+      <DataTableView<CloudExecutiveRowPayload, OfficerColumn>
+        columns={columns}
+        items={rows}
+        selection={{ kind: "none" }}
+        rootWidth={width}
+        rootHeight={height}
+        // The scroll body owns the gutter, so the table does not add its own.
+        horizontalPadding={0}
+        virtualize={false}
+        fitRows
+        sortColumnId={null}
+        sortDirection="asc"
+        getItemKey={(row, index) => `${row.name}-${row.total}-${index}`}
+        renderCell={renderOfficerCell}
+        emptyStateTitle="No named executive officers."
+      />
+    </Box>
+  );
+}
+
+/**
+ * What a key figure is about, so a filer's "Say on Pay Approval, 2025 Annual
+ * Meeting" is recognised as the "prior say-on-pay support" computed here.
+ */
+function figureTopic(label: string): string {
+  const letters = label.toLowerCase().replace(/[^a-z]/g, "");
+  if (letters.includes("sayonpay")) return "sayonpay";
+  if (letters.includes("payratio") || letters.includes("ceotomedian")
+    || (letters.includes("median") && letters.includes("ratio"))) return "payratio";
+  // The median's pay is its own figure; the pay ratio line carries it only as a note.
+  if (letters.includes("medianemployee")) return "medianpay";
+  return letters;
+}
+
+function figuresOf(statement: CloudProxyStatementPayload) {
+  const figures: Array<{ value: string; label: string; note?: string }> = [];
+  const ceo = statement.ceo;
+  if (ceo?.total != null && Number.isFinite(ceo.total)) {
+    const change = formatChange(ceo.total, ceo.priorYearTotal);
+    figures.push({
+      value: formatPay(ceo.total),
+      label: `${ceo.name} total pay`,
+      note: change
+        ? `${change} vs prior year`
+        : (statement.fiscalYearLabel ?? undefined),
+    });
+  }
+  if (statement.payRatio !== null) {
+    figures.push({
+      value: formatRatio(statement.payRatio),
+      label: "CEO to median employee",
+      note: statement.medianEmployeePay
+        ? `median ${formatPay(statement.medianEmployeePay)}`
+        : undefined,
+    });
+  }
+  if (ceo) {
+    const share = equityShare(ceo);
+    if (share) figures.push({ value: share, label: "CEO pay in equity" });
+  }
+  if (statement.sayOnPayPriorSupport !== null) {
+    figures.push({
+      value: `${Math.round(statement.sayOnPayPriorSupport)}%`,
+      label: "prior say-on-pay support",
+    });
+  }
+  const seen = new Set(figures.map((figure) => figureTopic(figure.label)));
+  if (statement.payRatio !== null && statement.medianEmployeePay) seen.add("medianpay");
+  for (const figure of statement.keyFigures ?? []) {
+    if (figures.length >= 8) break;
+    const topic = figureTopic(figure.label);
+    if (seen.has(topic)) continue;
+    seen.add(topic);
+    figures.push({
+      value: figure.value,
+      label: figure.label,
+      note: figure.note || undefined,
+    });
+  }
+  return figures;
+}
+
+const EXEC_WALL: ProFeatureWallCopy = {
+  placement: "exec-wall",
+  action: "see executive pay",
+  title: "Executive pay is part of Gloom Cloud Pro.",
+  message: "Named executive officers and how they were paid, read from each proxy statement and checked against the filing.",
+};
+
+export function ExecutivesPane({
+  focused,
+  width,
+  height,
+  nested = false,
+}: {
+  focused: boolean;
+  width: number;
+  height: number;
+  /** Inside Ticker Research, whose own tab strip keeps h/l and the arrows. */
+  nested?: boolean;
+}) {
+  // Every plan reads EXEC: without Pro the server serves each executive's
+  // total pay, so only its refusal (an older server, an expired session) walls it.
+  const { wall, guard } = useProFeatureWall(EXEC_WALL, { width, height }, { preview: true });
+  const tier: ProxyTier = usePlanAccess().hasProAccess ? "full" : "preview";
+  const { symbol, ticker: boundTicker } = useBoundTicker();
+  const ticker = symbol ? symbol.toUpperCase() : null;
+  const listing = useIssuerListing(boundTicker);
+  if (wall) return wall;
+  if (!ticker) return <EmptyState title="Select a ticker." />;
+  return <ExecutiveResearch key={ticker} ticker={ticker} listing={listing} tier={tier} focused={focused} width={width} nested={nested} guard={guard} />;
+}
+
+export function ExecutivesResearchTab(props: { focused: boolean; width: number; height: number }) {
+  return <ExecutivesPane {...props} nested />;
+}
+
+function ExecutiveResearch({ ticker, listing, tier, focused, width, nested, guard }: {
+  ticker: string;
+  listing: IssuerListingParams;
+  tier: ProxyTier;
+  focused: boolean;
+  width: number;
+  nested: boolean;
+  guard: ReadGuard;
+}) {
+  const nativePaneChrome = useUiCapabilities().nativePaneChrome === true;
+  const rendererHost = useRendererHost();
+  const openUpgrade = useCloudUpgradeAction("exec");
+  const [selectedYear, setYear] = usePaneStateValue<number | null>("proxyYear", null);
+  const loadYears = useCallback((force: boolean) => guard(loadProxyStatements(ticker, { force, listing, tier })), [guard, listing, ticker, tier]);
+  const list = useAsyncResource(loadYears, { clearOnError: isPermanentClientError });
+  const years = useMemo(() => (list.data?.data?.proxies ?? []).map((entry) => entry.proxyYear), [list.data]);
+  // Without Pro only the latest proxy is served: an earlier pick from a Pro
+  // session waits for Pro again rather than asking for a year that is refused.
+  const year = tier === "full" && selectedYear !== null && years.includes(selectedYear)
+    ? selectedYear : years[0] ?? null;
+  const loadStatement = useCallback((force: boolean) => guard(loadProxyStatement(ticker, year!, { force, listing, tier })), [guard, listing, ticker, year, tier]);
+  const detail = useAsyncResource(year === null ? null : loadStatement, { clearOnError: isPermanentClientError });
+  const statement = detail.data?.data ?? null;
+  // The free preview: each executive's total pay; the breakdown and earlier years are Pro.
+  const preview = statement?.access === "preview" || list.data?.data?.access === "preview";
+  const loading = list.loading || detail.loading;
+  // A copy saved earlier answering a failed refresh says when it was saved, in the footer every pane uses;
+  // a failed refresh with only what is on screen says why. Without anything shown, the body says it.
+  const listError = list.data?.data ? list.error ?? (list.data.savedAt == null ? list.data.refreshError : null) ?? null : null;
+  const statementError = detail.data?.data ? detail.error ?? (detail.data.savedAt == null ? detail.data.refreshError : null) ?? null : null;
+  const refresh = useCallback(() => {
+    void list.reload();
+    if (year !== null) void detail.reload();
+  }, [list.reload, detail.reload, year]);
+
+  const openFiling = useCallback(() => {
+    if (statement?.docUrl) void rendererHost.openExternal(statement.docUrl);
+  }, [rendererHost, statement]);
+  const { scrollRef, yearStrip, yearFilters, yearHint } = useFilingYearReader({
+    years,
+    year,
+    onSelectYear: setYear,
+    tabForm: "proxy",
+    filterLabel: "Proxy",
+    focused,
+    nested,
+    scope: "executives",
+    documentKey: String(year),
+    refresh,
+  });
+
+  usePaneFooter(EXECUTIVES_PANE_ID, () => {
+    const info: PaneFooterSegment[] = [];
+    if (loading)
+      info.push({ id: "loading", parts: [{ text: "loading", tone: "muted" }] });
+    if (listError) info.push({ id: "list-error", parts: [{ text: `Proxy list: ${listError}`, tone: "warning" }] });
+    if (statementError) info.push({ id: "statement-error", parts: [{ text: `${year} proxy: ${statementError}`, tone: "warning" }] });
+    info.push(...savedCopyFooterInfo([list.data?.data ? list.data.savedAt : null, statement ? detail.data?.savedAt : null]));
+    if (statement) {
+      info.push({
+        id: "filed",
+        parts: [
+          { text: `filed ${formatFiled(statement.filedAt)}`, tone: "muted" },
+        ],
+      });
+    }
+    // `r` refreshes every pane, so it gets no hint here.
+    const hints: PaneHint[] = statement ? [{ id: "open", key: "o", label: "pen filing", onPress: openFiling }] : [];
+    if (yearHint) hints.push(yearHint);
+    if (preview) hints.push({ id: "upgrade", key: CLOUD_PLAN_KEY, label: "upgrade", title: "Upgrade to Pro", onPress: openUpgrade });
+    return { info, hints };
+  }, [loading, listError, statementError, year, list.data, detail.data, statement, openFiling, yearHint, preview, openUpgrade]);
+
+  const figures = useMemo(
+    () => (statement ? figuresOf(statement) : []),
+    [statement],
+  );
+  // The year is named by the tabs or the filter when there is a choice; a
+  // single proxy says which one it is here.
+  const meta = statement ? [
+    years.length > 1 ? null : `${statement.proxyYear} proxy`,
+    statement.fiscalYearLabel ? `pay for ${statement.fiscalYearLabel.replace(/^Fiscal/, "fiscal")}` : null,
+    statement.meetingDate ? `meeting ${formatFiled(statement.meetingDate)}` : null,
+  ].filter(Boolean).join(" · ") : "";
+  const bodyWidth = Math.max(12, width - 2);
+  const proseWidth = Math.min(bodyWidth, READING_WIDTH);
+
+  if (list.loading && !list.data?.data) {
+    return <PaneStatusBody loading align="center" loadingLabel="Loading proxy statement..." />;
+  }
+  if (!list.error && years.length === 0) {
+    return <EmptyState title={`No proxy statement on file for ${ticker}.`} />;
+  }
+  if (list.error && !list.data?.data) {
+    return <PaneStatusBody error={list.error} errorTitle="Could not load executive compensation." />;
+  }
+
+  return (
+    <Box
+      flexDirection="column"
+      flexGrow={1}
+      flexShrink={1}
+      flexBasis={0}
+      minHeight={0}
+      overflow="hidden"
+    >
+      {yearStrip}
+      {(yearFilters.length > 0 || meta) && <QueryBar width={width} filters={yearFilters} meta={meta || undefined} />}
+      <ScrollBox
+        ref={scrollRef}
+        flexGrow={1}
+        flexShrink={1}
+        flexBasis={0}
+        minHeight={0}
+        scrollY
+        paddingX={1}
+      >
+        {statement ? (
+          <Box
+            flexDirection="column"
+            width={nativePaneChrome ? "100%" : bodyWidth}
+          >
+            {figures.length > 0 && (
+              <Box flexDirection="column">
+                <SectionHeading title="Key Figures" />
+                <FigureList figures={figures} width={proseWidth} minValueWidth={4} maxValueWidth={14} />
+              </Box>
+            )}
+            {statement.ceo && !preview && (
+              <Box flexDirection="column">
+                <SectionHeading marginTop={figures.length > 0 ? 1 : 0}
+                  title={`How ${statement.ceo.name.trim().split(/\s+/).pop() || "the CEO"} Was Paid`}
+                />
+                <PayMixBar row={statement.ceo} width={proseWidth} />
+              </Box>
+            )}
+            {statement.namedExecutives.length > 0 && (
+              <Box flexDirection="column">
+                <SectionHeading marginTop={1} title="Named Executive Officers" />
+                <ExecutiveRows
+                  rows={statement.namedExecutives}
+                  width={proseWidth}
+                  breakdown={!preview}
+                />
+              </Box>
+            )}
+            {preview && (
+              <Box marginTop={1}>
+                <UpgradeLabel text="Upgrade for the pay breakdown and earlier years" onPress={openUpgrade} role="exec-upgrade" />
+              </Box>
+            )}
+            {statement.highlights && (
+              <Box flexDirection="column">
+                <SectionHeading marginTop={1} title="What Changed" />
+                <BulletList items={statement.highlights.split("\n")} width={proseWidth} color={colors.text} />
+              </Box>
+            )}
+          </Box>
+        ) : (
+          <PaneStatusBody loading={detail.loading} error={detail.error} errorTitle="Could not load this proxy statement."
+            empty={detail.data?.data === null} emptyTitle={`No ${year} proxy statement on file for ${ticker}.`} />
+        )}
+      </ScrollBox>
+    </Box>
+  );
+}

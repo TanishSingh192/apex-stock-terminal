@@ -1,0 +1,174 @@
+/** One published figure: when it is as of and who published it (the fund's sponsor, or Gloom Cloud for a computed one). */
+interface FundFact<T> {
+  value: T;
+  asOf: string | null;
+  source: string;
+  url?: string;
+}
+
+/**
+ * `registered`: a 1940 Act fund (an ETF or UIT). `trust`: an exchange-traded
+ * trust or pool outside the 1940 Act. `closed-end`: a registered closed-end
+ * fund (ECC, OXLC, PDI), found filing N-CEN, N-CSR, N-PORT or N-2. `bdc`: a
+ * business development company (ARCC, MAIN), found filing N-2 or its N-54A
+ * election beside its 10-Q and 10-K. Either's shares trade at their own
+ * premium or discount to NAV. Servers before them say null.
+ */
+export type FundStructure = "registered" | "trust" | "closed-end" | "bdc";
+/** `management-fee`: a Hong Kong fund's management fee, which its issuer states apart from the ongoing charges. */
+type ExpenseRatioKind = "net" | "gross" | "sponsor-fee" | "management-fee";
+/**
+ * A bond fund as its sponsor classes it: `municipal` when its interest is
+ * exempt from federal income tax, `taxable` otherwise.
+ */
+type BondFundClass = "municipal" | "taxable";
+
+/**
+ * What a bond fund's sponsor publishes about its yield and rate risk, each
+ * figure dated. The 30-day SEC yield is the standardized yield (net
+ * investment income of the last 30 days, annualized, over the offering
+ * price); a distribution yield annualizes cash paid and is not it.
+ */
+export interface FundBondFacts {
+  kind: BondFundClass;
+  /** A single-state municipal fund's state (`CA`, `NY`); null for a national fund. */
+  state: string | null;
+  /** Percent. */
+  secYield: FundFact<number> | null;
+  /** Percent. */
+  yieldToWorst: FundFact<number> | null;
+  /** Years: `effective` (option-adjusted) duration, or Vanguard's month-end `average` duration. */
+  duration: (FundFact<number> & { measure: "effective" | "average" }) | null;
+}
+
+/**
+ * A leveraged or inverse fund's objective as its sponsor states it: `value`
+ * times its benchmark's return over each `reset` period (3 for TQQQ, -3 for
+ * SQQQ, 1.5 for UVXY), dated by the sponsor page or list it was read from.
+ * `proxy`: what tracks the benchmark one for one (QQQ for the Nasdaq-100, the
+ * share a single-stock fund multiplies), which CMP draws the objective from;
+ * null when nothing does.
+ */
+export interface FundLeverage extends FundFact<number> {
+  reset: "daily" | "monthly";
+  benchmark: string | null;
+  proxy: { ticker: string; basis: "index-fund" | "underlying" } | null;
+}
+
+/**
+ * A gold or silver trust's metal in trust (GLD, GLDM, IAU, IAUM, SLV), as its
+ * sponsor publishes it each business day: troy ounces, the sponsor's own
+ * tonnes, and the change on the stored day before (`since`). `change` is null
+ * until two days are stored: iShares publishes no history of its ounces, so
+ * IAU, IAUM and SLV have days from October 2026 only.
+ */
+export interface FundMetalHoldings {
+  metal: "gold" | "silver";
+  asOf: string;
+  ounces: number;
+  tonnes: number | null;
+  change: { since: string; ounces: number; tonnes: number | null } | null;
+  /** The sponsor and the fund page that shows the figures. */
+  source: { publisher: string; page: string };
+  /** The last read of the sponsor's file that succeeded. */
+  fetchedAt: string;
+  /** The newest day is more than five days old. */
+  stale: boolean;
+}
+
+/**
+ * The 1M change in an ETF's shares outstanding (creations less redemptions),
+ * from the sponsor's count on `from` to its count on `asOf`. `value` puts a
+ * dollar figure on it, each day's change at that day's NAV; null when a day
+ * in between had none.
+ */
+export interface FundFlows {
+  period: "1M";
+  shares: number;
+  value: number | null;
+  from: string;
+  asOf: string;
+  source: string;
+  url?: string;
+}
+
+/**
+ * `not-collected-yet`: a source Gloom reads covers the fund, but it has no
+ * figures yet. `not-published`: no source Gloom reads covers it. Servers
+ * before statuses leave it out.
+ */
+type FundFactsStatus = "covered" | "not-collected-yet" | "not-published" | "not-a-fund";
+
+/** GET /cloud/fund-facts/:ticker. Percent fields are in percent (0.03 is 0.03%). */
+export interface FundFactsPayload {
+  ticker: string;
+  covered: boolean;
+  status?: FundFactsStatus;
+  /** Why there are no facts, when `covered` is false. */
+  reason?: string;
+  name: string | null;
+  /** `trust`: an exchange-traded trust or pool outside the 1940 Act, charging a sponsor fee. */
+  structure: FundStructure | null;
+  /** `document`: read from the fund's prospectus filed with the SEC on `asOf`, not from its sponsor. */
+  expenseRatio: (FundFact<number> & { kind: ExpenseRatioKind; document?: "prospectus" }) | null;
+  /**
+   * `period`: a `day`'s NAV, or a `month-end`'s (a closed-end fund's monthly
+   * estimate, or the NAV per share its filing states), which is its normal
+   * cadence rather than a lag. `estimate`: the range the sponsor published,
+   * whose midpoint `value` is. Servers before them leave both out.
+   */
+  nav: (FundFact<number> & { period?: "day" | "month-end"; estimate?: { low: number; high: number } }) | null;
+  /** Why a covered fund has no NAV, in one line. Absent when it has one, and from servers before it. */
+  navReason?: string;
+  /** Dated by its own session: a month end on a weekend is priced at the Friday before it. */
+  closingPrice: FundFact<number> | null;
+  /**
+   * `published` by the sponsor, or `computed` from the closing price against
+   * the NAV, dated by the NAV. `estimate`: computed against the midpoint of a
+   * NAV estimate, so an estimate too; absent from servers before it.
+   */
+  premiumDiscount: (FundFact<number> & { basis: "published" | "computed"; estimate?: true }) | null;
+  /**
+   * `period`: a `day`'s figure, or the last `month-end`'s (Vanguard and ARK
+   * ETFs, N-PORT), which is not today's. `document`: the fund's N-PORT report
+   * to the SEC for that month end.
+   */
+  netAssets: (FundFact<number> & { scope: "share-class" | "fund" | null; period?: "day" | "month-end"; document?: "N-PORT" }) | null;
+  sponsor: FundFact<string> | null;
+  inception: FundFact<string> | null;
+  /** A leveraged or inverse fund's objective; null for any other fund. Servers before it leave it out. */
+  leverage?: FundLeverage | null;
+  index: FundFact<string> | null;
+  /** A bond fund's SEC yield, yield to worst and duration; null for any other fund. Servers before it leave it out. */
+  bond?: FundBondFacts | null;
+  /** A metal trust's metal in trust; absent for any other fund, until its first read, and from servers before it. */
+  metalHoldings?: FundMetalHoldings | null;
+  /** Shares outstanding as the sponsor's file states them, dated. Servers before it leave it out. */
+  sharesOutstanding?: FundFact<number> | null;
+  /** The 1M change in shares outstanding; null until a month of counts is kept. Servers before it leave it out. */
+  flows?: FundFlows | null;
+  /**
+   * The currency the NAV and closing price are in: a Hong Kong counter's own
+   * (HKD for 3046, USD for 9046). Absent for a US fund, whose figures are in
+   * US dollars.
+   */
+  currency?: string;
+  /**
+   * A spot bitcoin or ether fund's coins as its issuer states them, and the
+   * units in issue per coin on the same day (the Hong Kong spot funds).
+   * Absent for any other fund and from servers before it.
+   */
+  coinHoldings?: FundCoinHoldings | null;
+  /** The newest NAV is older than a few US trading days: every figure is older than it looks. */
+  stale: boolean;
+  fetchedAt: string | null;
+}
+
+export interface FundCoinHoldings {
+  asset: "BTC" | "ETH";
+  coins: number;
+  unitsPerCoin: number;
+  asOf: string;
+  source: string;
+  url?: string;
+}

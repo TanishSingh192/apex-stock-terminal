@@ -1,0 +1,756 @@
+import { logFailure } from "../../../utils/log-failure";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DataTableCell, DataTableVisibleRange, PaneFooterSegment } from "../../../components";
+import { savedCopyFooterSegment } from "../../../components/layout/pane/footer/model";
+import { oldestSavedCopyAt } from "../../../data/saved-copies";
+import { useQuoteEntries } from "../../../market-data/hooks";
+import { getRegularSessionDisplay, quoteDotMarketState, quoteHeadlineTime, quoteSessionColor, quoteSessionLabel } from "../../../market-data/market/status";
+import type { InstrumentRef } from "../../../market-data/request-types";
+import type { QueryEntry } from "../../../market-data/result-types";
+import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
+import { useAppVisible, usePaneVisible } from "../../../state/app/activity";
+import { useQuoteStreaming } from "../../../state/hooks/quote-streaming";
+import { colors, priceColor } from "../../../theme/colors";
+import type { MarketDataRequestContext, QuoteBatchResult, QuoteSubscriptionTarget } from "../../../types/data-provider";
+import type { MarketState, Quote } from "../../../types/financials";
+import { formatPercentRaw } from "../../../utils/format";
+import { useAssetData } from "../../runtime";
+
+export interface BoardQuoteState {
+  quote: Quote | null;
+  loading: boolean;
+  error: string | null;
+  /** The quote is the last good one, kept because the newest load returned nothing. */
+  stale: boolean;
+}
+
+export type BoardQuoteMap = Map<string, BoardQuoteState>;
+
+export interface QuoteBoardOptions {
+  /** Stream the board over the shared quote feed. Off, the snapshot poll carries every symbol. */
+  liveStreaming?: boolean;
+  /**
+   * Symbols on screen, including any overscan. They stream at full rate and
+   * rank first when the plan caps how many symbols one client may stream;
+   * the rest of the board streams at the off-screen cadence. Omitted, every
+   * symbol counts as on screen.
+   */
+  visibleSymbols?: ReadonlySet<string> | null;
+  selectedSymbol?: string | null;
+  /** Snapshot poll cadence for on-screen symbols the stream is not carrying. */
+  fallbackIntervalMs?: number;
+  /**
+   * Paint each listed symbol's cached quote, however old, as the network is
+   * asked, and refresh the listed symbols in a few batches at once. A batch
+   * is given up after `refreshTimeoutMs`, and so is each symbol it left to
+   * be asked for alone, so one slow symbol cannot hold the rest. A row whose
+   * refresh fails or times out keeps its cached quote, marked stale; an
+   * answer that still comes in later paints then, unless a newer load has
+   * started.
+   */
+  cacheFirst?: boolean;
+  /**
+   * With `cacheFirst`, the symbols the board lists now (after its search and
+   * collapsed sections): only these are fetched, and the others keep their
+   * cached quote until they are listed. Omitted, every symbol is listed.
+   * Keep the reference stable until its contents change.
+   */
+  listedSymbols?: ReadonlySet<string> | null;
+  /** How long a cache-first refresh waits for one batch, and for each symbol it asks for alone. */
+  refreshTimeoutMs?: number;
+}
+
+/**
+ * The snapshot poll covers what the stream cannot: symbols the plan's stream
+ * cap evicted, listings no live feed carries, and a dropped connection. It
+ * runs only while the board can be seen.
+ */
+const QUOTE_BOARD_FALLBACK_MS = 60_000;
+/** An open market the stream has not moved for this long is polled as well. */
+const STREAM_SILENCE_MS = 3 * 60_000;
+/** The feed answers a new subscription with a snapshot; give it this long before polling around it. */
+const STREAM_CONNECT_GRACE_MS = 10_000;
+
+/** A cache-first refresh splits the listed symbols into at most this many batches, sent at once. */
+const QUOTE_REFRESH_BATCHES = 4;
+/** And sends no batch smaller than this, so a short list is one request. */
+const QUOTE_REFRESH_MIN_BATCH = 8;
+/**
+ * A batch still unanswered after this long is given up and its rows keep
+ * their cached quote; so is a symbol it left to be asked for alone.
+ */
+const QUOTE_REFRESH_TIMEOUT_MS = 5_000;
+
+const EMPTY_STATE: BoardQuoteState = { quote: null, loading: false, error: null, stale: false };
+
+function errorMessage(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
+}
+
+function boardInstrument(symbol: string): InstrumentRef {
+  return { symbol, exchange: "" };
+}
+
+/** A price its source answered as its last, not a current one. A listing that no longer trades has nothing newer. */
+function isFlaggedStale(quote: Quote): boolean {
+  return quote.stale === true && !quote.delisting;
+}
+
+/**
+ * A failed refresh must not blank a board that was showing prices a second
+ * ago: keep the last good quote and mark it stale instead. A load that
+ * brings only a price flagged stale shows the newer of it and the last one,
+ * marked stale too.
+ */
+function mergeQuotes(previous: BoardQuoteMap, loaded: BoardQuoteMap): BoardQuoteMap {
+  const next: BoardQuoteMap = new Map(previous);
+  for (const [symbol, state] of loaded) {
+    const current = state.quote && !isFlaggedStale(state.quote) ? state.quote : null;
+    const kept = previous.get(symbol)?.quote ?? null;
+    const retained = current ?? (state.quote && (state.quote.lastUpdated ?? 0) >= (kept?.lastUpdated ?? 0) ? state.quote : kept);
+    next.set(symbol, {
+      quote: retained,
+      loading: false,
+      error: state.error,
+      stale: !current && retained !== null,
+    });
+  }
+  return next;
+}
+
+function finitePrice(quote: Quote | null): quote is Quote {
+  return !!quote && typeof quote.price === "number" && Number.isFinite(quote.price);
+}
+
+/**
+ * Whether the stream is keeping a symbol current: it delivered since this
+ * subscription started (the server sends a snapshot on subscribe, so a quiet
+ * closed market still counts), the connection has not marked it stale, and an
+ * open market has not gone silent. Only the feed stamps a receipt time, so a
+ * snapshot another pane loaded never counts.
+ */
+export function isStreamCarryingQuote(
+  entry: QueryEntry<Quote> | undefined,
+  subscriptionStartedAt: number,
+  now: number,
+): boolean {
+  const quote = resolveEntryData(entry);
+  if (!finitePrice(quote) || quote.stale === true) return false;
+  const receivedAt = quote.receivedAt;
+  if (typeof receivedAt !== "number" || !Number.isFinite(receivedAt) || receivedAt < subscriptionStartedAt) return false;
+  return quote.marketState !== "REGULAR" || now - receivedAt <= STREAM_SILENCE_MS;
+}
+
+/** The newer of the board's snapshot and the shared feed's quote, per symbol. */
+function overlayStreamQuote(base: BoardQuoteState, streamed: Quote | null): BoardQuoteState {
+  if (!finitePrice(streamed)) return base;
+  if (base.quote && (streamed.lastUpdated ?? 0) < (base.quote.lastUpdated ?? 0)) return base;
+  if (base.quote === streamed && !base.stale && base.error === null) return base;
+  return { quote: streamed, loading: base.loading, error: null, stale: streamed.stale === true };
+}
+
+/**
+ * `promise`, or a timeout error once `timeoutMs` has passed (never, without
+ * one). A result that arrives after the timeout is handed to `onLate`, so the
+ * caller can still use what it stopped waiting for; a failure then is only
+ * logged, as the caller has recorded the timeout.
+ */
+function within<T>(promise: Promise<T>, timeoutMs: number | undefined, onLate?: (late: T) => void): Promise<T> {
+  if (timeoutMs == null) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      if (onLate) promise.then(onLate, logFailure("shared.use-quote-board", "Late board quote read failed"));
+      reject(new Error("Quote refresh timed out"));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timedOut]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Quotes for `subset`, handed to `apply` as they land: the batch's answer at
+ * once, then each symbol it left without a current quote, asked for alone
+ * into its own row. Such a symbol whose own read fails shows the dated price
+ * the batch had, flagged stale, when it had one. Each request is given
+ * `timeoutMs`, when set; one that answers after it is applied then, over the
+ * timeout the caller recorded, so `apply` must drop what a newer load
+ * superseded. Throws only when the batch itself fails or times out, before
+ * anything was applied.
+ */
+async function requestBoardQuotes(
+  dataProvider: NonNullable<ReturnType<typeof useAssetData>>,
+  subset: readonly string[],
+  forceRefresh: boolean,
+  apply: (loaded: BoardQuoteMap) => void,
+  timeoutMs?: number,
+): Promise<void> {
+  const askAlone = async (symbol: string, context: MarketDataRequestContext | undefined, fallback: Quote | null = null) => {
+    const answered = (quote: Quote): BoardQuoteState => ({ quote, loading: false, error: null, stale: false });
+    let state: BoardQuoteState;
+    try {
+      const request = dataProvider.getQuote(symbol, "", context);
+      state = answered(await within(request, timeoutMs, (late) => apply(new Map([[symbol, answered(late)]]))));
+    } catch (error: unknown) {
+      state = { quote: fallback, loading: false, error: fallback ? null : errorMessage(error), stale: false };
+    }
+    apply(new Map([[symbol, state]]));
+  };
+
+  if (dataProvider.getQuotesBatch) {
+    const applyBatch = async (results: QuoteBatchResult[]) => {
+      const bySymbol = new Map(results.map((result) => [result.target.symbol, result]));
+      const answered: BoardQuoteMap = new Map();
+      const followUps: QuoteBatchResult[] = [];
+      for (const symbol of subset) {
+        const result = bySymbol.get(symbol);
+        if (result?.followUp) {
+          followUps.push(result);
+          continue;
+        }
+        answered.set(symbol, {
+          quote: result?.quote ?? null,
+          loading: false,
+          error: result?.error ? errorMessage(result.error) : null,
+          stale: false,
+        });
+      }
+      if (answered.size > 0) apply(answered);
+      await Promise.all(followUps.map((result) => askAlone(result.target.symbol, { cacheMode: result.followUp }, result.quote)));
+    };
+    const results = await within(dataProvider.getQuotesBatch(
+      subset.map((symbol) => ({ symbol, exchange: "" })),
+      { forceRefresh, deferFollowUps: true },
+    ), timeoutMs, (late) => {
+      applyBatch(late).catch(logFailure("shared.use-quote-board", "Apply late board quotes failed"));
+    });
+    await applyBatch(results);
+    return;
+  }
+
+  const context = forceRefresh ? { cacheMode: "refresh" as const } : undefined;
+  await Promise.all(subset.map((symbol) => askAlone(symbol, context)));
+}
+
+/**
+ * Cached quotes painted under a board that is already loading: a row takes
+ * one when it has none or an older one. A row whose refresh already came back
+ * empty shows the cached quote as stale.
+ */
+function paintCachedQuotes(previous: BoardQuoteMap, cached: readonly { target: { symbol: string }; quote: Quote | null }[]): BoardQuoteMap {
+  let next: BoardQuoteMap | null = null;
+  for (const { target, quote } of cached) {
+    const state = previous.get(target.symbol);
+    if (!state || !finitePrice(quote)) continue;
+    if (state.quote && (state.quote.lastUpdated ?? 0) >= (quote.lastUpdated ?? 0)) continue;
+    next ??= new Map(previous);
+    next.set(target.symbol, { ...state, quote, stale: !state.loading && (!state.quote || state.stale) });
+  }
+  return next ?? previous;
+}
+
+function inBatches(symbols: readonly string[]): string[][] {
+  const size = Math.max(QUOTE_REFRESH_MIN_BATCH, Math.ceil(symbols.length / QUOTE_REFRESH_BATCHES));
+  const batches: string[][] = [];
+  for (let index = 0; index < symbols.length; index += size) batches.push(symbols.slice(index, index + size));
+  return batches;
+}
+
+function sameBoard(left: BoardQuoteMap, right: BoardQuoteMap): boolean {
+  if (left.size !== right.size) return false;
+  const leftEntries = [...left];
+  let index = 0;
+  for (const [symbol, state] of right) {
+    const [leftSymbol, leftState] = leftEntries[index++]!;
+    if (leftSymbol !== symbol || leftState !== state) return false;
+  }
+  return true;
+}
+
+interface OverlayCacheEntry {
+  base: BoardQuoteState;
+  streamed: Quote | null;
+  result: BoardQuoteState;
+}
+
+/**
+ * Quotes for a board of index, futures or FX symbols (world indices, futures,
+ * the movers index strip).
+ *
+ * The first load may serve the provider cache, which is what makes a board
+ * paint instantly on open. After that the symbols ride the shared quote feed,
+ * deduplicated with every other pane and ranked by what is on screen; the
+ * snapshot poll only fills in what the feed is not carrying. A manual refresh
+ * bypasses every cache. `symbols` and `visibleSymbols` must keep stable
+ * references until their contents change.
+ */
+export function useQuoteBoard(symbols: string[], options: QuoteBoardOptions = {}): {
+  quotes: BoardQuoteMap;
+  refresh: () => void;
+} {
+  const {
+    liveStreaming = true,
+    visibleSymbols = null,
+    selectedSymbol = null,
+    fallbackIntervalMs = QUOTE_BOARD_FALLBACK_MS,
+    cacheFirst = false,
+    listedSymbols = null,
+    refreshTimeoutMs = QUOTE_REFRESH_TIMEOUT_MS,
+  } = options;
+  const dataProvider = useAssetData();
+  const appVisible = useAppVisible();
+  const paneVisible = usePaneVisible();
+  const [snapshots, setSnapshots] = useState<BoardQuoteMap>(new Map());
+  // A manual refresh can land after an in-flight poll, so only the newest
+  // request is allowed to write.
+  const fetchGenRef = useRef(0);
+  const lastLoadAtRef = useRef(0);
+
+  const targets = useMemo<QuoteSubscriptionTarget[]>(() => symbols.map((symbol) => {
+    const selected = symbol === selectedSymbol;
+    const visible = !visibleSymbols || visibleSymbols.has(symbol) || selected;
+    return {
+      symbol,
+      exchange: "",
+      surface: "screener",
+      visible,
+      selected,
+      weight: selected ? 100 : visible ? 70 : 20,
+    };
+  }), [selectedSymbol, symbols, visibleSymbols]);
+  useQuoteStreaming(targets, { enabled: liveStreaming });
+  const instruments = useMemo(() => symbols.map(boardInstrument), [symbols]);
+  const entries = useQuoteEntries(instruments);
+  // Counted from when the feed could first answer this symbol set.
+  const streamKey = `${appVisible && liveStreaming ? "live" : "off"}\u001f${symbols.join("\u001f")}`;
+  const streamStartRef = useRef({ key: streamKey, at: Date.now() });
+  if (streamStartRef.current.key !== streamKey) streamStartRef.current = { key: streamKey, at: Date.now() };
+
+  const load = useCallback((forceRefresh: boolean, subset: readonly string[] = symbols) => {
+    // A background top-up writes only if no full load started after it, and
+    // never cancels one: a full load is what clears the loading markers.
+    const background = subset !== symbols;
+    if (!background) fetchGenRef.current += 1;
+    const gen = fetchGenRef.current;
+    lastLoadAtRef.current = Date.now();
+
+    // A background top-up must not flash "loading" in the footer every minute.
+    if (!background) {
+      setSnapshots((prev) => {
+        const next: BoardQuoteMap = new Map();
+        for (const symbol of symbols) {
+          next.set(symbol, { ...(prev.get(symbol) ?? EMPTY_STATE), loading: !!dataProvider });
+        }
+        return next;
+      });
+    }
+    if (!dataProvider || subset.length === 0) return;
+
+    requestBoardQuotes(dataProvider, subset, forceRefresh, (loaded) => {
+      if (fetchGenRef.current !== gen) return;
+      setSnapshots((prev) => mergeQuotes(prev, loaded));
+    }).catch((error: unknown) => {
+      if (fetchGenRef.current !== gen) return;
+      const message = errorMessage(error);
+      const failed: BoardQuoteMap = new Map(subset.map((symbol) => [
+        symbol,
+        { quote: null, loading: false, error: message, stale: false },
+      ]));
+      setSnapshots((prev) => mergeQuotes(prev, failed));
+    });
+  }, [dataProvider, symbols]);
+
+  const listedRef = useRef(listedSymbols);
+  listedRef.current = listedSymbols;
+  // Symbols a cache-first board has asked the network for since its last full load.
+  const requestedRef = useRef(new Set<string>());
+
+  /**
+   * Refreshes `subset` a few batches at once. Each batch's rows paint as it
+   * answers, and a symbol it leaves to be asked for alone fills its own row
+   * later; a batch or a symbol that fails or times out keeps its rows' cached
+   * quotes.
+   */
+  const refreshInBatches = useCallback((subset: readonly string[], forceRefresh: boolean, gen: number) => {
+    if (!dataProvider) return;
+    const apply = (loaded: BoardQuoteMap) => {
+      if (fetchGenRef.current !== gen) return;
+      setSnapshots((prev) => mergeQuotes(prev, loaded));
+    };
+    for (const batch of inBatches(subset)) {
+      requestBoardQuotes(dataProvider, batch, forceRefresh, apply, refreshTimeoutMs)
+        .catch((error: unknown) => apply(new Map(batch.map((symbol) => [
+          symbol,
+          { quote: null, loading: false, error: errorMessage(error), stale: false },
+        ]))));
+    }
+  }, [dataProvider, refreshTimeoutMs]);
+
+  /**
+   * Paints `subset`'s cached quotes, however old. Asked after the refresh, so
+   * the network request is on its way while the cache is read.
+   */
+  const paintFromCache = useCallback((subset: readonly string[], gen: number) => {
+    if (!dataProvider?.getQuotesBatch || subset.length === 0) return;
+    dataProvider.getQuotesBatch(subset.map((symbol) => ({ symbol, exchange: "" })), { cacheOnly: true })
+      .then((cached) => {
+        if (fetchGenRef.current !== gen) return;
+        setSnapshots((prev) => paintCachedQuotes(prev, cached));
+      })
+      .catch(logFailure("shared.use-quote-board", "Paint cached board quotes failed"));
+  }, [dataProvider]);
+
+  /** The cache-first full load: the listed symbols' cached quotes at once, then from the network. */
+  const loadCacheFirst = useCallback((forceRefresh: boolean) => {
+    fetchGenRef.current += 1;
+    const gen = fetchGenRef.current;
+    lastLoadAtRef.current = Date.now();
+    const listed = listedRef.current;
+    const requested = symbols.filter((symbol) => !listed || listed.has(symbol));
+    requestedRef.current = new Set(requested);
+    setSnapshots((prev) => {
+      const next: BoardQuoteMap = new Map();
+      for (const symbol of symbols) {
+        next.set(symbol, { ...(prev.get(symbol) ?? EMPTY_STATE), loading: !!dataProvider && requestedRef.current.has(symbol) });
+      }
+      return next;
+    });
+    if (!dataProvider || requested.length === 0) return;
+    refreshInBatches(requested, forceRefresh, gen);
+    if (!forceRefresh) paintFromCache(requested, gen);
+  }, [dataProvider, paintFromCache, refreshInBatches, symbols]);
+
+  const refresh = useCallback(() => (cacheFirst ? loadCacheFirst(true) : load(true)), [cacheFirst, load, loadCacheFirst]);
+
+  useEffect(() => {
+    if (cacheFirst) loadCacheFirst(false);
+    else load(false);
+    return () => {
+      fetchGenRef.current += 1;
+    };
+  }, [cacheFirst, load, loadCacheFirst]);
+
+  // A symbol listed for the first time since the last full load (a search
+  // cleared, a section opened) is fetched then; the others keep what they have.
+  const listedKey = listedSymbols ? [...listedSymbols].sort().join("\u001f") : null;
+  useEffect(() => {
+    if (!cacheFirst || !dataProvider) return;
+    const listed = listedRef.current;
+    const pending = symbols.filter((symbol) => (!listed || listed.has(symbol)) && !requestedRef.current.has(symbol));
+    if (pending.length === 0) return;
+    for (const symbol of pending) requestedRef.current.add(symbol);
+    setSnapshots((prev) => {
+      const next: BoardQuoteMap = new Map(prev);
+      for (const symbol of pending) next.set(symbol, { ...(prev.get(symbol) ?? EMPTY_STATE), loading: true });
+      return next;
+    });
+    refreshInBatches(pending, false, fetchGenRef.current);
+    paintFromCache(pending, fetchGenRef.current);
+  }, [cacheFirst, dataProvider, listedKey, paintFromCache, refreshInBatches, symbols]);
+
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  useEffect(() => {
+    if (!paneVisible || !dataProvider || symbols.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = () => {
+      const now = Date.now();
+      const due = symbols.filter((symbol) => {
+        if (visibleSymbols && !visibleSymbols.has(symbol) && symbol !== selectedSymbol) return false;
+        if (!liveStreaming) return true;
+        const entry = entriesRef.current.get(buildQuoteKey(boardInstrument(symbol)));
+        return !isStreamCarryingQuote(entry, streamStartRef.current.at, now);
+      });
+      if (due.length > 0) load(true, due);
+      else lastLoadAtRef.current = now;
+      schedule();
+    };
+    const schedule = () => {
+      const due = lastLoadAtRef.current + fallbackIntervalMs;
+      // Coming back into view resubscribes; the snapshot the feed sends on
+      // subscribe usually lands before a poll would.
+      const settled = liveStreaming
+        ? streamStartRef.current.at + Math.min(STREAM_CONNECT_GRACE_MS, fallbackIntervalMs)
+        : 0;
+      timer = setTimeout(poll, Math.max(0, Math.max(due, settled) - Date.now()));
+    };
+    schedule();
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [dataProvider, fallbackIntervalMs, liveStreaming, load, paneVisible, selectedSymbol, symbols, visibleSymbols]);
+
+  // Settings changes must affect rows and footer status in the same render,
+  // including the frame before the next request effect starts. Unchanged
+  // symbols keep their state object so memoized rows can skip the work.
+  const overlayCacheRef = useRef(new Map<string, OverlayCacheEntry>());
+  const previousQuotesRef = useRef<BoardQuoteMap>(new Map());
+  const quotes = useMemo(() => {
+    const cache = overlayCacheRef.current;
+    const nextCache = new Map<string, OverlayCacheEntry>();
+    const next: BoardQuoteMap = new Map();
+    for (const symbol of symbols) {
+      const base = snapshots.get(symbol);
+      if (!base) continue;
+      const streamed = resolveEntryData(entries.get(buildQuoteKey(boardInstrument(symbol))));
+      const cached = cache.get(symbol);
+      const result = cached && cached.base === base && cached.streamed === streamed
+        ? cached.result
+        : overlayStreamQuote(base, streamed);
+      nextCache.set(symbol, { base, streamed, result });
+      next.set(symbol, result);
+    }
+    overlayCacheRef.current = nextCache;
+    const previous = previousQuotesRef.current;
+    if (sameBoard(previous, next)) return previous;
+    previousQuotesRef.current = next;
+    return next;
+  }, [entries, snapshots, symbols]);
+
+  return { quotes, refresh };
+}
+
+/** Rows streamed beyond the visible window so a short scroll lands on live prices. */
+const BOARD_STREAM_OVERSCAN = 4;
+/** The same margin for the long scrolling tables that stream by window. */
+const TABLE_STREAM_OVERSCAN = 8;
+/** Before the table reports its window, stream what a full-height pane shows. */
+export const INITIAL_STREAM_RANGE: DataTableVisibleRange = { start: 0, end: 40 };
+
+/**
+ * The rows a long table streams: those on screen plus overscan, and the
+ * selected row wherever it is, so its detail stays live after a scroll.
+ */
+export function streamWindowRows<T>(
+  rows: readonly T[],
+  range: DataTableVisibleRange,
+  selected: T | undefined,
+): T[] {
+  const window = rows.slice(Math.max(0, range.start - TABLE_STREAM_OVERSCAN), range.end + TABLE_STREAM_OVERSCAN);
+  return selected && !window.includes(selected) ? [...window, selected] : window;
+}
+
+/**
+ * The symbols of the rows on screen plus overscan, as a set that keeps its
+ * identity while its contents do not change. `rowSymbols` holds one entry per
+ * table row, null for section headers. Before the table reports its window
+ * this returns null, which the board reads as "all on screen".
+ */
+export function useVisibleBoardSymbols(
+  rowSymbols: readonly (string | null)[],
+  range: DataTableVisibleRange | null,
+  overscan = BOARD_STREAM_OVERSCAN,
+): ReadonlySet<string> | null {
+  const key = range
+    ? rowSymbols
+      .slice(Math.max(0, range.start - overscan), range.end + overscan)
+      .filter((symbol): symbol is string => !!symbol)
+      .join("\u001f")
+    : null;
+  return useMemo(() => (key == null ? null : new Set(key ? key.split("\u001f") : [])), [key]);
+}
+
+export interface QuoteBoardStatus {
+  loading: number;
+  /** Symbols showing their last good quote after a failed load. */
+  stale: number;
+  /** Symbols with no quote to show at all. */
+  unavailable: number;
+  latestTs: number;
+  /** When the oldest quote shown from a saved copy, after its refresh failed, was saved; null when none is. */
+  savedAt: number | null;
+}
+
+export function quoteBoardStatus(quotes: BoardQuoteMap): QuoteBoardStatus {
+  let loading = 0;
+  let stale = 0;
+  let unavailable = 0;
+  let latestTs = 0;
+  for (const state of quotes.values()) {
+    if (state.loading) loading += 1;
+    if (state.stale) stale += 1;
+    else if (!state.quote && !state.loading) unavailable += 1;
+    latestTs = Math.max(latestTs, state.quote?.lastUpdated ?? 0);
+  }
+  return { loading, stale, unavailable, latestTs, savedAt: oldestSavedCopyAt(Array.from(quotes.values(), (state) => state.quote)) };
+}
+
+/** The quotes a board shows, for the footer's delayed clock (`useQuoteDelayFooter`). */
+export function* boardQuotes(quotes: BoardQuoteMap): Generator<Quote | null> {
+  for (const state of quotes.values()) yield state.quote;
+}
+
+/** Board footer status: everything here changes as loads succeed or fail. */
+export function quoteBoardFooterInfo(status: QuoteBoardStatus): PaneFooterSegment[] {
+  const info: PaneFooterSegment[] = [];
+  if (status.loading > 0) info.push({ id: "loading", parts: [{ text: "loading", tone: "muted" }] });
+  if (status.stale > 0) {
+    info.push({ id: "stale", parts: [{ text: `${status.stale} stale`, tone: "warning" }] });
+  }
+  if (status.unavailable > 0) {
+    info.push({ id: "error", parts: [{ text: `${status.unavailable} unavailable`, tone: "warning" }] });
+  }
+  if (status.savedAt != null) {
+    info.push(savedCopyFooterSegment("saved-copy", status.savedAt));
+  } else if (status.latestTs > 0) {
+    info.push({
+      id: "fresh",
+      quoteStatus: true,
+      parts: [{
+        text: new Date(status.latestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        tone: "muted",
+      }],
+    });
+  }
+  return info;
+}
+
+/**
+ * Board session indicator: one glyph whose color carries the whole signal.
+ * `marketStateDot` in `src/market-data/market/status.ts` encodes the state in
+ * the glyph instead, which reads poorly in a one-cell column. A closed market
+ * is muted, not red: on a weekend every row is closed and nothing is wrong.
+ */
+function marketStatusDot(state: MarketState | undefined): { char: string; color: string } {
+  switch (state) {
+    case "REGULAR":
+      return { char: "●", color: colors.positive };
+    case "PRE":
+    case "POST":
+    case "PREPRE":
+    case "POSTPOST":
+      return { char: "●", color: colors.warning };
+    default:
+      return { char: "●", color: colors.textMuted };
+  }
+}
+
+const ERROR_MESSAGE_MAX_LENGTH = 48;
+
+/**
+ * The reason a board is empty, taken from the per-symbol errors the board
+ * records. It speaks for the whole board, so a trailing "for ES=F" goes.
+ */
+export function boardErrorMessage(quotes: BoardQuoteMap): string | null {
+  let total = 0;
+  let unavailable = 0;
+  let message: string | null = null;
+  for (const [symbol, state] of quotes) {
+    total += 1;
+    if (state.quote || state.loading) continue;
+    unavailable += 1;
+    if (!message && state.error) {
+      const suffix = ` for ${symbol}`;
+      message = state.error.endsWith(suffix) ? state.error.slice(0, -suffix.length) : state.error;
+    }
+  }
+  if (total === 0 || unavailable < total || !message) return null;
+  return message.length > ERROR_MESSAGE_MAX_LENGTH
+    ? `${message.slice(0, ERROR_MESSAGE_MAX_LENGTH - 1)}…`
+    : message;
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * 24-hour UTC, like the other panes' TIME UTC columns, so the cell stays 5 wide
+ * and never clips. A quote from an earlier UTC day shows its date instead, so a
+ * closed market's last print is not read as a time today.
+ */
+function formatQuoteTime(lastUpdated: number | undefined, now = Date.now()): string {
+  if (!lastUpdated) return "—";
+  const date = new Date(lastUpdated);
+  const today = new Date(now);
+  if (date.getUTCFullYear() !== today.getUTCFullYear() || date.getUTCMonth() !== today.getUTCMonth()
+    || date.getUTCDate() !== today.getUTCDate()) {
+    return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}`;
+  }
+  return `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+/** The quote columns every board draws the same way. */
+export type QuoteBoardCellKind = "status" | "price" | "change" | "changePercent" | "time";
+
+export interface QuoteBoardCellFormat {
+  /** Spell out the session instead of a colored dot. */
+  sessionText?: boolean;
+  /** The moment the status cell reads the venue's session at, in ms; the current time when omitted. */
+  now?: number;
+  /** Called with the quote at its headline: a finite price. */
+  formatPrice: (quote: Quote) => string;
+  /** Called with the quote at its headline: a finite change; the text carries its sign. */
+  formatChange: (quote: Quote) => string;
+}
+
+/** Each quote's figures as the board shows them, cached so a held quote keeps one object. */
+const boardHeadlines = new WeakMap<Quote, Quote>();
+
+/**
+ * The quote with its regular session's price and move (getRegularSessionDisplay),
+ * as `ticker` reads it: after the close its close and move, never an extended
+ * print, which a board of these columns has nowhere to show. Its time is that
+ * price's (quoteHeadlineTime), as `quote` dates it.
+ */
+export function boardHeadlineQuote(quote: Quote): Quote {
+  const cached = boardHeadlines.get(quote);
+  if (cached) return cached;
+  const display = getRegularSessionDisplay(quote);
+  const lastUpdated = quoteHeadlineTime(quote);
+  const headline = (!display || (display.price === quote.price && display.change === quote.change && display.changePercent === quote.changePercent))
+    && lastUpdated === quote.lastUpdated
+    ? quote
+    : {
+      ...quote,
+      ...display ? { price: display.price, change: display.change ?? Number.NaN, changePercent: display.changePercent ?? Number.NaN } : {},
+      lastUpdated,
+    };
+  boardHeadlines.set(quote, headline);
+  return headline;
+}
+
+/** A row is loading while it has no quote yet, so none of its cells shows a no-data dash. */
+export function isBoardRowLoading(state: BoardQuoteState | undefined): boolean {
+  return !state?.quote && (state?.loading ?? true);
+}
+
+export function renderQuoteBoardCell(
+  kind: QuoteBoardCellKind,
+  state: BoardQuoteState | undefined,
+  format: QuoteBoardCellFormat,
+): DataTableCell {
+  const quote = state?.quote ? boardHeadlineQuote(state.quote) : state?.quote;
+  // One row must not mix a loading marker with a no-data marker.
+  if (isBoardRowLoading(state)) return { text: kind === "status" ? "" : "…", color: colors.textDim };
+
+  switch (kind) {
+    case "status": {
+      if (format.sessionText) {
+        return { text: quoteSessionLabel(quote, format.now) ?? "—", color: quoteSessionColor(quote, colors, format.now) };
+      }
+      const dot = marketStatusDot(quoteDotMarketState(quote, format.now));
+      // The dot is a picture; the export says which session it means.
+      return { text: dot.char, value: quoteSessionLabel(quote, format.now), color: dot.color };
+    }
+    case "price":
+      if (!quote || !Number.isFinite(quote.price)) return { text: "—", color: colors.textDim };
+      // A retained quote still beats a dash; dim it so stale is visible.
+      return { text: format.formatPrice(quote), value: quote.price, color: state?.stale ? colors.textDim : undefined };
+    case "change":
+      if (!quote || !Number.isFinite(quote.change)) return { text: "—", color: colors.textDim };
+      // No raw value: a change is a difference of two prices, so its float noise would outlive the text.
+      return { text: format.formatChange(quote), color: priceColor(quote.change) };
+    case "changePercent":
+      if (!quote || !Number.isFinite(quote.changePercent)) return { text: "—", color: colors.textDim };
+      return {
+        text: formatPercentRaw(quote.changePercent),
+        value: quote.changePercent,
+        color: priceColor(quote.changePercent),
+      };
+    case "time":
+      return {
+        text: formatQuoteTime(quote?.lastUpdated),
+        // A Date, so the export writes it whole and a rendered-view report dates the board by its quotes.
+        value: quote?.lastUpdated ? new Date(quote.lastUpdated) : null,
+        color: colors.textDim,
+      };
+  }
+}

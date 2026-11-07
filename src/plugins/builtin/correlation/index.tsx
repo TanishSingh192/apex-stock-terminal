@@ -1,0 +1,362 @@
+import { Box, type InputRenderable } from "../../../ui";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { PaneStatusBody, QueryBar, usePaneFooter, usePaneNoticeFooter } from "../../../components";
+import { handleRefreshKey } from "../../../components/data-table/table-pane";
+import type { PaneProps } from "../../../types/plugin";
+import type { PluginModule } from "../plugin-module";
+import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
+import { usePluginAppActions, usePluginTickerActions } from "../../runtime";
+import { useAppSelector, usePaneInstance, usePaneSettingValue } from "../../../state/app/context";
+import { useChartQueries } from "../../../market-data/hooks";
+import { getSharedMarketDataCoordinator } from "../../../market-data/coordinator";
+import { useShortcut } from "../../../react/input";
+import { buildChartKey } from "../../../market-data/selectors";
+import { formatTickerListInput } from "../../../tickers/list";
+import { isPlainKey } from "../../../utils/keyboard";
+import { useAsyncResource } from "../../../react/async-resource";
+import { cloudGeoRequest } from "../world-venue-map/client";
+import { geoSeriesToken, loadGeoCorrelationHistory } from "./geo";
+import type { DailyClose } from "./compute";
+import {
+  CORRELATION_RANGE_OPTIONS,
+  DEFAULT_CORRELATION_SYMBOLS,
+  MAX_CORRELATION_TICKERS,
+  buildCorrelationSettingsDef,
+  getCorrelationPaneSettings,
+  type CorrelationRangePreset,
+} from "./settings";
+import {
+  buildRelationshipGraphSettingsDef,
+  createRelationshipPaneTemplate,
+  RELATIONSHIP_GRAPH_PANE_ID,
+  RelationshipGraphPane,
+} from "./relationship/pane";
+import {
+  buildCorrelationMatrix,
+  buildCorrelationPaneTitle,
+  buildGeoCorrelationSeries,
+  buildStatusSummary,
+  type CorrelationSeries,
+  getSeriesForEntry,
+  pairKey,
+  rowHeaderColor,
+} from "./matrix/model";
+import { CorrelationMatrixGrid, correlationMatrixLayout, useCorrelationMatrixNavigation } from "./matrix/grid";
+import { correlationHeadless, relationshipHeadless } from "./headless";
+import { CORRELATION_HISTORY_RESOLUTION } from "./history";
+import { buildMatrixPairHistory, matrixChartRows } from "./matrix/selection";
+import { MatrixPairChart } from "./matrix/pair-chart";
+
+/** A map series' values and when they arrived; after a failed load, the error and any values kept from before. */
+interface GeoSeriesLoad {
+  values?: DailyClose[];
+  fetchedAt?: number;
+  error?: string;
+}
+
+function CorrelationMatrixPane({ focused, width, height }: PaneProps) {
+  const pane = usePaneInstance();
+  const { navigateTicker, pinTicker } = usePluginTickerActions();
+  const { createPaneFromTemplate } = usePluginAppActions();
+  const tickers = useAppSelector((state) => state.tickers);
+  const settings = useMemo(() => getCorrelationPaneSettings(pane?.settings), [pane?.settings]);
+  const [rangePreset, setRangePreset] = usePaneSettingValue<CorrelationRangePreset>("rangePreset", settings.rangePreset);
+  const [symbolsText, setSymbolsText] = usePaneSettingValue<string>("symbolsText", settings.symbolsText);
+  const [symbolsEditing, setSymbolsEditing] = useState(false);
+  const [symbolsFocusToken, setSymbolsFocusToken] = useState(0);
+  const symbolsInputRef = useRef<InputRenderable | null>(null);
+  // The list as it was when editing began, for Esc to put back. The field
+  // applies drafts as they are typed, so the saved value is not it.
+  const symbolsBeforeEditRef = useRef(symbolsText);
+  // Remounts the query bar so the field drops the draft Esc threw away.
+  const [queryBarRevision, setQueryBarRevision] = useState(0);
+
+  const entries = settings.symbolsError ? [] : settings.symbols;
+  const geoEntries = entries.filter((entry) => geoSeriesToken(entry));
+  const geoKey = geoEntries.join(",");
+  const instruments = useMemo(() => {
+    if (settings.symbolsError) return [];
+    return settings.symbols.filter((symbol) => !geoSeriesToken(symbol)).map((symbol) => {
+      const ticker = tickers.get(symbol);
+      return {
+        symbol,
+        exchange: ticker?.metadata.exchange ?? "",
+      };
+    });
+  }, [settings.symbols.join(","), settings.symbolsError, tickers]);
+
+  const instrumentKey = instruments.map((instrument) => `${instrument.symbol}|${instrument.exchange}`).join(",");
+
+  const chartRequests = useMemo(
+    () => instruments.map((instrument) => ({
+      instrument: {
+        symbol: instrument.symbol,
+        exchange: instrument.exchange,
+      },
+      bufferRange: settings.rangePreset,
+      granularity: "resolution" as const,
+      resolution: CORRELATION_HISTORY_RESOLUTION,
+    })),
+    [instrumentKey, settings.rangePreset],
+  );
+
+  const chartEntries = useChartQueries(chartRequests);
+
+  // Map series load beside the tickers; one that fails leaves the others and every ticker pair working.
+  // A failed refresh keeps the series' last values for the same range, as a ticker keeps its last history.
+  const geoRetainedRef = useRef(new Map<string, { values: DailyClose[]; fetchedAt: number }>());
+  const geoLoader = useMemo(() => geoKey ? async () => {
+    const range = settings.rangePreset;
+    const results = await Promise.allSettled(geoEntries.map((entry) => (
+      loadGeoCorrelationHistory(cloudGeoRequest, geoSeriesToken(entry)!, range)
+    )));
+    return new Map(geoEntries.map((entry, index): [string, GeoSeriesLoad] => {
+      const result = results[index]!;
+      const key = `${range}|${entry}`;
+      if (result.status === "fulfilled") {
+        const loaded = { values: result.value, fetchedAt: Date.now() };
+        geoRetainedRef.current.set(key, loaded);
+        return [entry, loaded];
+      }
+      const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      return [entry, { ...geoRetainedRef.current.get(key), error }];
+    }));
+  } : null, [geoKey, settings.rangePreset]);
+  const geoHistory = useAsyncResource(geoLoader, { keepPreviousData: true });
+
+  const seriesBySymbol = useMemo(() => {
+    const map = new Map<string, CorrelationSeries>();
+    for (let i = 0; i < instruments.length; i++) {
+      const instrument = instruments[i]!;
+      const request = chartRequests[i]!;
+      const key = buildChartKey(request);
+      const entry = chartEntries.get(key);
+      map.set(instrument.symbol, getSeriesForEntry(instrument.symbol, entry, settings.rangePreset));
+    }
+    for (const symbol of geoEntries) {
+      const loaded = geoHistory.data?.get(symbol);
+      map.set(symbol, !loaded
+        ? { symbol, prices: [], basis: "difference", status: "loading", observationCount: 0 }
+        : loaded.values
+          ? {
+            ...buildGeoCorrelationSeries(symbol, loaded.values),
+            loading: geoHistory.loading, refreshError: loaded.error, fetchedAt: loaded.fetchedAt,
+          }
+          : { symbol, prices: [], basis: "difference", status: "error", observationCount: 0, refreshError: loaded.error });
+    }
+    return map;
+  }, [chartEntries, chartRequests, instruments, settings.rangePreset, geoKey, geoHistory.data, geoHistory.loading]);
+
+  const symbols = entries;
+  const symbolsKey = symbols.join(",");
+  const openSymbol = useCallback((symbol: string) => {
+    if (geoSeriesToken(symbol)) {
+      createPaneFromTemplate("chart-composer-pane", { arg: symbol });
+      return;
+    }
+    if (tickers.has(symbol)) {
+      pinTicker(symbol, { floating: true, paneType: TICKER_RESEARCH_PANE_ID });
+      return;
+    }
+    navigateTicker(symbol);
+  }, [createPaneFromTemplate, navigateTicker, pinTicker, tickers]);
+  const navigation = useCorrelationMatrixNavigation({
+    symbols,
+    focused: focused && !symbolsEditing,
+    scope: "correlation:matrix",
+    // Ratio and beta are price measures, so a pair with a map series charts both in G instead.
+    onOpenPair: (pair) => pair.some((entry) => geoSeriesToken(entry))
+      ? createPaneFromTemplate("chart-composer-pane", { arg: formatTickerListInput(pair) })
+      : createPaneFromTemplate("relationship-graph-pane", { symbols: pair, arg: formatTickerListInput(pair) }),
+    onOpenSymbol: openSymbol,
+  });
+  const { selection } = navigation;
+  const pair = selection && selection[0] !== selection[1] ? selection : null;
+  const pairHistory = useMemo(() => pair ? buildMatrixPairHistory(
+    seriesBySymbol.get(pair[0]), seriesBySymbol.get(pair[1]), settings.rangePreset,
+  ) : null, [pair?.[0], pair?.[1], seriesBySymbol, settings.rangePreset]);
+
+  const matrix = useMemo(() => {
+    return buildCorrelationMatrix(symbols, seriesBySymbol);
+  }, [symbolsKey, seriesBySymbol]);
+
+  const statusSummary = useMemo(
+    () => buildStatusSummary(symbols, seriesBySymbol, matrix.sampleMin, matrix.sampleMax, matrix.hasThinPair),
+    [symbolsKey, seriesBySymbol, matrix.sampleMin, matrix.sampleMax, matrix.hasThinPair],
+  );
+
+  const refresh = useCallback(() => {
+    const coordinator = getSharedMarketDataCoordinator();
+    for (const request of chartRequests) void coordinator?.loadChart(request, { forceRefresh: true });
+    if (geoKey) void geoHistory.reload();
+  }, [chartRequests, geoKey, geoHistory.reload]);
+
+  useShortcut((event) => {
+    if (!focused || symbolsEditing || event.defaultPrevented) return;
+    handleRefreshKey(event, refresh, { stopPropagation: true });
+  }, { phase: "before", scope: "correlation:refresh" });
+
+  // Esc cancels an edit of the list instead of clearing it: the field's own
+  // Esc empties the draft, which would fall back to the default tickers.
+  useShortcut((event) => {
+    if (!isPlainKey(event, "escape", "esc")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (symbolsText !== symbolsBeforeEditRef.current) setSymbolsText(symbolsBeforeEditRef.current);
+    setSymbolsEditing(false);
+    setQueryBarRevision((revision) => revision + 1);
+  }, {
+    allowEditable: true,
+    enabled: focused && symbolsEditing,
+    phase: "before",
+    scope: "correlation:tickers",
+  });
+  usePaneNoticeFooter({
+    registrationId: "correlation-warnings", focused,
+    notices: [...seriesBySymbol.values()].flatMap((series) => series.refreshError
+      ? [`${series.symbol}: ${series.refreshError}${series.fetchedAt ? ` Retained history retrieved ${new Date(series.fetchedAt).toISOString()}.` : ""}`]
+      : []).concat(pair && pairHistory?.unavailable ? [`${pair.join("/")}: ${pairHistory.unavailable}`] : []),
+  });
+
+  // The ticker set and range are visible in-pane and an invalid list shows in
+  // the body, so the footer only carries load state. `r` is global: no hint.
+  usePaneFooter("correlation", () => ({
+    info: !settings.symbolsError && symbols.length >= 2 && statusSummary
+      ? [{ id: "status", parts: [{ text: statusSummary, tone: "muted" as const }] }]
+      : [],
+  }), [settings.symbolsError, statusSummary, symbols.length]);
+
+  // Rows are exactly as wide as the matrix (after the one-cell inset), so the
+  // zebra and hover bands stop at the last column instead of running on.
+  const matrixRowWidth = correlationMatrixLayout(symbols, width).rowWidth;
+  const chartRows = pair ? matrixChartRows(width, height, symbols.length, matrixRowWidth) : 0;
+  const matrixHeight = Math.max(1, height - 1 - (chartRows > 0 ? chartRows + 1 : 0));
+  const bodyStatus = settings.symbolsError
+    ? <PaneStatusBody error={settings.symbolsError} />
+    : symbols.length < 2
+      ? <PaneStatusBody empty emptyTitle="Enter at least 2 tickers." />
+      : null;
+
+  return (
+    <Box flexDirection="column" width={width} height={height} overflow="hidden">
+      <QueryBar
+        key={queryBarRevision}
+        width={width}
+        search={{
+          value: symbolsText,
+          onChange: (query) => setSymbolsText(query),
+          placeholder: "tickers",
+          focused,
+          active: symbolsEditing,
+          onActiveChange: (active) => {
+            if (!active) {
+              setSymbolsEditing(false);
+              return;
+            }
+            if (!symbolsEditing) symbolsBeforeEditRef.current = symbolsText;
+            setSymbolsEditing(true);
+            setSymbolsFocusToken((token) => token + 1);
+          },
+          focusToken: symbolsFocusToken,
+          inputRef: symbolsInputRef,
+          debounceMs: 500,
+        }}
+        view={{
+          value: rangePreset,
+          options: CORRELATION_RANGE_OPTIONS.map((range) => ({ label: range, value: range })),
+          onChange: (value: string) => setRangePreset(value as CorrelationRangePreset),
+          focused: focused && !symbolsEditing,
+          shortcutScope: "correlation:range",
+        }}
+      />
+      {bodyStatus ?? (
+        <>
+          <CorrelationMatrixGrid
+            symbols={symbols}
+            width={width}
+            height={matrixHeight}
+            correlation={(row, column) => matrix.results.get(pairKey(row, column))?.correlation ?? null}
+            {...navigation.grid}
+            rowColor={(symbol) => rowHeaderColor(seriesBySymbol.get(symbol)?.status ?? "loading")}
+            onOpenSymbol={openSymbol}
+          />
+          {chartRows > 0 && pair && pairHistory ? (
+            <MatrixPairChart
+              pair={pair}
+              history={pairHistory}
+              fullPeriod={matrix.results.get(pairKey(...pair))?.correlation ?? null}
+              width={width}
+              height={chartRows}
+            />
+          ) : null}
+        </>
+      )}
+    </Box>
+  );
+}
+
+export const correlationModule: PluginModule = {
+  panes: [
+    {
+      id: "correlation",
+      name: "Correlation Matrix",
+      icon: "C",
+      component: CorrelationMatrixPane,
+      headless: correlationHeadless,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 90, height: 18 },
+      settings: buildCorrelationSettingsDef(),
+    },
+    {
+      id: RELATIONSHIP_GRAPH_PANE_ID,
+      name: "Relationship Graph",
+      icon: "R",
+      component: RelationshipGraphPane,
+      headless: relationshipHeadless,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 100, height: 30 },
+      settings: buildRelationshipGraphSettingsDef(),
+    },
+  ],
+
+  paneTemplates: [
+    {
+      id: "correlation-pane",
+      headless: correlationHeadless,
+      paneId: "correlation",
+      label: "Correlation Matrix",
+      description: "Date-aligned Pearson correlation matrix for ticker returns and map series such as GEO:HORMUZ.",
+      keywords: ["correlation", "corr", "matrix", "pearson", "returns", "covariance"],
+      shortcut: { prefix: "CORR", argPlaceholder: "tickers", argKind: "ticker-list", keepArgToken: (token) => !!geoSeriesToken(token) },
+      wizard: [
+        {
+          key: "tickers",
+          label: "Correlation Tickers",
+          placeholder: formatTickerListInput(DEFAULT_CORRELATION_SYMBOLS),
+          defaultValue: formatTickerListInput(DEFAULT_CORRELATION_SYMBOLS),
+          body: [
+            `Enter 2-${MAX_CORRELATION_TICKERS} ticker symbols separated by commas.`,
+          ],
+          type: "text",
+        },
+      ],
+      createInstance: (_context, options) => {
+        const symbols = options?.symbols && options.symbols.length >= 2
+          ? options.symbols
+          : DEFAULT_CORRELATION_SYMBOLS;
+        return {
+          title: buildCorrelationPaneTitle(),
+          placement: "floating",
+          settings: {
+            rangePreset: "1Y",
+            symbols,
+            symbolsText: formatTickerListInput(symbols),
+          },
+        };
+      },
+    },
+    { ...createRelationshipPaneTemplate(), headless: relationshipHeadless },
+  ],
+};

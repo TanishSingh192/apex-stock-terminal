@@ -1,0 +1,1317 @@
+import { Box, Text, useContextMenu, useRendererHost, useUiCapabilities } from "../../../../ui";
+import { useState, useEffect, useRef, useCallback, useMemo, useSyncExternalStore } from "react";
+import { PageStackView } from "../../../../components/ui";
+import { ChoiceDialog } from "../../../../components/ui/choice-dialog";
+import { useOptionalDialog, type PromptContext } from "../../../../ui/dialog";
+import { canReactToMessage, terminalReactionChoices } from "../reactions";
+import { type InputRenderable, type ScrollBoxRenderable, type TextareaRenderable } from "../../../../ui";
+import { useAppDispatch, useAppSelector } from "../../../../state/app/context";
+import { useInlineTickers } from "../../../../state/hooks/inline-tickers";
+import { blendHex, colors } from "../../../../theme/colors";
+import { chatController } from "../controller";
+import {
+  estimateComposerHeight,
+} from "../layout";
+import { formatChatPaneTitle } from "../channel-labels";
+import {
+  DEFAULT_CHAT_CHANNEL_ID,
+  normalizeChannelId,
+} from "../channels";
+import { ChatComposerArea } from "./composer";
+import { ChatTranscript } from "./transcript";
+import {
+  ChannelSidebar,
+} from "../sidebar";
+import { chatSidebarStore } from "../sidebar-store";
+import { useChatSnapshotState } from "./snapshot";
+import { useChatContentShortcuts } from "./shortcuts";
+import { useChatFooter } from "./footer";
+import type { ChatContentController } from "./types";
+import { useChatProfilePopover } from "../profile-popover";
+import { useChatChannelNavigation } from "./channel-navigation";
+import { useChatScrollRuntime, type ChatPrependAnchor } from "./scroll";
+import {
+  resolveChatContentHeightMetrics,
+  resolveChatContentWidthMetrics,
+} from "./layout-metrics";
+import { buildChatUserByUsername } from "./user-map";
+import { useChatComposerRuntime } from "./composer-runtime";
+import { runDiscordCommand } from "../discord-command";
+import type { DiscordComposerCommand } from "../composer-commands";
+import { useChatMessageSelection } from "./selection-runtime";
+import { useChatRowActivity } from "./row-activity";
+import { useUnseenMessageCount } from "./new-messages";
+import type { ChatAttachment, ChatMessage, ChatUserSummary } from "../../../../api-client";
+import { DesktopChatDropOverlay, DesktopChatDropTarget } from "../attachments/desktop";
+import { uploadFromTransferFile, type TransferFile } from "../attachments/transfer";
+import { readChatImageFiles } from "../attachments/files";
+import { NewDmDialog } from "./new-dm-dialog";
+import { takeChatPaneRequest, usePendingChatPaneRequest } from "../pane-requests";
+import {
+  describeConversationStartError,
+  directMessageAction,
+  findDirectChannelWith,
+} from "../direct-messages";
+import type { ChatUserAnchor, ChatUserContextMenuEvent } from "../message/types";
+import type { ContextMenuItem } from "../../../../types/context-menu";
+import { usePluginAppActions } from "../../../runtime";
+import { openTeamPane } from "../../../../team/pane-request";
+import { openChatPaneLink } from "../pane-links/open";
+import { runChatCommand, useChatFunctions } from "../pane-links/commands";
+import type { ChatMessagePaneLink } from "../pane-links/model";
+import { splitComposerDraft, type ComposerShareLink } from "../pane-links/composer";
+import { teamStore } from "../../../../team/store";
+import { requestAccountManagementTab } from "../../account-management/navigation";
+import {
+  CHAT_MESSAGE_EDIT_WINDOW_MS,
+  findLatestEditableChatMessage,
+} from "../edit-window";
+import {
+  applyMentionSuggestion,
+  buildRecentMentionSuggestions,
+  detectChatMentionTrigger,
+  filterMentionSuggestions,
+} from "./mentions";
+import { applyCommandSuggestion, detectChatCommandTrigger, filterCommandSuggestions } from "./command-suggestions";
+import { getComposerCursorOffset } from "./composer-cursor";
+import { ChatHandlePrompt, chatHandlePromptRows, handleSavedMessage, useChatHandlePrompt } from "./handle-prompt";
+import { SignInWall } from "../../cloud/auth-actions";
+
+interface ChatContentProps {
+  width: number;
+  height: number;
+  focused: boolean;
+  channelId?: string;
+  onChannelChange?: (channelId: string) => void;
+  onChannelTitleChange?: (title: string) => void;
+  controller?: ChatContentController;
+  targetMessageId?: string;
+  onTargetMessageHandled?: () => void;
+}
+
+/** No account and no saved login to finish: the chat shows nothing. */
+function isSignedOut(snapshot: { user: unknown; hasSavedSession: boolean }): boolean {
+  return !snapshot.user && !snapshot.hasSavedSession;
+}
+
+/** A check the app made this recently (the status bar's, on launch) answers for the pane. */
+const RECENT_SESSION_CHECK_MS = 30_000;
+
+/**
+ * Chat sits behind the wall every account-gated pane shows: signed out there
+ * is no transcript, no channel list and nothing to read, only the wall. A
+ * saved login, or an account still confirming its email, reads the chat and
+ * is asked at the composer to finish signing in.
+ */
+export function ChatContent(props: ChatContentProps) {
+  const controller = props.controller ?? chatController;
+  const [signedOut, setSignedOut] = useState(() => isSignedOut(controller.getSnapshot()));
+  useEffect(() => controller.subscribe((snapshot) => setSignedOut(isSignedOut(snapshot))), [controller]);
+  // Nothing behind the wall asks for the session, so a sign-in made elsewhere
+  // (the web app's cookie) is picked up here.
+  useEffect(() => {
+    if (isSignedOut(controller.getSnapshot())) void controller.refreshSession({ reuseCheckWithinMs: RECENT_SESSION_CHECK_MS }).catch(() => {});
+  }, [controller]);
+  if (signedOut) {
+    return <SignInWall placement="chat-signin" action="chat" width={props.width} height={props.height} />;
+  }
+  return <ChatConversation {...props} />;
+}
+
+function ChatConversation({
+  width,
+  height,
+  focused,
+  channelId: rawChannelId,
+  onChannelChange,
+  onChannelTitleChange,
+  controller = chatController,
+  targetMessageId,
+  onTargetMessageHandled,
+}: ChatContentProps) {
+  const dispatch = useAppDispatch();
+  const { showPane, createPaneFromTemplate, notify } = usePluginAppActions();
+  const commandBarOpen = useAppSelector((state) => state.commandBarOpen);
+  const channelId = normalizeChannelId(rawChannelId);
+  const channelIdRef = useRef(channelId);
+  channelIdRef.current = channelId;
+  const initialSnapshot = controller.getSnapshot(channelId);
+  const { nativePaneChrome } = useUiCapabilities();
+  const rendererHost = useRendererHost();
+  const [inputFocused, setInputFocused] = useState(false);
+  const [selectedIdx, setSelectedIdx] = useState(-1);
+  const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
+  const [followMessages, setFollowMessages] = useState(true);
+  const [newDmOpen, setNewDmOpen] = useState(false);
+  // The first-chat handle field above the composer has the keyboard.
+  const [handleFieldFocused, setHandleFieldFocusedState] = useState(false);
+  // Read by the field's blur, which can come before the render that moved focus on.
+  const handleFieldFocusedRef = useRef(false);
+  const setHandleFieldFocused = useCallback((next: boolean) => {
+    handleFieldFocusedRef.current = next;
+    setHandleFieldFocusedState(next);
+  }, []);
+  const handleInputRef = useRef<InputRenderable>(null);
+  // Only while the pane is too small for the sidebar: the channel list stands
+  // in for the open channel until one is picked.
+  const [channelListOpen, setChannelListOpen] = useState(false);
+  const inputRef = useRef<TextareaRenderable>(null);
+  const scrollRef = useRef<ScrollBoxRenderable>(null);
+  const messageElementsRef = useRef(new Map<string, unknown>());
+  const applyingExternalDraftRef = useRef(false);
+  const prependAnchorRef = useRef<ChatPrependAnchor | null>(null);
+  const previousEditingChannelIdRef = useRef(channelId);
+  const useDefaultControllerChannel = channelId === DEFAULT_CHAT_CHANNEL_ID && !onChannelChange;
+  const sidebarWidth = useSyncExternalStore(
+    (onChange) => chatSidebarStore.subscribe(onChange),
+    () => chatSidebarStore.getSnapshot().width,
+  );
+  const initialWidthMetrics = resolveChatContentWidthMetrics({
+    width,
+    height,
+    channelCount: initialSnapshot.channels.length,
+    nativePaneChrome,
+    sidebarWidth,
+  });
+  const composerTextWidthRef = useRef(initialWidthMetrics.composerTextWidth);
+  // The saved draft is the message as it will be sent; share links at its end
+  // are chips above the field, and the field holds the rest.
+  const [initialDraft] = useState(() => splitComposerDraft(initialSnapshot.draft));
+  const inputValueRef = useRef(initialDraft.text);
+  const draftLinksRef = useRef<ComposerShareLink[]>(initialDraft.links);
+  const [draftLinks, setDraftLinksState] = useState(initialDraft.links);
+  const setDraftLinks = useCallback((links: ComposerShareLink[]) => {
+    draftLinksRef.current = links;
+    setDraftLinksState(links);
+  }, []);
+  const [composerDraft, setComposerDraft] = useState(initialDraft.text);
+  const [composerCursorOffset, setComposerCursorOffset] = useState(initialDraft.text.length);
+  const [mentionSelectedIndex, setMentionSelectedIndex] = useState(0);
+  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const syncComposerState = useCallback((draft: string, cursorOffset = getComposerCursorOffset(inputRef.current, draft)) => {
+    setComposerDraft((current) => (current === draft ? current : draft));
+    setComposerCursorOffset((current) => (current === cursorOffset ? current : cursorOffset));
+  }, []);
+  const syncComposerCursor = useCallback(() => {
+    const draft = inputRef.current?.editBuffer.getText() ?? inputValueRef.current;
+    syncComposerState(draft, getComposerCursorOffset(inputRef.current, draft));
+  }, [syncComposerState]);
+  const [composerRows, setComposerRows] = useState(() => estimateComposerHeight(initialDraft.text, initialWidthMetrics.composerTextWidth));
+  const updateComposerRows = useCallback((draft: string) => {
+    const nextRows = estimateComposerHeight(draft, composerTextWidthRef.current);
+    setComposerRows((current) => (current === nextRows ? current : nextRows));
+  }, []);
+  const retryMessages = useCallback(() => {
+    void controller.refreshChannelMessages(channelId).catch(() => {});
+  }, [channelId, controller]);
+  const attachmentsSupported = useSyncExternalStore(
+    useCallback((onChange: () => void) => controller.subscribeAttachmentSupport(onChange), [controller]),
+    () => controller.attachmentsSupported(),
+  );
+  const [dropActive, setDropActive] = useState(false);
+  const attachPickerRef = useRef<(() => void) | null>(null);
+  const replaceComposerDraftRef = useRef<((draft: string, cursorOffset?: number) => void) | null>(null);
+  const {
+    channels,
+    channelsLoading,
+    channelStates,
+    conversationActivity,
+    draftAttachments,
+    hasOlderMessages,
+    loading,
+    loadingOlderMessages,
+    messages,
+    mentionCandidates,
+    messagesError,
+    replyTo,
+    setReplyTo,
+    user,
+  } = useChatSnapshotState({
+    applyingExternalDraftRef,
+    channelId,
+    controller,
+    // A channel hidden behind the list is not being read.
+    focused: focused && !channelListOpen,
+    initialSnapshot,
+    inputRef,
+    inputValueRef,
+    onComposerStateChange: syncComposerState,
+    draftLinksRef,
+    onDraftLinksChange: setDraftLinks,
+    prependAnchorRef,
+    setFollowMessages,
+    setSelectedIdx,
+    updateComposerRows,
+    useDefaultControllerChannel,
+  });
+  const {
+    channelSidebarWidth,
+    chatWidth,
+    composerTextWidth,
+    composerWidth,
+    contentWidth,
+    messageBodyWidth,
+    showChannelSidebar,
+  } = resolveChatContentWidthMetrics({
+    width,
+    height,
+    channelCount: channels.length,
+    nativePaneChrome,
+    sidebarWidth,
+  });
+  // Too small for the sidebar, the list and the open channel take turns as a
+  // stack. A single channel has no list to go back to.
+  const stackedNav = !showChannelSidebar && channels.length >= 2 && !!onChannelChange;
+  const showingChannelList = stackedNav && channelListOpen;
+  const channelListVisible = showChannelSidebar || showingChannelList;
+  useEffect(() => {
+    if (!stackedNav) setChannelListOpen(false);
+  }, [stackedNav]);
+  composerTextWidthRef.current = composerTextWidth;
+  const canSend = !!user?.emailVerified;
+  // Images go only to a server that said it takes them, and never into an edit.
+  const imagesAvailable = canSend && attachmentsSupported;
+  const canAttach = imagesAvailable && !editingMessage;
+  const selectionActive = selectedIdx >= 0 && selectedIdx < messages.length;
+  const stickyTranscript = followMessages && !selectionActive;
+  const latestMessage = messages[messages.length - 1] ?? null;
+  const {
+    clearHighlight,
+    clearHover,
+    highlightMessage,
+    highlightedMessageId,
+    hoveredIdx,
+    onPointerMove,
+    setHoveredIdx,
+  } = useChatRowActivity({ channelId, focused, messages, nativePaneChrome });
+  // A selected row is the keyboard's cursor; a pane that no longer has the keyboard keeps none.
+  useEffect(() => {
+    if (!focused) setSelectedIdx(-1);
+  }, [focused]);
+  const [editWindowNowMs, setEditWindowNowMs] = useState(() => Date.now());
+  const latestOwnMessage = useMemo(() => {
+    if (!user?.id) return null;
+    return [...messages]
+      .reverse()
+      .find((message) => message.user.id === user.id && !message.clientStatus) ?? null;
+  }, [messages, user?.id]);
+
+  useEffect(() => {
+    if (!latestOwnMessage) return;
+    const createdMs = Date.parse(latestOwnMessage.createdAt);
+    if (!Number.isFinite(createdMs)) return;
+    const expiresInMs = createdMs + CHAT_MESSAGE_EDIT_WINDOW_MS - Date.now();
+    if (expiresInMs <= 0) return;
+    const timer = setTimeout(() => {
+      setEditWindowNowMs(Date.now());
+    }, Math.min(expiresInMs + 250, 60_000));
+    return () => clearTimeout(timer);
+  }, [editWindowNowMs, latestOwnMessage]);
+
+  const latestEditableMessageId = useMemo(() => {
+    return findLatestEditableChatMessage(messages, user?.id, editWindowNowMs)?.id ?? null;
+  }, [editWindowNowMs, messages, user?.id]);
+  useEffect(() => {
+    updateComposerRows(inputValueRef.current);
+  }, [updateComposerRows]);
+
+  const messageContents = useMemo(() => messages.map((message) => message.content), [messages]);
+  const { catalog, openTicker } = useInlineTickers(messageContents, { badgeQuotes: true });
+  const userByUsername = useMemo(() => buildChatUserByUsername(channels, messages), [channels, messages]);
+  const ownChatUser = user?.username ? userByUsername.get(user.username.toLowerCase()) : undefined;
+  const refreshSession = useCallback(() => controller.refreshSession(), [controller]);
+  const announceHandle = useCallback((username: string) => {
+    notify({ body: handleSavedMessage(username), type: "success" });
+  }, [notify]);
+  const handlePrompt = useChatHandlePrompt({
+    user,
+    accountType: ownChatUser?.id === user?.id ? ownChatUser?.accountType : undefined,
+    refreshSession,
+    onSaved: announceHandle,
+  });
+  const activeChannel = useMemo(() => channels.find((channel) => channel.id === channelId), [channelId, channels]);
+  const activeChannelTitle = useMemo(() => formatChatPaneTitle(activeChannel, channelId), [activeChannel, channelId]);
+  const recentMentionSuggestions = useMemo(() => buildRecentMentionSuggestions({
+    activeChannel,
+    currentUserId: user?.id,
+    messages,
+    candidates: mentionCandidates,
+  }), [activeChannel, messages, mentionCandidates, user?.id]);
+  const mentionDisabled = activeChannel?.kind === "direct" || (!activeChannel && channelId.startsWith("dm:"));
+  const mentionTrigger = useMemo(() => (
+    mentionDisabled ? null : detectChatMentionTrigger(composerDraft, composerCursorOffset)
+  ), [
+    mentionDisabled,
+    composerCursorOffset,
+    composerDraft,
+  ]);
+  const mentionTriggerKey = mentionTrigger
+    ? `${channelId}:${mentionTrigger.start}:${mentionTrigger.end}:${mentionTrigger.query}`
+    : null;
+  const mentionSuggestions = useMemo(() => {
+    if (!mentionTrigger || mentionTriggerKey === dismissedMentionKey) return [];
+    return filterMentionSuggestions(recentMentionSuggestions, mentionTrigger.query);
+  }, [dismissedMentionKey, mentionTrigger, mentionTriggerKey, recentMentionSuggestions]);
+  // Desktop and web: after a backtick the same list offers functions, which a message draws as chips there.
+  const commandTrigger = useMemo(() => (
+    nativePaneChrome && !mentionTrigger ? detectChatCommandTrigger(composerDraft, composerCursorOffset) : null
+  ), [composerCursorOffset, composerDraft, mentionTrigger, nativePaneChrome]);
+  const commandTriggerKey = commandTrigger
+    ? `${channelId}:code:${commandTrigger.start}:${commandTrigger.end}:${commandTrigger.query}`
+    : null;
+  const functions = useChatFunctions();
+  const commandSuggestions = useMemo(() => {
+    if (!commandTrigger || commandTriggerKey === dismissedMentionKey) return [];
+    return filterCommandSuggestions(functions, commandTrigger.query);
+  }, [commandTrigger, commandTriggerKey, dismissedMentionKey, functions]);
+  // One list at a time: people after @, functions after a backtick.
+  const suggestionTriggerKey = mentionTriggerKey ?? commandTriggerKey;
+  const suggestionCount = mentionSuggestions.length + commandSuggestions.length;
+  const composerSuggestions = useMemo(() => mentionSuggestions.length > 0
+    ? mentionSuggestions.map((suggestion) => ({ id: suggestion.username, label: `@${suggestion.username}` }))
+    : commandSuggestions.map((suggestion) => ({ id: suggestion.code, label: suggestion.code, detail: suggestion.name })),
+  [commandSuggestions, mentionSuggestions]);
+  const mentionSelectedIndexSafe = suggestionCount > 0
+    ? Math.min(mentionSelectedIndex, suggestionCount - 1)
+    : 0;
+  useEffect(() => {
+    setMentionSelectedIndex(0);
+  }, [suggestionTriggerKey]);
+  const {
+    composerHeight,
+    messageAreaHeight,
+  } = resolveChatContentHeightMetrics({
+    canSend,
+    composerRows,
+    editingMessage,
+    height,
+    mentionSuggestionCount: suggestionCount,
+    nativePaneChrome,
+    replyTo,
+    stackHeader: stackedNav && !channelListOpen,
+    draftAttachmentCount: draftAttachments.length,
+    draftLinkCount: draftLinks.length,
+    promptRows: canSend && !nativePaneChrome ? chatHandlePromptRows(handlePrompt, contentWidth) : 0,
+  });
+  const {
+    cancelProfilePopoverClose,
+    closeProfilePopover,
+    dismissProfilePopover,
+    hoverProfilePopover,
+    ownProfileConfigured,
+    profilePopoverAnchor,
+    profilePopoverUser,
+    scheduleProfilePopoverClose,
+    showProfilePopover,
+    toggleProfilePopover,
+  } = useChatProfilePopover(focused ? user?.id : undefined);
+
+  // `p` on the selected message: the card opens just below that message.
+  const selectedMessageId = messages[selectedIdx]?.id ?? null;
+  const showUserProfilePopover = useCallback((targetUser: ChatUserSummary) => {
+    const element = selectedMessageId ? messageElementsRef.current.get(selectedMessageId) : null;
+    showProfilePopover(targetUser, {
+      ownProfile: targetUser.id === user?.id,
+      anchor: (element as ChatUserAnchor | undefined) ?? null,
+    });
+  }, [selectedMessageId, showProfilePopover, user?.id]);
+
+  const hoverUserProfile = useCallback((targetUser: ChatUserSummary, anchor?: ChatUserAnchor) => {
+    hoverProfilePopover(targetUser, { ownProfile: targetUser.id === user?.id, anchor });
+  }, [hoverProfilePopover, user?.id]);
+
+  const toggleUserProfile = useCallback((targetUser: ChatUserSummary, anchor?: ChatUserAnchor) => {
+    toggleProfilePopover(targetUser, { ownProfile: targetUser.id === user?.id, anchor });
+  }, [toggleProfilePopover, user?.id]);
+
+  const openProfileSetup = useCallback(() => {
+    closeProfilePopover();
+    requestAccountManagementTab("profile");
+    showPane("account-management");
+  }, [closeProfilePopover, showPane]);
+
+  const blurInput = useCallback(() => {
+    setInputFocused(false);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: false });
+  }, [dispatch]);
+
+  // Reactions are on offer once the server has shown it takes them: its
+  // message lists carry them on every message.
+  const reactionsEnabled = canSend && messages.some((message) => Array.isArray(message.reactions));
+  const dialog = useOptionalDialog();
+  const [reactionPickerMessageId, setReactionPickerMessageId] = useState<string | null>(null);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const currentUserIdRef = useRef(user?.id ?? null);
+  currentUserIdRef.current = user?.id ?? null;
+  const toggleReaction = useCallback((messageId: string, emoji: string) => {
+    void controller.toggleChannelReaction(channelIdRef.current, messageId, emoji);
+  }, [controller]);
+  const closeReactionPicker = useCallback(() => setReactionPickerMessageId(null), []);
+  // The desktop opens the picker beside the message's React action; the
+  // terminal asks in a dialog, which also names who reacted with each emoji.
+  const openReactionPicker = useCallback((index: number) => {
+    const message = messagesRef.current[index];
+    if (!message || !canReactToMessage(message)) return;
+    closeProfilePopover();
+    if (nativePaneChrome) {
+      setReactionPickerMessageId(message.id);
+      return;
+    }
+    if (!dialog) return;
+    void dialog.prompt<string>({
+      closeOnClickOutside: true,
+      content: (context: PromptContext<string>) => (
+        <ChoiceDialog
+          {...context}
+          title="React"
+          choices={terminalReactionChoices(message, currentUserIdRef.current)}
+        />
+      ),
+    }).then((emoji) => {
+      if (emoji) toggleReaction(message.id, emoji);
+    }).catch(() => {});
+  }, [closeProfilePopover, dialog, nativePaneChrome, toggleReaction]);
+  useEffect(() => {
+    if (reactionPickerMessageId && !messages.some((message) => message.id === reactionPickerMessageId)) {
+      setReactionPickerMessageId(null);
+    }
+  }, [messages, reactionPickerMessageId]);
+
+  useEffect(() => {
+    onChannelTitleChange?.(activeChannelTitle);
+  }, [activeChannelTitle, onChannelTitleChange]);
+
+  useEffect(() => {
+    if (previousEditingChannelIdRef.current === channelId) return;
+    previousEditingChannelIdRef.current = channelId;
+    setEditingMessage(null);
+    setReactionPickerMessageId(null);
+    // A card pinned in one channel does not follow into the next.
+    closeProfilePopover();
+  }, [channelId, closeProfilePopover]);
+
+  const {
+    moveMessageSelection,
+    resetTranscriptSelection,
+    shouldLeaveComposerForSelection,
+  } = useChatMessageSelection({
+    inputRef,
+    messageCount: messages.length,
+    selectedIdx,
+    setFollowMessages,
+    setSelectedIdx,
+  });
+
+  // The list's cursor switches channels as it moves. Any other switch (a
+  // notification, the unread list, a command) shows the channel it opened.
+  const listChannelRef = useRef<string | null>(null);
+  const onListChannelChange = useMemo(() => (
+    onChannelChange
+      ? (nextChannelId: string) => {
+        listChannelRef.current = nextChannelId;
+        onChannelChange(nextChannelId);
+      }
+      : undefined
+  ), [onChannelChange]);
+  useEffect(() => {
+    if (listChannelRef.current !== channelId) setChannelListOpen(false);
+  }, [channelId]);
+
+  const {
+    cycleChannel,
+    expandDirectSection,
+    focusChannelSidebar,
+    focusChatContent,
+    moveSidebarChannelSelection,
+    moveSidebarToEdge,
+    selectSidebarChannel,
+    setSidebarFocused,
+    setSidebarSectionExpanded,
+    sidebarCursorChannelId,
+    sidebarCursorRow,
+    sidebarFocused,
+    sidebarFocusedRef,
+    sidebarHeaderCursor,
+  } = useChatChannelNavigation({
+    blurInput,
+    canCreateConversation: canSend,
+    channelId,
+    channelIdRef,
+    channels,
+    channelsLoading,
+    conversationActivity,
+    focused,
+    inputFocused,
+    onChannelChange: onListChannelChange,
+    resetTranscriptSelection,
+    channelListVisible,
+  });
+
+  const focusInput = useCallback(() => {
+    setNewDmOpen(false);
+    setSidebarFocused(false);
+    setHandleFieldFocused(false);
+    setInputFocused(true);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: true });
+    inputRef.current?.focus?.();
+  }, [dispatch, setHandleFieldFocused, setSidebarFocused]);
+
+  const closeNewDmDialog = useCallback(() => {
+    setNewDmOpen(false);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: false });
+  }, [dispatch]);
+
+  const openNewDmDialog = useCallback(() => {
+    blurInput();
+    closeProfilePopover();
+    setSidebarFocused(false);
+    setNewDmOpen(true);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: true });
+  }, [blurInput, closeProfilePopover, dispatch, setSidebarFocused]);
+
+  const openChannelList = useCallback(() => {
+    blurInput();
+    closeNewDmDialog();
+    closeProfilePopover();
+    setChannelListOpen(true);
+  }, [blurInput, closeNewDmDialog, closeProfilePopover]);
+
+  // The list owns the keys while it is shown, with its cursor on the open channel.
+  useEffect(() => {
+    if (!showingChannelList || !focused || newDmOpen || sidebarFocused) return;
+    focusChannelSidebar();
+  }, [focusChannelSidebar, focused, newDmOpen, showingChannelList, sidebarFocused]);
+
+  const selectChannelFromList = useCallback((nextChannelId: string) => {
+    selectSidebarChannel(nextChannelId);
+    setChannelListOpen(false);
+    setSidebarFocused(false);
+  }, [selectSidebarChannel, setSidebarFocused]);
+
+  // Enter or Right on a channel opens it, which in the stack also leaves the list.
+  const openChannelFromList = useCallback(() => {
+    if (!focusChatContent()) return false;
+    setChannelListOpen(false);
+    return true;
+  }, [focusChatContent]);
+
+  // Left and the pane menu's Channel List reach the list in either layout.
+  const canReachChannelList = channelListVisible || stackedNav;
+  const reachChannelList = useCallback(() => {
+    if (!stackedNav || channelListOpen) return focusChannelSidebar();
+    openChannelList();
+    return true;
+  }, [channelListOpen, focusChannelSidebar, openChannelList, stackedNav]);
+
+  useEffect(() => {
+    if (!focused && newDmOpen) {
+      closeNewDmDialog();
+    }
+  }, [closeNewDmDialog, focused, newDmOpen]);
+
+  const attachFiles = useCallback((files: TransferFile[]) => {
+    if (!canAttach) {
+      if (imagesAvailable) notify({ body: "Images can't be added to an edit.", type: "info" });
+      return;
+    }
+    if (controller.attachToChannel(channelIdRef.current, files.map(uploadFromTransferFile)) > 0) focusInput();
+  }, [canAttach, controller, focusInput, imagesAvailable, notify]);
+
+  // A chip: the shared pane, the story or calendar a Wire post names, or a function written in a message.
+  const openPaneLink = useCallback((link: ChatMessagePaneLink) => {
+    openChatPaneLink(link, {
+      createPaneFromTemplate,
+      notify,
+      openExternal: (url) => { void rendererHost.openExternal(url); },
+      runCommand: runChatCommand,
+    });
+  }, [createPaneFromTemplate, notify, rendererHost]);
+
+  const handleDiscordCommand = useCallback((command: DiscordComposerCommand) => {
+    void runDiscordCommand(command, { openUrl: async (url) => { await rendererHost.openExternal(url); } }).then(notify);
+  }, [notify, rendererHost]);
+
+  // The terminal: a pasted or dropped path to an image file attaches the file
+  // and leaves the composer. A path that is no file stays as typed.
+  const handlePastedImagePaths = useCallback((paths: string[], pasted: string) => {
+    const targetChannelId = channelIdRef.current;
+    void readChatImageFiles(paths).then((uploads) => {
+      if (uploads.length === 0 || channelIdRef.current !== targetChannelId) return;
+      const draft = inputValueRef.current;
+      const at = draft.indexOf(pasted);
+      if (at >= 0) replaceComposerDraftRef.current?.(`${draft.slice(0, at)}${draft.slice(at + pasted.length)}`, at);
+      controller.attachToChannel(targetChannelId, uploads);
+    }).catch(() => {});
+  }, [controller]);
+
+  const reportConversationStartError = useCallback((error: unknown, usernames: string[]) => {
+    notify({ body: describeConversationStartError(error, usernames, userByUsername), type: "error" });
+  }, [notify, userByUsername]);
+
+  const removeDraftAttachment = useCallback((localId: string) => {
+    controller.removeChannelAttachment(channelIdRef.current, localId);
+  }, [controller]);
+  const retryDraftAttachment = useCallback((localId: string) => {
+    controller.retryChannelAttachment(channelIdRef.current, localId);
+  }, [controller]);
+  const removeLastDraftAttachment = useCallback(() => {
+    const last = draftAttachments[draftAttachments.length - 1];
+    if (!last) return false;
+    removeDraftAttachment(last.localId);
+    return true;
+  }, [draftAttachments, removeDraftAttachment]);
+  const retryMessage = useCallback((index: number) => {
+    const message = messages[index];
+    if (message?.clientStatus === "failed") controller.retryChannelMessage(channelIdRef.current, message.id);
+  }, [controller, messages]);
+  const refreshImageLinks = useCallback((attachment: ChatAttachment) => {
+    // Only a signed link expires; a stable one that fails is gone for good.
+    if (!/[?&]sig=/.test(attachment.url)) return;
+    controller.refreshChannelImageLinks(channelIdRef.current);
+  }, [controller]);
+
+  const {
+    beginEditLatestMessage,
+    beginEditMessage,
+    beginReplyTo,
+    cancelEditMessage,
+    clearReplyTarget,
+    commitLocalDraft,
+    editingPreview,
+    focusComposer,
+    inputPlaceholder,
+    replyPreview,
+    replaceComposerDraft,
+    replaceDraftLinks,
+    returnToComposer,
+    sendMessage,
+  } = useChatComposerRuntime({
+    applyingExternalDraftRef,
+    blurInput,
+    canSend,
+    channelId,
+    channelIdRef,
+    contentWidth,
+    controller,
+    focusInput,
+    focused,
+    inputFocused,
+    inputRef,
+    inputValueRef,
+    messages,
+    onComposerStateChange: syncComposerState,
+    onChannelChange,
+    editingMessage,
+    latestEditableMessageId,
+    replyTo,
+    setEditingMessage,
+    expandDirectSection,
+    setFollowMessages,
+    setReplyTo,
+    setSelectedIdx,
+    updateComposerRows,
+    useDefaultControllerChannel,
+    draftAttachmentCount: draftAttachments.length,
+    draftLinksRef,
+    setDraftLinks,
+    onPastedImagePaths: !nativePaneChrome && canAttach ? handlePastedImagePaths : undefined,
+    onConversationStartError: reportConversationStartError,
+    onDiscordCommand: handleDiscordCommand,
+  });
+  replaceComposerDraftRef.current = replaceComposerDraft;
+  const removeDraftLink = useCallback((index: number) => {
+    replaceDraftLinks(draftLinksRef.current.filter((_, at) => at !== index));
+  }, [replaceDraftLinks]);
+  // A pasted link is one chip: Backspace in an empty field takes it back out.
+  const removeLastDraftLink = useCallback(() => {
+    if (draftLinksRef.current.length === 0) return false;
+    replaceDraftLinks(draftLinksRef.current.slice(0, -1));
+    return true;
+  }, [replaceDraftLinks]);
+
+  // The handle field takes the keyboard the way the composer does: the
+  // channel, its draft and the composer stay as they are underneath.
+  const focusHandleField = useCallback(() => {
+    if (!handlePrompt.visible) return;
+    closeNewDmDialog();
+    closeProfilePopover();
+    setSidebarFocused(false);
+    setSelectedIdx(-1);
+    setInputFocused(false);
+    setHandleFieldFocused(true);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: true });
+    queueMicrotask(() => handleInputRef.current?.focus?.());
+  }, [closeNewDmDialog, closeProfilePopover, dispatch, handlePrompt.visible, setHandleFieldFocused, setSidebarFocused]);
+  const leaveHandleField = useCallback(() => {
+    setHandleFieldFocused(false);
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: false });
+  }, [dispatch, setHandleFieldFocused]);
+  // Focus that went elsewhere on its own (a click outside on the desktop) leaves the field too.
+  const blurHandleField = useCallback(() => {
+    if (handleFieldFocusedRef.current) leaveHandleField();
+  }, [leaveHandleField]);
+  // Saved or put off from the field, the keyboard goes on to the composer;
+  // from anywhere else it stays where it was.
+  const afterHandlePrompt = useCallback((fromField: boolean) => {
+    if (!fromField) return;
+    leaveHandleField();
+    if (canSend) focusComposer();
+  }, [canSend, focusComposer, leaveHandleField]);
+  const { save: saveHandlePrompt, dismiss: dismissHandlePromptForAccount } = handlePrompt;
+  const saveHandle = useCallback(() => {
+    const fromField = handleFieldFocusedRef.current;
+    void saveHandlePrompt().then((result) => {
+      if (result === "saved") afterHandlePrompt(fromField);
+      // A refused handle is fixed where it was typed.
+      else if (result === "failed" && focused) focusHandleField();
+    });
+  }, [afterHandlePrompt, focusHandleField, focused, saveHandlePrompt]);
+  const dismissHandlePrompt = useCallback(() => {
+    const fromField = handleFieldFocusedRef.current;
+    dismissHandlePromptForAccount();
+    afterHandlePrompt(fromField);
+  }, [afterHandlePrompt, dismissHandlePromptForAccount]);
+  useEffect(() => {
+    if (handleFieldFocused && (!focused || !handlePrompt.visible)) leaveHandleField();
+  }, [focused, handleFieldFocused, handlePrompt.visible, leaveHandleField]);
+  // A conversation just opened or started: selected in the sidebar, with the
+  // composer ready to write in.
+  const showConversation = useCallback((nextChannelId: string) => {
+    expandDirectSection();
+    selectSidebarChannel(nextChannelId);
+    setChannelListOpen(false);
+    setSidebarFocused(false);
+    closeNewDmDialog();
+    closeProfilePopover();
+    if (canSend) focusComposer();
+  }, [canSend, closeNewDmDialog, closeProfilePopover, expandDirectSection, focusComposer, selectSidebarChannel, setSidebarFocused]);
+
+  // Asked for from outside the pane (the command bar): once this pane has the
+  // keyboard on that conversation, the composer takes it, or New DM opens.
+  const pendingPaneRequest = usePendingChatPaneRequest();
+  useEffect(() => {
+    if (!pendingPaneRequest || !focused || commandBarOpen) return;
+    const request = takeChatPaneRequest(channelId);
+    if (!request || !canSend) return;
+    if (request.action === "new-dm") openNewDmDialog();
+    else showConversation(channelId);
+  }, [canSend, channelId, commandBarOpen, focused, openNewDmDialog, pendingPaneRequest, showConversation]);
+
+  const openConversationFromDialog = useCallback(async (usernames: string[]) => {
+    const channel = usernames.length === 1
+      ? await controller.openDirectChannel({ username: usernames[0] })
+      : await controller.openGroupChannel({ usernames });
+    showConversation(channel.id);
+  }, [controller, showConversation]);
+
+  const directMessageContext = useMemo(
+    () => ({ currentUserId: user?.id, channels, canSend }),
+    [canSend, channels, user?.id],
+  );
+
+  /** "Message @name": opens the DM you share, or starts one and opens it. */
+  const messageUser = useCallback(async (target: ChatUserSummary) => {
+    const action = directMessageAction(target, directMessageContext);
+    if (!action || action.kind === "refused") return;
+    const existing = action.kind === "open" ? findDirectChannelWith(channels, target) : null;
+    if (existing) {
+      showConversation(existing.id);
+      return;
+    }
+    try {
+      const channel = await controller.openDirectChannel({ username: action.username });
+      showConversation(channel.id);
+    } catch (error) {
+      notify({ body: describeConversationStartError(error, [action.username], userByUsername), type: "error" });
+    }
+  }, [channels, controller, directMessageContext, notify, showConversation, userByUsername]);
+
+  const pinUserProfile = useCallback((target: ChatUserSummary, anchor?: ChatUserAnchor) => {
+    showProfilePopover(target, { ownProfile: target.id === user?.id, pin: true, anchor });
+  }, [showProfilePopover, user?.id]);
+
+  const { showContextMenu } = useContextMenu();
+  const openUserContextMenu = useCallback((target: ChatUserSummary, event: ChatUserContextMenuEvent, anchor?: ChatUserAnchor) => {
+    const items: ContextMenuItem[] = [];
+    const action = directMessageAction(target, directMessageContext);
+    // Shown grayed out where their settings refuse it, so the menu does not just vanish.
+    if (action) {
+      items.push({
+        id: "chat-user:message",
+        label: action.menuLabel,
+        enabled: action.kind !== "refused",
+        onSelect: () => { void messageUser(target); },
+      });
+    }
+    items.push({ id: "chat-user:profile", label: "Show Profile", onSelect: () => pinUserProfile(target, anchor) });
+    void showContextMenu({ kind: "chat-user", userId: target.id, username: target.username }, items, event);
+  }, [directMessageContext, messageUser, pinUserProfile, showContextMenu]);
+  // Messages are memoized; they keep one handler that runs the latest menu.
+  const openUserContextMenuRef = useRef(openUserContextMenu);
+  openUserContextMenuRef.current = openUserContextMenu;
+  const onUserContextMenu = useCallback((target: ChatUserSummary, event: ChatUserContextMenuEvent, anchor?: ChatUserAnchor) => {
+    openUserContextMenuRef.current(target, event, anchor);
+  }, []);
+
+  const profileDirectMessage = useMemo(() => (
+    profilePopoverUser ? directMessageAction(profilePopoverUser, directMessageContext) : null
+  ), [directMessageContext, profilePopoverUser]);
+  const profileMessageAction = useMemo(() => {
+    if (!profileDirectMessage || profileDirectMessage.kind === "refused" || !profilePopoverUser) return null;
+    const target = profilePopoverUser;
+    return { label: profileDirectMessage.buttonLabel, onPress: () => { void messageUser(target); } };
+  }, [messageUser, profileDirectMessage, profilePopoverUser]);
+
+  const selectedMessageAuthor = selectionActive && !sidebarFocused ? messages[selectedIdx]?.user ?? null : null;
+  const authorMessageAction = useMemo(() => {
+    const action = selectedMessageAuthor ? directMessageAction(selectedMessageAuthor, directMessageContext) : null;
+    if (!action || action.kind === "refused" || !selectedMessageAuthor) return null;
+    const target = selectedMessageAuthor;
+    return { label: action.menuLabel, run: () => { void messageUser(target); } };
+  }, [directMessageContext, messageUser, selectedMessageAuthor]);
+
+  const moveMentionSelection = useCallback((direction: "up" | "down") => {
+    if (suggestionCount === 0) return false;
+    setMentionSelectedIndex((current) => {
+      const safeCurrent = Math.max(0, Math.min(current, suggestionCount - 1));
+      if (direction === "up") {
+        return safeCurrent <= 0 ? suggestionCount - 1 : safeCurrent - 1;
+      }
+      return safeCurrent >= suggestionCount - 1 ? 0 : safeCurrent + 1;
+    });
+    return true;
+  }, [suggestionCount]);
+
+  const dismissMentionSuggestions = useCallback(() => {
+    if (!suggestionTriggerKey || suggestionCount === 0) return false;
+    setDismissedMentionKey(suggestionTriggerKey);
+    return true;
+  }, [suggestionCount, suggestionTriggerKey]);
+
+  const commitMentionSelection = useCallback((index = mentionSelectedIndexSafe) => {
+    let replacement: { draft: string; cursorOffset: number } | null = null;
+    if (mentionTrigger && mentionSuggestions.length > 0) {
+      const suggestion = mentionSuggestions[index] ?? mentionSuggestions[0]!;
+      replacement = applyMentionSuggestion(composerDraft, mentionTrigger, suggestion);
+    } else if (commandTrigger && commandSuggestions.length > 0) {
+      const suggestion = commandSuggestions[index] ?? commandSuggestions[0]!;
+      replacement = applyCommandSuggestion(composerDraft, commandTrigger, suggestion);
+    }
+    if (!replacement) return false;
+    replaceComposerDraft(replacement.draft, replacement.cursorOffset);
+    setMentionSelectedIndex(0);
+    setDismissedMentionKey(suggestionTriggerKey);
+    queueMicrotask(() => focusInput());
+    return true;
+  }, [
+    commandSuggestions,
+    commandTrigger,
+    composerDraft,
+    focusInput,
+    mentionSelectedIndexSafe,
+    mentionSuggestions,
+    mentionTrigger,
+    replaceComposerDraft,
+    suggestionTriggerKey,
+  ]);
+
+  const {
+    atBottom,
+    handleTranscriptScrollActivity,
+    jumpToMessage,
+    registerMessageElement,
+    requestOlderMessages,
+    requestOlderMessagesIfNeeded,
+    scrollToLatest,
+    setPinnedToBottom,
+    takeBackScrollPlace,
+  } = useChatScrollRuntime({
+    channelId,
+    catalog,
+    contentWidth,
+    controller,
+    focused,
+    hasOlderMessages,
+    height,
+    latestMessage,
+    loadingOlderMessages,
+    messageAreaHeight,
+    messageElementsRef,
+    messages,
+    nativePaneChrome,
+    prependAnchorRef,
+    scrollRef,
+    selectedIdx,
+    selectionActive,
+    setFollowMessages,
+    setSelectedIdx,
+    stickyTranscript,
+    useDefaultControllerChannel,
+    composerLayoutKey: `${editingMessage ? "" : draftAttachments.map((attachment) => attachment.status).join(",")}:${draftLinks.length}`,
+    highlightMessage,
+    clearHover,
+    clearHighlight,
+  });
+  const unseenCount = useUnseenMessageCount({ channelId, following: atBottom, messages, userId: user?.id });
+
+  // A jump to a message (a notification, the unread list) shows the channel.
+  useEffect(() => {
+    if (targetMessageId) setChannelListOpen(false);
+  }, [targetMessageId]);
+
+  const handledTargetMessageRef = useRef<string | null>(null);
+  useEffect(() => {
+    // A jump handled once is cleared from the pane; the same message named
+    // again (a second click on the notification) is a new jump.
+    if (!targetMessageId) handledTargetMessageRef.current = null;
+    if (!targetMessageId || loading || messages.length === 0) return;
+    const targetKey = `${channelId}:${targetMessageId}`;
+    if (handledTargetMessageRef.current === targetKey) return;
+    handledTargetMessageRef.current = targetKey;
+    jumpToMessage(targetMessageId);
+    onTargetMessageHandled?.();
+  }, [
+    channelId,
+    jumpToMessage,
+    loading,
+    messages.length,
+    onTargetMessageHandled,
+    targetMessageId,
+  ]);
+
+  useChatContentShortcuts({
+    beginEditLatestMessage,
+    beginReplyTo,
+    blurInput,
+    canSend,
+    cancelEditMessage,
+    commandBarOpen,
+    clearReplyTarget,
+    closeProfilePopover,
+    cycleChannel,
+    focusChannelSidebar: reachChannelList,
+    focusChatContent: openChannelFromList,
+    focusComposer,
+    focused: focused && !newDmOpen && !handleFieldFocused,
+    hasOlderMessages,
+    inputFocused,
+    inputValueRef,
+    loadingOlderMessages,
+    messages,
+    mentionMenuOpen: suggestionCount > 0,
+    moveMentionSelection,
+    dismissMentionSuggestions,
+    commitMentionSelection,
+    moveMessageSelection,
+    moveSidebarChannelSelection,
+    moveSidebarToEdge,
+    nativePaneChrome,
+    editingMessage,
+    profilePopoverOpen: !!profilePopoverUser,
+    replyTo,
+    requestOlderMessages,
+    requestOlderMessagesIfNeeded,
+    returnToComposer,
+    retryMessage,
+    removeLastDraftAttachment,
+    draftLinksRef,
+    removeLastDraftLink,
+    scrollRef,
+    selectedIdx,
+    setFollowMessages,
+    setSelectedIdx,
+    setSidebarSectionExpanded,
+    shouldLeaveComposerForSelection,
+    channelListReachable: canReachChannelList,
+    sidebarCursorRow,
+    sidebarFocusedRef,
+  });
+
+  const openTeamChannel = useCallback((teamId: string) => {
+    openTeamPane(createPaneFromTemplate, { teamId, section: "channels" });
+  }, [createPaneFromTemplate]);
+  // With the sidebar focused, keys act on the row under its cursor; otherwise
+  // on the open channel.
+  const cursorChannelId = sidebarFocused
+    ? sidebarCursorRow?.kind === "channel" ? sidebarCursorRow.channel.id : null
+    : channels.some((channel) => channel.id === channelId) ? channelId : null;
+  const cursorTeamId = sidebarFocused && sidebarCursorRow
+    ? sidebarCursorRow.kind === "team-header"
+      ? sidebarCursorRow.team ? sidebarCursorRow.teamId : null
+      : sidebarCursorRow.kind === "channel" && sidebarCursorRow.teamId && teamStore.getTeam(sidebarCursorRow.teamId)
+        ? sidebarCursorRow.teamId
+        : null
+    : null;
+  useChatFooter({
+    composing: inputFocused || newDmOpen || handleFieldFocused,
+    canSend,
+    selectedIdx,
+    // While the sidebar has the keys, a message's reply and edit are not on offer.
+    selectedMessage: selectionActive && !sidebarFocused ? messages[selectedIdx] ?? null : null,
+    latestEditableMessageId,
+    beginEditMessage,
+    beginReplyTo,
+    retryMessage,
+    focusComposer,
+    catalog,
+    openTicker,
+    openPaneLink,
+    openAttachPicker: canAttach && nativePaneChrome ? () => attachPickerRef.current?.() : null,
+    profilePopoverUser,
+    showProfilePopover: showUserProfilePopover,
+    closeProfilePopover,
+    notificationChannelId: cursorChannelId,
+    notificationsEnabled: channelStates.find((state) => state.channelId === cursorChannelId)?.notificationsEnabled === true,
+    setChannelNotificationsEnabled: (nextChannelId, enabled) => controller.setChannelNotificationsEnabled(nextChannelId, enabled),
+    newChannelTeamId: cursorTeamId,
+    openNewDm: openNewDmDialog,
+    openTeamChannel,
+    canCycleChannels: channels.length > 1 && !!onChannelChange,
+    cycleChannel,
+    canFocusSidebar: canReachChannelList && !sidebarFocused && !!onChannelChange,
+    focusChannelSidebar: reachChannelList,
+    jumpToMessage,
+    needsProfileSetup: !!user?.id && ownProfileConfigured === false,
+    openProfileSetup,
+    authorMessageAction,
+    reactionsEnabled,
+    openReactionPicker,
+  });
+
+  const chatContentBg = focused && showChannelSidebar && !sidebarFocused
+    ? blendHex(colors.bg, colors.borderFocused, 0.08)
+    : undefined;
+  const chatLayoutHeight = nativePaneChrome ? "100%" : height;
+  const nativeFillStyle = nativePaneChrome ? { minHeight: 0 } : undefined;
+  // The desktop sizes the chat by CSS: it follows a resize to the pixel, and
+  // the cell widths only catch up a few times a second (live-resize.ts).
+  const chatLayoutWidth = nativePaneChrome ? "100%" : width;
+
+  const channelSidebar = (
+    <ChannelSidebar
+      channels={channels}
+      channelStates={channelStates}
+      conversationActivity={conversationActivity}
+      activeChannelId={sidebarFocused ? (sidebarHeaderCursor ? "" : sidebarCursorChannelId) : channelId}
+      cursorHeaderKey={sidebarFocused ? sidebarHeaderCursor : null}
+      width={stackedNav ? width : channelSidebarWidth}
+      paneWidth={width}
+      resizable={!stackedNav}
+      height={height}
+      focused={focused}
+      keyboardFocused={sidebarFocused}
+      loading={channelsLoading}
+      canManageNotifications={!!user?.emailVerified}
+      canCreateConversation={!!user?.emailVerified}
+      needsProfileSetup={!!user?.id && ownProfileConfigured === false}
+      onOpenProfile={openProfileSetup}
+      onSelect={stackedNav ? selectChannelFromList : selectSidebarChannel}
+      onFocusRequest={() => setSidebarFocused(true)}
+      onCreateConversation={openNewDmDialog}
+      onToggleNotifications={(nextChannelId, enabled) => {
+        controller.setChannelNotificationsEnabled(nextChannelId, enabled);
+      }}
+      onCreateTeamChannel={openTeamChannel}
+    />
+  );
+
+  const newDmDialog = newDmOpen ? (
+    <NewDmDialog
+      width={stackedNav ? width : chatWidth}
+      height={height}
+      userByUsername={userByUsername}
+      currentUserId={user?.id}
+      channels={channels}
+      onCancel={closeNewDmDialog}
+      onOpenChannel={showConversation}
+      onSubmit={openConversationFromDialog}
+    />
+  ) : null;
+
+  const threadPane = (
+    <Box
+      flexDirection="column"
+      // Beside the channel list, the desktop thread takes the space the list leaves.
+      width={nativePaneChrome ? undefined : chatWidth}
+      height={chatLayoutHeight}
+      flexGrow={nativePaneChrome ? 1 : undefined}
+      backgroundColor={chatContentBg}
+      position="relative"
+      {...(nativePaneChrome ? {
+        onMouseDownCapture: () => { clearHighlight(); focusChatContent(); },
+      } : {
+        onMouseDown: () => { clearHighlight(); focusChatContent(); },
+      })}
+      style={nativePaneChrome ? { minHeight: 0, minWidth: 0, ...(stackedNav ? {} : { flexBasis: 0 }) } : undefined}
+    >
+      {/* In the stack, the Back row above takes the place of the top rule. */}
+      {!nativePaneChrome && !stackedNav && (
+        <Box height={1} width={contentWidth}>
+          <Text fg={colors.border}>{"-".repeat(contentWidth)}</Text>
+        </Box>
+      )}
+
+      <ChatTranscript
+        channelId={channelId}
+        beginReplyTo={beginReplyTo}
+        beginEditMessage={beginEditMessage}
+        canSend={canSend}
+        catalog={catalog}
+        cancelProfilePopoverClose={cancelProfilePopoverClose}
+        chatWidth={chatWidth}
+        contentWidth={contentWidth}
+        handleTranscriptScrollActivity={handleTranscriptScrollActivity}
+        highlightedMessageId={highlightedMessageId}
+        hoveredIdx={hoveredIdx}
+        jumpToMessage={jumpToMessage}
+        loading={loading}
+        loadingOlderMessages={loadingOlderMessages}
+        messagesError={messagesError}
+        onRetryMessages={retryMessages}
+        retryMessage={retryMessage}
+        onImageLoadError={refreshImageLinks}
+        messageAreaHeight={messageAreaHeight}
+        messageBodyWidth={messageBodyWidth}
+        messages={messages}
+        nativePaneChrome={nativePaneChrome}
+        onPointerMove={onPointerMove}
+        onStickyPinChange={setPinnedToBottom}
+        latestEditableMessageId={latestEditableMessageId}
+        openTicker={openTicker}
+        openPaneLink={openPaneLink}
+        profilePopoverUser={profilePopoverUser}
+        profilePopoverAnchor={profilePopoverAnchor}
+        registerMessageElement={registerMessageElement}
+        scheduleProfilePopoverClose={scheduleProfilePopoverClose}
+        scrollRef={scrollRef}
+        selectedIdx={selectedIdx}
+        setHoveredIdx={setHoveredIdx}
+        showProfilePopover={hoverUserProfile}
+        toggleProfilePopover={toggleUserProfile}
+        dismissProfilePopover={dismissProfilePopover}
+        stickyTranscript={stickyTranscript}
+        unseenCount={unseenCount}
+        onJumpToLatest={scrollToLatest}
+        takeBackScrollPlace={takeBackScrollPlace}
+        user={user}
+        userByUsername={userByUsername}
+        onSetUpProfile={openProfileSetup}
+        onUserContextMenu={onUserContextMenu}
+        profileMessageAction={profileMessageAction}
+        profileMessageRefusal={profileDirectMessage?.refusal ?? null}
+        reactionsEnabled={reactionsEnabled}
+        toggleReaction={toggleReaction}
+        openReactionPicker={openReactionPicker}
+        reactionPickerMessageId={reactionPickerMessageId}
+        closeReactionPicker={closeReactionPicker}
+      />
+
+      {stackedNav ? null : newDmDialog}
+
+      {!nativePaneChrome && !canSend && (
+        <Box height={1} width={contentWidth}>
+          <Text fg={colors.border}>{"-".repeat(contentWidth)}</Text>
+        </Box>
+      )}
+
+      <ChatComposerArea
+        handlePrompt={(
+          <ChatHandlePrompt
+            prompt={handlePrompt}
+            contentWidth={contentWidth}
+            nativePaneChrome={nativePaneChrome}
+            focused={focused}
+            fieldFocused={handleFieldFocused}
+            inputRef={handleInputRef}
+            onFocusField={focusHandleField}
+            onLeaveField={leaveHandleField}
+            onBlurField={blurHandleField}
+            onSave={saveHandle}
+            onDismiss={dismissHandlePrompt}
+          />
+        )}
+        canSend={canSend}
+        cancelEditMessage={cancelEditMessage}
+        clearReplyTarget={clearReplyTarget}
+        commitLocalDraft={commitLocalDraft}
+        composerHeight={composerHeight}
+        composerWidth={composerWidth}
+        contentWidth={contentWidth}
+        focused={focused}
+        focusComposer={focusComposer}
+        inputFocused={inputFocused}
+        inputPlaceholder={inputPlaceholder}
+        inputRef={inputRef}
+        inputValueRef={inputValueRef}
+        nativePaneChrome={nativePaneChrome}
+        editingMessage={editingMessage}
+        editingPreview={editingPreview}
+        replyPreview={replyPreview}
+        replyTo={replyTo}
+        sendMessage={sendMessage}
+        suggestions={composerSuggestions}
+        mentionSelectedIndex={mentionSelectedIndexSafe}
+        onMentionCursorChange={syncComposerCursor}
+        onMentionSelect={commitMentionSelection}
+        user={user}
+        draftAttachments={draftAttachments}
+        canAttach={canAttach}
+        onAttachFiles={attachFiles}
+        onRemoveAttachment={removeDraftAttachment}
+        onRetryAttachment={retryDraftAttachment}
+        draftLinks={draftLinks}
+        onOpenDraftLink={openPaneLink}
+        onRemoveDraftLink={removeDraftLink}
+        attachPickerRef={attachPickerRef}
+      />
+      {nativePaneChrome && dropActive && <DesktopChatDropOverlay />}
+    </Box>
+  );
+  // Files dropped anywhere on the thread, or pasted into its composer, attach.
+  const thread = nativePaneChrome ? (
+    <DesktopChatDropTarget
+      enabled={imagesAvailable}
+      onFiles={attachFiles}
+      onDragActiveChange={setDropActive}
+    >
+      {threadPane}
+    </DesktopChatDropTarget>
+  ) : threadPane;
+
+  if (stackedNav) {
+    return (
+      <Box
+        flexDirection="column"
+        width={chatLayoutWidth}
+        height={chatLayoutHeight}
+        flexGrow={nativePaneChrome ? 1 : undefined}
+        position="relative"
+        style={nativeFillStyle}
+      >
+        <PageStackView
+          // Esc first drops a selection or the profile card, then leaves the channel.
+          focused={focused && !newDmOpen && !inputFocused && !handleFieldFocused && !selectionActive && !profilePopoverUser}
+          detailOpen={!channelListOpen}
+          onBack={openChannelList}
+          rootContent={channelSidebar}
+          detailContent={thread}
+        />
+        {newDmDialog}
+      </Box>
+    );
+  }
+
+  return (
+    <Box
+      flexDirection="row"
+      width={chatLayoutWidth}
+      height={chatLayoutHeight}
+      flexGrow={nativePaneChrome ? 1 : undefined}
+      style={nativeFillStyle}
+    >
+      {showChannelSidebar && channelSidebar}
+      {thread}
+    </Box>
+  );
+}

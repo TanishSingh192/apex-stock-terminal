@@ -1,0 +1,664 @@
+import type {
+  CloudSearchDocType,
+  CloudSearchSort,
+  CloudTweetQueryType,
+} from "./types";
+import { isUsListingExchange, normalizeSymbol, parsePublicTickerKey, publicTickerKey } from "../utils/exchanges";
+import { nonUsSecListingVenue } from "../utils/sec";
+import type { HistoryRetention } from "../sources/history-retention";
+import type { CloudBeneficialOwnersParams } from "./beneficial-owners";
+import type { CloudInsiderSignalsParams } from "./insider-signals";
+import type { RevenueBreakdownView } from "./revenue-breakdown";
+
+export type CloudHistoryParams = {
+  interval?: string;
+  outputsize?: number;
+  startDate?: string;
+  endDate?: string;
+  rangeKey?: string;
+  historyRecovery?: HistoryRetention;
+  /** Ask for pre-market and after-hours bars too. */
+  session?: "extended";
+};
+
+export type CloudFredSeriesParams = {
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  sortOrder?: "asc" | "desc";
+};
+
+export type CloudCdsParams = {
+  /** Reference entity name, matched by the backend against DTCC issuer names. */
+  issuer?: string;
+  days?: number;
+  limit?: number;
+};
+
+export type CloudCdsHistoryParams = {
+  /** Company name; the backend matches it to one reference entity. */
+  issuer: string;
+  days?: number;
+};
+
+type CloudCongressChamber = "all" | "house" | "senate";
+
+export type CloudCongressHouseParams = {
+  /** Which feed to read; House when omitted. */
+  chamber?: CloudCongressChamber;
+  year?: number;
+  limit?: number;
+  offset?: number;
+  filingLimit?: number;
+  filingOffset?: number;
+  member?: string;
+  ticker?: string;
+  refresh?: boolean;
+  side?: "BUY" | "SELL" | "EXCHANGE" | "OTHER";
+  owner?: "self" | "spouse" | "joint" | "dependent" | "other";
+  assetType?: "stock" | "option" | "other";
+  minAmount?: number;
+};
+
+/** The listing an issuer lookup is for, so a listing abroad never reads a US namesake. */
+export type IssuerListingParams = {
+  /** The listing's venue. Sent only for a venue outside the US, with `name`. */
+  exchange?: string;
+  /** The listing's company name, from its ticker or its own quote. */
+  name?: string;
+};
+
+export type CloudEarningsCallsParams = IssuerListingParams & {
+  ticker?: string;
+  limit?: number;
+  offset?: number;
+  /** Include calls still working through the transcription pipeline. */
+  includePending?: boolean;
+  /** Every company's calls on these New York days (YYYY-MM-DD), earliest first, in place of a company or the shelf. */
+  upcoming?: { from: string; to: string };
+};
+
+export type CloudNewsParams = {
+  feed?: "latest" | "top" | "breaking" | "ticker" | "sector" | "topic";
+  ticker?: string;
+  exchange?: string;
+  tickerTier?: "primary" | "related" | "any";
+  tickerRelations?: string[];
+  limit?: number;
+  topics?: string[];
+  categories?: string[];
+  sectors?: string[];
+  sources?: string[];
+  excludeSources?: string[];
+  sentiment?: "positive" | "neutral" | "negative";
+  minImportance?: number;
+  minUrgency?: number;
+  breaking?: boolean;
+  since?: Date;
+  until?: Date;
+  cursor?: string;
+};
+
+export type CloudTickerTweetsParams = {
+  ticker: string;
+  limit?: number;
+  offset?: number;
+  hours?: number;
+  includeReplies?: boolean;
+};
+
+export type CloudTweetSearchParams = {
+  query: string;
+  queryType?: CloudTweetQueryType;
+  limit?: number;
+  offset?: number;
+  hours?: number;
+};
+
+const LOGO_SYMBOL_RE = /^[A-Z0-9][A-Z0-9._^:-]{0,23}$/;
+const CRYPTO_QUOTE = /[-/](USD|USDT|USDC|EUR|GBP|BTC)$/;
+
+export type CloudLogoKind = "ticker" | "crypto";
+
+function normalizeCloudLogoSymbol(
+  kind: CloudLogoKind,
+  symbol: string,
+): string | null {
+  let normalized = symbol.trim().toUpperCase();
+  if (kind === "crypto") normalized = normalized.replace(CRYPTO_QUOTE, "");
+  return LOGO_SYMBOL_RE.test(normalized) ? normalized : null;
+}
+
+export function cloudLogoPath(
+  kind: CloudLogoKind,
+  symbol: string,
+): string | null {
+  const normalized = normalizeCloudLogoSymbol(kind, symbol);
+  if (!normalized) return null;
+  return `/cloud/logos/${kind}/${encodeURIComponent(normalized)}`;
+}
+
+function appendQuery(path: string, search: URLSearchParams): string {
+  const query = search.toString();
+  return `${path}${query ? `?${query}` : ""}`;
+}
+
+export function cloudMarketSearchPath(query: string, limit: number): string {
+  return appendQuery(
+    "/market/search",
+    new URLSearchParams({
+      q: query,
+      limit: String(limit),
+    }),
+  );
+}
+
+export function cloudMarketSymbolPath(
+  path: string,
+  symbol: string,
+  exchange?: string,
+): string {
+  const search = new URLSearchParams({ symbol });
+  if (exchange) search.set("exchange", exchange);
+  return appendQuery(path, search);
+}
+
+export function cloudOptionsChainPath(
+  symbol: string,
+  exchange?: string,
+  expirationDate?: number,
+  /** The contracts adjusted for a corporate action, in place of the standard ones. */
+  adjusted = false,
+): string {
+  const search = new URLSearchParams({ symbol });
+  if (exchange) search.set("exchange", exchange);
+  if (expirationDate != null)
+    search.set("expirationDate", String(expirationDate));
+  if (adjusted) search.set("adjusted", "1");
+  return appendQuery("/market/options", search);
+}
+
+export function cloudHistoryPath(
+  symbol: string,
+  exchange: string,
+  params: CloudHistoryParams = {},
+): string {
+  const search = new URLSearchParams({ symbol, exchange });
+  if (params.interval) search.set("interval", params.interval);
+  if (params.outputsize != null)
+    search.set("outputsize", String(params.outputsize));
+  if (params.startDate) search.set("startDate", params.startDate);
+  if (params.endDate) search.set("endDate", params.endDate);
+  if (params.rangeKey) search.set("rangeKey", params.rangeKey);
+  if (params.historyRecovery) search.set("historyRecovery", JSON.stringify(params.historyRecovery));
+  if (params.session) search.set("session", params.session);
+  return appendQuery("/market/history", search);
+}
+
+export function cloudShillerPath(): string {
+  return "/cloud/econ/shiller";
+}
+
+export function cloudExchangeRatePath(fromCurrency: string): string {
+  return appendQuery(
+    "/market/exchange-rate",
+    new URLSearchParams({ fromCurrency }),
+  );
+}
+
+export function cloudFredSeriesPath(
+  seriesId: string,
+  params: CloudFredSeriesParams = {},
+): string {
+  const search = new URLSearchParams();
+  if (params.startDate) search.set("startDate", params.startDate);
+  if (params.endDate) search.set("endDate", params.endDate);
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.sortOrder) search.set("sortOrder", params.sortOrder);
+  return appendQuery(
+    `/cloud/econ/series/${encodeURIComponent(seriesId)}`,
+    search,
+  );
+}
+
+export function cloudCdsPath(params: CloudCdsParams = {}): string {
+  const search = new URLSearchParams();
+  const issuer = params.issuer?.trim();
+  if (issuer) search.set("issuer", issuer);
+  if (params.days != null) search.set("days", String(params.days));
+  if (params.limit != null) search.set("limit", String(params.limit));
+  return appendQuery("/cloud/credit/cds", search);
+}
+
+export function cloudCdsHistoryPath(params: CloudCdsHistoryParams): string {
+  const search = new URLSearchParams({ issuer: params.issuer.trim() });
+  if (params.days != null) search.set("days", String(params.days));
+  return appendQuery("/cloud/credit/cds/history", search);
+}
+
+/** `/cloud/credit/cdx` or `/cloud/credit/sovr`. */
+export function cloudCreditBoardPath(board: "cdx" | "sovr", params: { days?: number } = {}): string {
+  const search = new URLSearchParams();
+  if (params.days != null) search.set("days", String(params.days));
+  return appendQuery(`/cloud/credit/${board}`, search);
+}
+
+export type CloudSecFilingsParams = {
+  ticker: string;
+  /** The listing's venue. Sent only for a venue outside the US, with `name`. */
+  exchange?: string;
+  /** The listing's company name, from its own quote. */
+  name?: string;
+  limit?: number;
+  offset?: number;
+  /** Only these forms, each with its amendment (`8-K` is also `8-K/A`). A server that predates the filter sends every form. */
+  forms?: readonly string[];
+};
+
+export type CloudSecFilingParams = {
+  cik?: string;
+  accession?: string;
+  form?: string;
+  primaryDocument?: string;
+  primaryDocumentUrl?: string;
+  filingUrl?: string;
+};
+
+export function cloudCongressHousePath(
+  params: CloudCongressHouseParams = {},
+): string {
+  const search = new URLSearchParams();
+  if (params.year != null) search.set("year", String(params.year));
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset != null) search.set("offset", String(params.offset));
+  if (params.filingLimit != null)
+    search.set("filingLimit", String(params.filingLimit));
+  if (params.filingOffset != null)
+    search.set("filingOffset", String(params.filingOffset));
+  if (params.member) search.set("member", params.member);
+  if (params.ticker) search.set("ticker", params.ticker);
+  if (params.side) search.set("side", params.side);
+  if (params.owner) search.set("owner", params.owner);
+  if (params.assetType) search.set("assetType", params.assetType);
+  if (params.minAmount != null) search.set("minAmount", String(params.minAmount));
+  if (params.refresh != null) search.set("refresh", String(params.refresh));
+  return appendQuery(`/cloud/congress/${params.chamber ?? "house"}`, search);
+}
+
+/** Issuer endpoints accept US ticker symbols, not the pane's listing key. */
+export function normalizeIssuerResearchTicker(ticker: string): string {
+  const parsed = parsePublicTickerKey(ticker);
+  return isUsListingExchange(parsed.exchange) ? parsed.symbol : normalizeSymbol(ticker);
+}
+
+export function cloudJobsPath(ticker: string, name?: string | null): string {
+  const search = new URLSearchParams();
+  if (name) search.set("name", name);
+  return appendQuery(`/cloud/jobs/${encodeURIComponent(normalizeIssuerResearchTicker(ticker))}`, search);
+}
+
+export interface CloudJobsPostingsParams {
+  function?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+  includeClosed?: boolean;
+}
+
+export function cloudJobsPostingsPath(ticker: string, params: CloudJobsPostingsParams = {}): string {
+  const search = new URLSearchParams();
+  if (params.function) search.set("function", params.function);
+  if (params.q) search.set("q", params.q);
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset != null) search.set("offset", String(params.offset));
+  if (params.includeClosed) search.set("includeClosed", "true");
+  return appendQuery(`/cloud/jobs/${encodeURIComponent(normalizeIssuerResearchTicker(ticker))}/postings`, search);
+}
+
+/** One posting of a company, by the database id the jobs list carries or the careers system's own id HIRE's evidence carries. */
+export function cloudJobsPostingPath(ticker: string, posting: { id: number } | { externalId: string }): string {
+  const search = new URLSearchParams();
+  if ("id" in posting) search.set("id", String(posting.id));
+  else search.set("externalId", posting.externalId);
+  return appendQuery(`/cloud/jobs/${encodeURIComponent(normalizeIssuerResearchTicker(ticker))}/posting`, search);
+}
+
+export function cloudJobsMoversPath(limit?: number, offset?: number): string {
+  const search = new URLSearchParams();
+  if (limit != null) search.set("limit", String(limit));
+  if (offset) search.set("offset", String(offset));
+  return appendQuery("/cloud/jobs", search);
+}
+
+/** A listing outside the US, as an issuer lookup names it: its bare symbol, venue and company. */
+export interface ListingAbroad {
+  symbol: string;
+  exchange: string;
+  name?: string;
+}
+
+/**
+ * The listing abroad a ticker names, from its key or the given venue: AI in
+ * Paris is Air Liquide, AI in New York is C3.ai. Null for a US listing, a
+ * routing destination or a symbol with no venue, which keep their US lookup.
+ */
+export function listingAbroad(ticker: string, exchange?: string, name?: string | null): ListingAbroad | null {
+  const venue = nonUsSecListingVenue(ticker, exchange);
+  if (!venue) return null;
+  const company = name?.trim();
+  return { symbol: parsePublicTickerKey(ticker).symbol, exchange: venue, ...(company ? { name: company } : {}) };
+}
+
+/** Sets a listing abroad's venue and company on an issuer lookup. */
+function setListingAbroad(search: URLSearchParams, listing: ListingAbroad | null): void {
+  if (!listing) return;
+  search.set("exchange", listing.exchange);
+  if (listing.name) search.set("name", listing.name);
+}
+
+/** A US listing or a bare symbol looks up its US ticker as before; a listing abroad names its venue and company. */
+export function cloudEarningsCallsPath(
+  params: CloudEarningsCallsParams = {},
+): string {
+  const search = new URLSearchParams();
+  if (params.ticker) {
+    const abroad = listingAbroad(params.ticker, params.exchange, params.name);
+    search.set("ticker", abroad?.symbol ?? normalizeIssuerResearchTicker(params.ticker));
+    setListingAbroad(search, abroad);
+  }
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset != null) search.set("offset", String(params.offset));
+  if (params.includePending) search.set("includePending", "true");
+  if (params.upcoming) {
+    search.set("upcoming", "true");
+    search.set("from", params.upcoming.from);
+    search.set("to", params.upcoming.to);
+  }
+  return appendQuery("/cloud/transcripts", search);
+}
+
+export function cloudEarningsTranscriptPath(id: string): string {
+  return `/cloud/transcripts/${encodeURIComponent(id)}`;
+}
+
+export function cloudEarningsCallAudioPath(id: string): string {
+  return `${cloudEarningsTranscriptPath(id)}/audio`;
+}
+
+/**
+ * An issuer read's path: a US listing or a bare symbol keeps its US ticker
+ * and sends nothing else; a listing abroad sends its bare symbol with its
+ * venue and company (listingAbroad).
+ */
+function issuerPath(base: string, ticker: string, listing: IssuerListingParams = {}, suffix = ""): string {
+  const abroad = listingAbroad(ticker, listing.exchange, listing.name);
+  const search = new URLSearchParams();
+  setListingAbroad(search, abroad);
+  return appendQuery(`${base}/${encodeURIComponent(abroad?.symbol ?? normalizeIssuerResearchTicker(ticker))}${suffix}`, search);
+}
+
+/**
+ * RISK, EXEC and EK are Pro: these reads need a verified Pro account. The same
+ * risk factors and pay are open under /public for the gloom.sh pages.
+ */
+export function cloudProxyStatementsPath(ticker: string, listing?: IssuerListingParams): string {
+  return issuerPath("/cloud/proxies", ticker, listing);
+}
+
+export function cloudFilingEventsPath(ticker: string, limit?: number, listing: IssuerListingParams = {}): string {
+  const abroad = listingAbroad(ticker, listing.exchange, listing.name);
+  const search = new URLSearchParams();
+  setListingAbroad(search, abroad);
+  if (limit != null) search.set("limit", String(limit));
+  return appendQuery(`/cloud/events/${encodeURIComponent(abroad?.symbol ?? normalizeIssuerResearchTicker(ticker))}`, search);
+}
+
+export function cloudRiskReportsPath(ticker: string, listing?: IssuerListingParams): string {
+  return issuerPath("/cloud/risks", ticker, listing);
+}
+
+export function cloudRiskReportPath(ticker: string, year: number, listing?: IssuerListingParams): string {
+  return issuerPath("/cloud/risks", ticker, listing, `/${year}`);
+}
+
+export function cloudProxyStatementPath(ticker: string, year: number, listing?: IssuerListingParams): string {
+  return issuerPath("/cloud/proxies", ticker, listing, `/${year}`);
+}
+
+/**
+ * The maturity schedule; a US symbol goes as given, as it always has.
+ * `version=2` asks for schedules in a filing's own bands too, which servers
+ * before them ignore.
+ */
+export function cloudDebtMaturitiesPath(symbol: string, listing: IssuerListingParams = {}): string {
+  const abroad = listingAbroad(symbol, listing.exchange, listing.name);
+  const search = new URLSearchParams({ symbol: abroad?.symbol ?? symbol });
+  setListingAbroad(search, abroad);
+  search.set("version", "2");
+  return appendQuery("/cloud/debt-maturities", search);
+}
+
+export function cloudRevenueBreakdownPath(symbol: string, view?: RevenueBreakdownView, listing: IssuerListingParams = {}): string {
+  const abroad = listingAbroad(symbol, listing.exchange, listing.name);
+  const search = new URLSearchParams({ symbol: abroad?.symbol ?? symbol });
+  setListingAbroad(search, abroad);
+  if (view) search.set("view", view);
+  return appendQuery("/cloud/revenue-breakdown", search);
+}
+
+/**
+ * A US listing, or a symbol with no venue, looks up its US ticker as before.
+ * A listing elsewhere sends its bare symbol with the venue and company name:
+ * its symbol can be another company's US ticker.
+ */
+export function cloudSecFilingsPath(params: CloudSecFilingsParams): string {
+  const abroad = listingAbroad(params.ticker, params.exchange, params.name);
+  const search = new URLSearchParams({
+    ticker: abroad?.symbol ?? normalizeIssuerResearchTicker(params.ticker),
+  });
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset != null) search.set("offset", String(params.offset));
+  if (params.forms?.length) search.set("form", params.forms.join(","));
+  setListingAbroad(search, abroad);
+  return appendQuery("/cloud/sec/filings", search);
+}
+
+/** A US-listed company's bank figures: SEC deposits and its lead bank's FDIC call report. */
+export function cloudBankFiguresPath(symbol: string): string {
+  return appendQuery("/cloud/bank-figures", new URLSearchParams({ symbol }));
+}
+
+/** Schedule 13D and 13G reports about the issuer behind `ticker`. */
+export function cloudSecBeneficialOwnersPath(params: CloudBeneficialOwnersParams): string {
+  const abroad = listingAbroad(params.ticker, params.exchange, params.name);
+  const search = new URLSearchParams({ ticker: abroad?.symbol ?? normalizeIssuerResearchTicker(params.ticker) });
+  setListingAbroad(search, abroad);
+  if (params.form) search.set("form", params.form);
+  if (params.history) search.set("history", "1");
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset != null) search.set("offset", String(params.offset));
+  return appendQuery("/cloud/sec/beneficial-owners", search);
+}
+
+/** Companies ranked by recent open-market insider buying or selling. Defaults are left out of the query. */
+export function cloudSecInsiderSignalsPath(params: CloudInsiderSignalsParams = {}): string {
+  const search = new URLSearchParams();
+  if (params.side === "sell") search.set("side", "sell");
+  if (params.window != null) search.set("window", String(params.window));
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.role && params.role !== "all") search.set("role", params.role);
+  if (params.minValue) search.set("minValue", String(params.minValue));
+  if (params.cluster) search.set("cluster", "true");
+  if (params.position) search.set("position", params.position);
+  if (params.cap) search.set("cap", params.cap);
+  if (params.ticker) search.set("ticker", params.ticker);
+  return appendQuery("/cloud/sec/insider-signals", search);
+}
+
+export function cloudSecFilingDocumentsPath(
+  params: CloudSecFilingParams,
+): string {
+  const search = new URLSearchParams();
+  if (params.cik) search.set("cik", params.cik);
+  if (params.accession) search.set("accession", params.accession);
+  if (params.form) search.set("form", params.form);
+  if (params.primaryDocument)
+    search.set("primaryDocument", params.primaryDocument);
+  if (params.filingUrl) search.set("filingUrl", params.filingUrl);
+  return appendQuery("/cloud/sec/filing/documents", search);
+}
+
+export function cloudSecFilingContentPath(
+  params: CloudSecFilingParams,
+): string {
+  const search = new URLSearchParams();
+  if (params.cik) search.set("cik", params.cik);
+  if (params.accession) search.set("accession", params.accession);
+  if (params.form) search.set("form", params.form);
+  if (params.primaryDocument)
+    search.set("primaryDocument", params.primaryDocument);
+  if (params.primaryDocumentUrl)
+    search.set("primaryDocumentUrl", params.primaryDocumentUrl);
+  if (params.filingUrl) search.set("filingUrl", params.filingUrl);
+  return appendQuery("/cloud/sec/filing/content", search);
+}
+
+export function cloudSec13FPath(
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) search.set(key, String(value));
+  }
+  const normalized = path.startsWith("/") ? path.slice(1) : path;
+  return appendQuery(`/cloud/sec/13f/${normalized}`, search);
+}
+
+export type CloudSearchParams = {
+  query: string;
+  tickers?: readonly string[];
+  docTypes?: readonly CloudSearchDocType[];
+  sources?: readonly string[];
+  /** Inclusive ISO date or timestamp bounds on `publishedAt`. */
+  from?: string;
+  to?: string;
+  sort?: CloudSearchSort;
+  limit?: number;
+  offset?: number;
+  /** Set false to skip the total-count pass when only the top hits are shown. */
+  count?: boolean;
+  /** One row per source document instead of one per matching chunk. */
+  distinct?: boolean;
+};
+
+function csvParam(values: readonly string[] | undefined): string | null {
+  if (!values) return null;
+  const cleaned = values
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  return cleaned.length > 0 ? cleaned.join(",") : null;
+}
+
+export function cloudSearchPath(params: CloudSearchParams): string {
+  const search = new URLSearchParams({ q: params.query.trim() });
+  const tickers = csvParam(params.tickers?.map(normalizeSymbol));
+  if (tickers) search.set("tickers", tickers);
+  const docTypes = csvParam(params.docTypes);
+  if (docTypes) search.set("docTypes", docTypes);
+  const sources = csvParam(params.sources);
+  if (sources) search.set("sources", sources);
+  if (params.from) search.set("from", params.from);
+  if (params.to) search.set("to", params.to);
+  if (params.sort) search.set("sort", params.sort);
+  if (params.limit != null) search.set("limit", String(params.limit));
+  // Offset 0 is the default page, so sending it only lengthens the cache key.
+  if (params.offset) search.set("offset", String(params.offset));
+  // Counting is the server default, so only opting out is worth a parameter.
+  if (params.count === false) search.set("count", "false");
+  if (params.distinct) search.set("distinct", "true");
+  return appendQuery("/cloud/search", search);
+}
+
+export function cloudSearchDocumentPath(
+  docType: CloudSearchDocType,
+  sourceId: string,
+): string {
+  return `/cloud/search/documents/${encodeURIComponent(docType)}/${encodeURIComponent(sourceId)}`;
+}
+
+export function cloudSavedSearchesPath(): string {
+  return "/cloud/search/saved";
+}
+
+export function cloudSavedSearchPath(id: string): string {
+  return `/cloud/search/saved/${encodeURIComponent(id)}`;
+}
+
+export function cloudNewsPath(params: CloudNewsParams = {}): string {
+  const search = new URLSearchParams();
+  if (params.feed) search.set("feed", params.feed);
+  if (params.ticker) {
+    const tickerFilter = params.exchange
+      ? publicTickerKey(params.ticker, params.exchange)
+      : normalizeSymbol(params.ticker);
+    search.set("tickers", tickerFilter);
+  }
+  if (params.tickerTier) search.set("tickerTier", params.tickerTier);
+  if (params.tickerRelations?.length)
+    search.set("tickerRelations", params.tickerRelations.join(","));
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.topics?.length) search.set("topics", params.topics.join(","));
+  if (params.categories?.length)
+    search.set("categories", params.categories.join(","));
+  if (params.sectors?.length) search.set("sectors", params.sectors.join(","));
+  if (params.sources?.length) search.set("sources", params.sources.join(","));
+  if (params.excludeSources?.length)
+    search.set("excludeSources", params.excludeSources.join(","));
+  if (params.sentiment) search.set("sentiment", params.sentiment);
+  if (params.minImportance != null)
+    search.set("minImportance", String(params.minImportance));
+  if (params.minUrgency != null)
+    search.set("minUrgency", String(params.minUrgency));
+  if (params.breaking != null) search.set("breaking", String(params.breaking));
+  if (params.since) search.set("since", params.since.toISOString());
+  if (params.until) search.set("until", params.until.toISOString());
+  if (params.cursor) search.set("cursor", params.cursor);
+  return appendQuery("/news", search);
+}
+
+/** Stories whose headline, summary or publisher matches the text, best match first; the service takes at most 100. */
+/** `topics` are NI codes the stories must carry: `query=gold&topics=metals` is gold's market news. */
+/**
+ * `closest`: when no story has every word, the stories with the most of them, marked `match: "closest"`.
+ * `tickers`: only the stories filed under them (`HAWK:NYSE`).
+ */
+export function cloudNewsSearchPath(
+  query: string, limit?: number, topics?: readonly string[], options: { closest?: boolean; tickers?: readonly string[] } = {},
+): string {
+  const search = new URLSearchParams({ query });
+  if (limit != null) search.set("limit", String(limit));
+  if (topics?.length) search.set("topics", topics.join(","));
+  if (options.tickers?.length) search.set("tickers", options.tickers.join(","));
+  if (options.closest) search.set("closest", "1");
+  return appendQuery("/news/search", search);
+}
+
+export function cloudTickerTweetsPath(params: CloudTickerTweetsParams): string {
+  const search = new URLSearchParams({ ticker: params.ticker });
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset) search.set("offset", String(params.offset));
+  if (params.hours != null) search.set("hours", String(params.hours));
+  if (params.includeReplies != null)
+    search.set("includeReplies", String(params.includeReplies));
+  return appendQuery("/news/tweets", search);
+}
+
+export function cloudTweetSearchPath(params: CloudTweetSearchParams): string {
+  const search = new URLSearchParams({ query: params.query });
+  if (params.queryType) search.set("queryType", params.queryType);
+  if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.offset) search.set("offset", String(params.offset));
+  if (params.hours != null) search.set("hours", String(params.hours));
+  return appendQuery("/news/tweets/search", search);
+}

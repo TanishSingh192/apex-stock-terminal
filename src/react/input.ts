@@ -1,0 +1,278 @@
+import {
+  createContext,
+  createElement,
+  useContext,
+  useLayoutEffect,
+  useRef,
+  type ReactNode,
+} from "react";
+import { keySignature, mayRepeat } from "./key-repeat";
+
+export interface KeyEventLike {
+  key: string;
+  name?: string;
+  sequence?: string;
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  meta: boolean;
+  super?: boolean;
+  targetEditable?: boolean;
+  /**
+   * The platform sent this press because the key is held down (DOM `repeat`,
+   * the kitty protocol's repeat event). Absent where the host cannot tell,
+   * such as a terminal that does not report event types.
+   */
+  readonly repeat?: boolean;
+  readonly defaultPrevented?: boolean;
+  readonly propagationStopped?: boolean;
+  preventDefault(): void;
+  stopPropagation(): void;
+}
+
+export interface ShortcutOptions {
+  enabled?: boolean;
+  /**
+   * Groups related handlers into one interaction surface. Within each phase,
+   * newer enabled scopes receive events before older scopes and unscoped
+   * handlers. Once a scoped handler prevents the default action, only that
+   * scope receives the rest of the dispatch.
+   */
+  scope?: string;
+  /**
+   * `capture` is for a modal surface that owns every key while it is open (a
+   * menu, window mode): it runs before everything, whatever mounted later.
+   * `before`, `normal` and `after` are the usual order. `idle` runs last and
+   * only for a key nothing else used, for fallbacks such as the pane menu
+   * key or arming double Esc.
+   */
+  phase?: "capture" | "before" | "normal" | "after" | "idle";
+  allowEditable?: boolean;
+}
+
+interface ShortcutRegistration {
+  handler(event: KeyEventLike): void;
+  isEnabled(): boolean;
+  allowsEditable(): boolean;
+  scope?: string;
+  phase: NonNullable<ShortcutOptions["phase"]>;
+}
+
+interface ShortcutEntry extends ShortcutRegistration {
+  order: number;
+}
+
+export interface ShortcutRegistry {
+  register(registration: ShortcutRegistration): () => void;
+  /**
+   * Runs `listener` for every key, before any handler is picked for it. State
+   * it sets has rendered by the time the handlers run (when the host can
+   * flush), so they read it instead of what the last frame held.
+   */
+  beforeDispatch(listener: (event: KeyEventLike) => void): () => void;
+  dispatch(event: KeyEventLike): void;
+}
+
+export interface ShortcutRegistryOptions {
+  /** The renderer's synchronous render flush, which `beforeDispatch` listeners run inside. */
+  flushSync?: (run: () => void) => void;
+}
+
+const SHORTCUT_PHASES: ReadonlyArray<ShortcutEntry["phase"]> = [
+  "capture",
+  "before",
+  "normal",
+  "after",
+  "idle",
+];
+
+function normalizeShortcutScope(scope: string | undefined): string | undefined {
+  const normalized = scope?.trim();
+  return normalized || undefined;
+}
+
+function orderShortcutEntries(entries: ShortcutEntry[]): ShortcutEntry[] {
+  const scopePriority = new Map<string, number>();
+  for (const entry of entries) {
+    if (!entry.scope) continue;
+    scopePriority.set(entry.scope, Math.max(scopePriority.get(entry.scope) ?? 0, entry.order));
+  }
+
+  return entries.sort((left, right) => {
+    if (left.scope === right.scope) return left.order - right.order;
+    if (!left.scope) return 1;
+    if (!right.scope) return -1;
+    return (scopePriority.get(right.scope) ?? 0) - (scopePriority.get(left.scope) ?? 0);
+  });
+}
+
+export function createShortcutRegistry({ flushSync }: ShortcutRegistryOptions = {}): ShortcutRegistry {
+  let nextOrder = 1;
+  const entries = new Map<number, ShortcutEntry>();
+  const beforeListeners = new Set<(event: KeyEventLike) => void>();
+
+  const registry: ShortcutRegistry = {
+    register(registration) {
+      const order = nextOrder++;
+      entries.set(order, {
+        ...registration,
+        scope: normalizeShortcutScope(registration.scope),
+        order,
+      });
+      return () => {
+        entries.delete(order);
+      };
+    },
+    beforeDispatch(listener) {
+      beforeListeners.add(listener);
+      return () => {
+        beforeListeners.delete(listener);
+      };
+    },
+    dispatch(event) {
+      if (beforeListeners.size > 0) {
+        const run = () => {
+          for (const listener of [...beforeListeners]) listener(event);
+        };
+        if (flushSync) flushSync(run);
+        else run();
+      }
+      const eligible = orderShortcutEntries(
+        [...entries.values()].filter((entry) => (
+          entry.isEnabled() && shouldDeliverShortcut(event, entry.allowsEditable())
+        )),
+      );
+      let claimedScope: string | undefined;
+
+      for (const phase of SHORTCUT_PHASES) {
+        if ((phase === "after" || phase === "idle") && (event.defaultPrevented || event.propagationStopped)) return;
+        for (const entry of eligible) {
+          if (entry.phase !== phase) continue;
+          if (claimedScope && entry.scope !== claimedScope) continue;
+
+          const wasDefaultPrevented = event.defaultPrevented === true;
+          entry.handler(event);
+          if (!wasDefaultPrevented && event.defaultPrevented && entry.scope) {
+            claimedScope = entry.scope;
+          }
+          if (event.propagationStopped) return;
+        }
+      }
+    },
+  };
+
+  // A held key repeats its press. Only the keys meant to repeat (key-repeat.ts)
+  // reach the handlers again; the rest already ran when the key went down.
+  // `lastPress` is that press: a repeat of a key the app claimed stays claimed,
+  // or the webview would act on it itself (a beep on macOS).
+  let lastPress: { signature: string; claimed: boolean } | null = null;
+  return {
+    ...registry,
+    dispatch(event) {
+      if (event.repeat === true && !mayRepeat(event)) {
+        if (lastPress?.claimed && lastPress.signature === keySignature(event)) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      registry.dispatch(event);
+      if (event.repeat !== true) {
+        lastPress = {
+          signature: keySignature(event),
+          claimed: event.defaultPrevented === true || event.propagationStopped === true,
+        };
+      }
+    },
+  };
+}
+
+export function useRegisteredShortcut(
+  registry: ShortcutRegistry,
+  handler: (event: KeyEventLike) => void,
+  options?: ShortcutOptions,
+): void {
+  const handlerRef = useRef(handler);
+  const enabledRef = useRef(options?.enabled !== false);
+  const allowEditableRef = useRef(options?.allowEditable === true);
+  handlerRef.current = handler;
+  enabledRef.current = options?.enabled !== false;
+  allowEditableRef.current = options?.allowEditable === true;
+
+  useLayoutEffect(() => registry.register({
+    handler: (event) => handlerRef.current(event),
+    isEnabled: () => enabledRef.current,
+    allowsEditable: () => allowEditableRef.current,
+    phase: options?.phase ?? "normal",
+    scope: options?.scope,
+  }), [options?.phase, options?.scope, registry]);
+}
+
+export function useRegisteredBeforeShortcut(
+  registry: ShortcutRegistry,
+  listener: (event: KeyEventLike) => void,
+): void {
+  const listenerRef = useRef(listener);
+  listenerRef.current = listener;
+  useLayoutEffect(
+    () => registry.beforeDispatch((event) => listenerRef.current(event)),
+    [registry],
+  );
+}
+
+export interface InputHost {
+  useShortcut(
+    handler: (event: KeyEventLike) => void,
+    options?: ShortcutOptions,
+  ): void;
+  useBeforeShortcut(listener: (event: KeyEventLike) => void): void;
+  useViewport(): { width: number; height: number };
+}
+
+const InputHostContext = createContext<InputHost | null>(null);
+
+export function InputHostProvider({
+  host,
+  children,
+}: {
+  host: InputHost;
+  children: ReactNode;
+}) {
+  return createElement(InputHostContext, { value: host }, children);
+}
+
+function useInputHost(): InputHost {
+  const host = useContext(InputHostContext);
+  if (!host) {
+    throw new Error("Input host hooks must be used inside InputHostProvider");
+  }
+  return host;
+}
+
+export function useShortcut(
+  handler: (event: KeyEventLike) => void,
+  options?: ShortcutOptions,
+): void {
+  useInputHost().useShortcut(handler, options);
+}
+
+/**
+ * Runs before every key reaches any shortcut handler, whatever its phase or
+ * scope, for state the handlers read: set it here and it has rendered by the
+ * time they run. Not for acting on the key.
+ */
+export function useBeforeShortcut(listener: (event: KeyEventLike) => void): void {
+  useInputHost().useBeforeShortcut(listener);
+}
+
+export function shouldDeliverShortcut(
+  event: KeyEventLike,
+  allowEditable: boolean,
+): boolean {
+  if (allowEditable || event.targetEditable !== true) return true;
+  return event.ctrl || event.meta || event.super === true;
+}
+
+export function useViewport(): { width: number; height: number } {
+  return useInputHost().useViewport();
+}

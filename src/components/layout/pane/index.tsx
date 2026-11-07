@@ -1,0 +1,166 @@
+import { Box, useUiCapabilities } from "../../../ui";
+import type { ReactNode } from "react";
+import { paneBg } from "../../../theme/colors";
+import { useThemeColors } from "../../../theme/theme-context";
+import { PaneBodyFrame, getPaneWindowAttributes, type DockEdge } from "./frame";
+import { PaneHeader, type PaneHeaderQuickSetting, type PaneHeaderStack } from "./header";
+import { PaneHeaderTabsProvider, usePaneHeaderTabsHost } from "./header-tabs";
+import { hasPaneFooterContent, PaneFooterBar, type CombinedPaneFooter } from "./footer";
+import { paneHeaderRows, resolvePaneBodyFrame, shouldReservePaneFooter } from "./sizing";
+
+interface PaneWrapperProps {
+  paneId?: string;
+  title?: string;
+  /**
+   * Desktop and web: the ticker the title shows, drawn as a control that opens ticker search for
+   * the pane (`onTitleTickerPress`).
+   */
+  titleTicker?: string | null;
+  onTitleTickerPress?: () => void;
+  focused: boolean;
+  windowModeSelected?: boolean;
+  width?: number;
+  height?: number | `${number}%` | "auto";
+  /**
+   * Desktop: fill the box it sits in instead of taking `width` and `height`,
+   * so a box restyled by a drag (a divider) sizes the pane without a render.
+   * `width` still fits the header and footer.
+   */
+  stretch?: boolean;
+  flexGrow?: number;
+  locked?: boolean;
+  showActions?: boolean;
+  quickSettings?: PaneHeaderQuickSetting[];
+  /** A dock divider line is drawn over the top row (the pane is below another). */
+  topRule?: boolean;
+  /** Desktop: the sides that face another docked pane across the gap between them. */
+  dockEdges?: readonly DockEdge[];
+  /** Panes stacked as tabs in this spot. */
+  stack?: PaneHeaderStack | null;
+  onMouseDown?: (event: any) => void;
+  onMouseDownCapture?: (event: any) => void;
+  onHeaderMouseMove?: (event: any) => void;
+  onHeaderMouseDown?: (event: any) => void;
+  onHeaderMouseDrag?: (event: any) => void;
+  onHeaderMouseDragEnd?: (event: any) => void;
+  onHeaderContextMenu?: (event: any) => void;
+  onActionMouseDown?: (event: any) => void;
+  onHelpMouseDown?: (event: any) => void;
+  /** Ask Gloom about the pane, from the button beside the `?`. */
+  onAskMouseDown?: (event: any) => void;
+  onRestoreMouseDown?: (event: any) => void;
+  fullscreen?: boolean;
+  footer?: CombinedPaneFooter | null;
+  children: ReactNode;
+}
+
+export function PaneWrapper({
+  paneId,
+  title,
+  titleTicker = null,
+  onTitleTickerPress,
+  focused,
+  windowModeSelected = false,
+  width = 0,
+  height,
+  stretch = false,
+  flexGrow,
+  locked = false,
+  showActions = false,
+  quickSettings,
+  topRule = false,
+  dockEdges,
+  stack,
+  onMouseDown,
+  onMouseDownCapture,
+  onHeaderMouseMove,
+  onHeaderMouseDown,
+  onHeaderMouseDrag,
+  onHeaderMouseDragEnd,
+  onHeaderContextMenu,
+  onActionMouseDown,
+  onHelpMouseDown,
+  onAskMouseDown,
+  onRestoreMouseDown,
+  fullscreen = false,
+  footer,
+  children,
+}: PaneWrapperProps) {
+  const { nativePaneChrome } = useUiCapabilities();
+  const { headerTabs, contextValue: headerTabsContext } = usePaneHeaderTabsHost(nativePaneChrome === true && !!title);
+  // This frame can sit below a memoized layer. The body surface feeds canvas
+  // charts too, so subscribe rather than reading the non-reactive facade.
+  const colors = useThemeColors();
+  const bg = paneBg(focused, colors);
+  const showFooter = hasPaneFooterContent(footer);
+  const reserveFooter = !!title && shouldReservePaneFooter(nativePaneChrome, showFooter);
+  const renderFooter = !!title && (reserveFooter || showFooter);
+  const bodyFrame = resolvePaneBodyFrame({
+    height: typeof height === "number" ? height : undefined,
+    nativePaneChrome,
+    footerVisible: renderFooter,
+    reserveFooter,
+    headerRows: title ? paneHeaderRows(nativePaneChrome) : 0,
+  });
+
+  return (
+    <Box
+      flexDirection="column"
+      width={stretch ? "100%" : width}
+      height={stretch ? "100%" : height}
+      flexGrow={flexGrow}
+      backgroundColor={bg}
+      overflow="hidden"
+      {...getPaneWindowAttributes({
+        enabled: nativePaneChrome,
+        role: "pane-window",
+        paneId,
+        floating: false,
+        focused,
+        windowModeSelected,
+        showBorderColor: true,
+        dockEdges,
+      })}
+      onMouseDown={onMouseDown}
+      onMouseDownCapture={onMouseDownCapture}
+    >
+      {title && (
+        <PaneHeader
+          title={title}
+          titleTicker={titleTicker}
+          onTitleTickerPress={onTitleTickerPress}
+          width={width}
+          focused={focused}
+          windowModeSelected={windowModeSelected}
+          locked={locked}
+          showActions={showActions}
+          quickSettings={quickSettings}
+          tabs={headerTabs}
+          stack={stack}
+          bodyBackground={bg}
+          topRule={topRule}
+          onHeaderMouseMove={onHeaderMouseMove}
+          onHeaderMouseDown={onHeaderMouseDown}
+          onHeaderMouseDrag={onHeaderMouseDrag}
+          onHeaderMouseDragEnd={onHeaderMouseDragEnd}
+          onHeaderContextMenu={onHeaderContextMenu}
+          onActionMouseDown={onActionMouseDown}
+          onHelpMouseDown={onHelpMouseDown}
+          onAskMouseDown={onAskMouseDown}
+          fullscreen={fullscreen}
+          onRestoreMouseDown={onRestoreMouseDown}
+        />
+      )}
+      <PaneBodyFrame layoutProps={bodyFrame.layoutProps} backgroundColor={bg}>
+        <PaneHeaderTabsProvider value={headerTabsContext}>{children}</PaneHeaderTabsProvider>
+      </PaneBodyFrame>
+      {renderFooter && (
+        <PaneFooterBar
+          footer={footer}
+          focused={focused}
+          width={typeof width === "number" ? width : undefined}
+        />
+      )}
+    </Box>
+  );
+}

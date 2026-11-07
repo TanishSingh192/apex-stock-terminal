@@ -1,0 +1,346 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+import type { CrashReportsPayload } from "../api-client";
+import { flushCrashReports, installCrashReporter, resetCrashReporterForTests } from "../telemetry/crash-reports";
+import { VERSION } from "../version";
+import { listPluginDirectories, loadExternalPlugin, readPluginCommit, unresolvedSpecifier } from "./loader";
+
+const scratch: string[] = [];
+
+function checkout(): string {
+  const dir = mkdtempSync(join(tmpdir(), "gloom-plugin-"));
+  scratch.push(dir);
+  mkdirSync(join(dir, ".git", "refs", "heads"), { recursive: true });
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+/**
+ * Read without spawning git, once per plugin at every startup. The three
+ * layouts git actually writes are covered; anything else must come back null
+ * rather than a wrong commit that the update check would then trust.
+ */
+describe("readPluginCommit", () => {
+  test("reads a detached HEAD, which is what a pinned install leaves", () => {
+    const dir = checkout();
+    writeFileSync(join(dir, ".git", "HEAD"), `${SHA}\n`);
+    expect(readPluginCommit(dir)).toBe(SHA);
+  });
+
+  test("follows a branch ref to its loose file", () => {
+    const dir = checkout();
+    writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(dir, ".git", "refs", "heads", "main"), `${SHA}\n`);
+    expect(readPluginCommit(dir)).toBe(SHA);
+  });
+
+  test("falls back to packed-refs after git gc", () => {
+    const dir = checkout();
+    writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(dir, ".git", "packed-refs"), `# pack-refs with: peeled fully-peeled sorted\n${SHA} refs/heads/main\n`);
+    expect(readPluginCommit(dir)).toBe(SHA);
+  });
+
+  test("is null for a folder that is not a checkout", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gloom-plain-"));
+    scratch.push(dir);
+    expect(readPluginCommit(dir)).toBeNull();
+  });
+});
+
+function pluginAt(commit: string, files: Record<string, string>): string {
+  const dir = checkout();
+  writeFileSync(join(dir, ".git", "HEAD"), `${commit}\n`);
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+  return dir;
+}
+
+describe("loadExternalPlugin", () => {
+  test.each([
+    ["gloom.json", { "gloom.json": JSON.stringify({ id: "future", minGloom: "999.0.0" }) }],
+    ["a gloomberb peer range", { "package.json": JSON.stringify({ name: "future", peerDependencies: { gloomberb: ">=999.0.0" } }) }],
+  ])("does not import a checkout that needs a newer Gloomberb, from %s", async (_source, manifest) => {
+    const dir = pluginAt(SHA, { ...manifest, "index.ts": `throw new Error("imported");\n` });
+
+    const loaded = await loadExternalPlugin(dir);
+
+    expect(loaded?.needsGloomberb).toBe("999.0.0");
+    expect(loaded?.error).toBe(`Needs Gloom 999.0.0, this is ${VERSION}.`);
+  });
+
+  test("names the host export a stale plugin imports, from Bun's own error", async () => {
+    const dir = pluginAt(SHA, {
+      "index.ts": `import { RemovedLongAgo } from "gloomberb/theme";\nexport default { id: "stale", name: "Stale", RemovedLongAgo };\n`,
+    });
+
+    const loaded = await loadExternalPlugin(dir);
+
+    expect(loaded?.error).toBe(
+      `Uses RemovedLongAgo from gloomberb/theme, which Gloom ${VERSION} does not have. Update the plugin, or Gloom if the plugin is newer.`,
+    );
+  });
+
+  test("asks for a restart when a plugin split across files changes after it was imported", async () => {
+    // Bun re-reads only the entry on a fresh import and keeps the other files
+    // cached, so calling the update done would leave old code running.
+    const dir = pluginAt(SHA, {
+      "index.ts": `import { label } from "./label";\nexport default { id: "split", name: label };\n`,
+      "label.ts": `export const label = "Split";\n`,
+    });
+    expect((await loadExternalPlugin(dir))?.needsRestart).toBeUndefined();
+
+    writeFileSync(join(dir, "label.ts"), `export const label = "Split 2";\n`);
+    writeFileSync(join(dir, ".git", "HEAD"), `${"1".repeat(40)}\n`);
+    expect((await loadExternalPlugin(dir, "cli", { fresh: true }))?.needsRestart).toBe(true);
+  });
+});
+
+/**
+ * An update that adds an export to a file the old version already imported:
+ * Bun keeps the old file, so the new entry cannot link against it. That is
+ * the restart the row already asks for, not a failure to report. Adjacent
+ * did this to every install that updated it in a running session.
+ */
+describe("a plugin updated in a running session to files its cached modules cannot satisfy", () => {
+  afterEach(() => resetCrashReporterForTests());
+
+  function stage() {
+    const dir = pluginAt(SHA, {
+      "index.ts": `import { tab } from "./types";\nexport default { id: "linked-update", name: "Linked", tab };\n`,
+      "types.ts": `export const tab = "old";\n`,
+    });
+    const sent: CrashReportsPayload[] = [];
+    resetCrashReporterForTests();
+    installCrashReporter({
+      surface: "terminal",
+      isEnabled: () => true,
+      getInstallId: () => "0f1e2d3c-4b5a-4968-8776-655443322110",
+      send: async (payload) => { sent.push(payload); },
+    });
+    const update = (files: Record<string, string>) => {
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(dir, file), content);
+      writeFileSync(join(dir, ".git", "HEAD"), `${"1".repeat(40)}\n`);
+    };
+    return { dir, sent, update };
+  }
+
+  test("asks for a restart when the new entry imports an export the cached file lacks", async () => {
+    const { dir, sent, update } = stage();
+    expect((await loadExternalPlugin(dir))?.error).toBeUndefined();
+
+    update({
+      "index.ts": `import { tab, tabs } from "./types";\nexport default { id: "linked-update", name: "Linked", tab, tabs };\n`,
+      "types.ts": `export const tab = "new";\nexport const tabs = ["new"];\n`,
+    });
+    const loaded = await loadExternalPlugin(dir, "cli", { fresh: true });
+    await flushCrashReports({ timeoutMs: 500 });
+
+    expect({ needsRestart: loaded?.needsRestart, error: loaded?.error }).toEqual({ needsRestart: true, error: undefined });
+    expect(sent).toEqual([]);
+  });
+
+  test("still reports an update that throws for another reason", async () => {
+    const { dir, sent, update } = stage();
+    await loadExternalPlugin(dir);
+
+    update({ "index.ts": `throw new Error("broken on purpose");\n` });
+    const loaded = await loadExternalPlugin(dir, "cli", { fresh: true });
+    await flushCrashReports({ timeoutMs: 500 });
+
+    expect(loaded?.error).toContain("broken on purpose");
+    expect(sent.flatMap((payload) => payload.errors.map((error) => error.message))).toEqual([
+      expect.stringContaining("broken on purpose"),
+    ]);
+  });
+});
+
+/** IBKR Gateway and Interactive Brokers in miniature: a plugin that imports its sibling, and the sibling. */
+function siblingPlugins(peerFiles: Record<string, string>) {
+  const pluginsDir = mkdtempSync(join(tmpdir(), "gloom-plugins-"));
+  scratch.push(pluginsDir);
+  const folder = (name: string, files: Record<string, string>) => {
+    mkdirSync(join(pluginsDir, name));
+    for (const [file, content] of Object.entries(files)) writeFileSync(join(pluginsDir, name, file), content);
+    return join(pluginsDir, name);
+  };
+  const gateway = folder("gloom-fixture-gateway", {
+    "package.json": JSON.stringify({ name: "gloom-fixture-gateway", main: "index.ts", peerDependencies: { "gloom-fixture-peer": ">=1.0.0" } }),
+    "index.ts": `import { label, slot } from "./plugin";\nexport default { id: "fixture-gateway", name: label, slot };\n`,
+    "plugin.ts": `import { bridge, slot } from "gloom-fixture-peer/bridge";\nimport { suffix } from './parts/suffix';\nexport const label = bridge + suffix;\nexport { slot };\n`,
+  });
+  // A nested file that imports the sibling too, as the gateway's trading
+  // pane does: its folder is cached apart from the plugin's own.
+  mkdirSync(join(gateway, "parts"));
+  writeFileSync(join(gateway, "parts", "suffix.ts"), `import { bridge } from "gloom-fixture-peer/bridge";\nexport const suffix = bridge ? "" : "?";\n`);
+  const addPeer = () => folder("gloom-fixture-peer", { "package.json": JSON.stringify({ name: "gloom-fixture-peer" }), ...peerFiles });
+  const sent: CrashReportsPayload[] = [];
+  resetCrashReporterForTests();
+  installCrashReporter({
+    surface: "terminal",
+    isEnabled: () => true,
+    getInstallId: () => "0f1e2d3c-4b5a-4968-8776-655443322110",
+    send: async (payload) => { sent.push(payload); },
+  });
+  return { gateway, addPeer, sent };
+}
+
+const PEER_BRIDGE = { "bridge.ts": `export const bridge = "Fixture Gateway";\nexport const slot = {};\n` };
+
+/**
+ * An import of IBKR Gateway that ran before Interactive Brokers was linked
+ * fails, and Bun keeps that failure for the rest of the process: its resolver
+ * remembers the folder without the link, and the failed module stays failed
+ * under its path. The loader links the sibling and imports the plugin again
+ * in a way that looks again, and the report carries the link state. A
+ * sibling that really lacks the module is still a failure.
+ */
+describe("a plugin whose sibling plugin was linked after its import failed", () => {
+  afterEach(() => resetCrashReporterForTests());
+
+  test("loads in the same process once the module is there, and reports the link state it recovered from", async () => {
+    const { gateway, addPeer, sent } = siblingPlugins(PEER_BRIDGE);
+    await import(join(gateway, "index.ts")).catch(() => {});
+    addPeer();
+
+    const loaded = await loadExternalPlugin(gateway, "cli", { fresh: true });
+    // The desktop reads every plugin a second time to compile it for the
+    // view; that read must get the modules that loaded, not run them twice.
+    const again = await loadExternalPlugin(gateway, "cli");
+    await flushCrashReports({ timeoutMs: 500 });
+
+    expect({ name: loaded?.plugin.name, error: loaded?.error, needsRestart: loaded?.needsRestart })
+      .toEqual({ name: "Fixture Gateway", error: undefined, needsRestart: undefined });
+    expect(again?.plugin).toBe(loaded!.plugin);
+    // The sibling's own module, not a second copy: the gateway hands its
+    // bridge to Interactive Brokers through it.
+    const peerBridge = await import(realpathSync(join(gateway, "..", "gloom-fixture-peer", "bridge.ts")));
+    expect((loaded!.plugin as unknown as { slot: object }).slot).toBe(peerBridge.slot);
+    const messages = sent.flatMap((payload) => payload.errors.map((error) => error.message));
+    // The link was made right before the import that replayed the failure.
+    expect(messages).toEqual([expect.stringMatching(
+      /\[retry=loaded peer=gloom-fixture-peer dir=gloom-fixture-peer link=(?:symlink|junction)->gloom-fixture-peer relinked=no link-writes=1@\d+\.\ds installs=none loads=1 first-launch=unknown bun=/,
+    )]);
+  });
+
+  test("still fails and reports a module the sibling does not have", async () => {
+    const { gateway, addPeer, sent } = siblingPlugins({ "index.ts": `export default { id: "fixture-peer", name: "Fixture Peer" };\n` });
+    addPeer();
+
+    const loaded = await loadExternalPlugin(gateway, "cli", { fresh: true });
+    await flushCrashReports({ timeoutMs: 500 });
+
+    // Bun 1.3 names the module, 1.4 the package alone.
+    const unresolved = /Cannot find (?:module 'gloom-fixture-peer\/bridge'|package 'gloom-fixture-peer')/;
+    expect(loaded?.needsRestart).toBeUndefined();
+    expect(loaded?.error).toMatch(unresolved);
+    const messages = sent.flatMap((payload) => payload.errors.map((error) => error.message));
+    expect(messages).toEqual([
+      expect.stringMatching(new RegExp(`${unresolved.source}.*\\[retry=failed peer=gloom-fixture-peer dir=gloom-fixture-peer link=`)),
+    ]);
+    // The retry failed the same way, under its own module key: nothing to add.
+    expect(messages[0]).not.toContain("retry-error=");
+  });
+
+  test("checks the subpath when the message names only the package", () => {
+    // Bun 1.4's wording for `import "gloom-fixture-peer/bridge"`: the peer's
+    // index exists, so judging by the package alone would ask for a restart.
+    const err = Object.assign(new Error("Cannot find package 'gloom-fixture-peer' imported from /plugins/gloom-fixture-gateway/plugin.ts"), {
+      code: "ERR_MODULE_NOT_FOUND",
+      specifier: "gloom-fixture-peer/bridge",
+    });
+    expect(unresolvedSpecifier(err, err.message)).toBe("gloom-fixture-peer/bridge");
+    expect(unresolvedSpecifier(new Error("x"), "Cannot find module 'gloom-fixture-peer/bridge' from '/plugins/a.ts'")).toBe("gloom-fixture-peer/bridge");
+  });
+});
+
+/**
+ * The first launch after an update on Windows: the gateway's junction to
+ * Interactive Brokers was in place and pointed at it, and still nothing in
+ * that process could read through it, rewritten or not. The sibling's own
+ * folder read fine. So a plugin imports its sibling from the sibling's
+ * folder, and the link only shows up in a report.
+ */
+describe("a plugin whose link to its sibling plugin does not resolve", () => {
+  afterEach(() => resetCrashReporterForTests());
+
+  // The link is made unreadable by a folder the loader cannot write, which
+  // Windows does not enforce on its owner and root ignores.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "imports the sibling from its folder, shares its modules, and reports the link once",
+    async () => {
+      const { gateway, addPeer, sent } = siblingPlugins(PEER_BRIDGE);
+      const peer = addPeer();
+      const modules = join(gateway, "node_modules");
+      mkdirSync(modules);
+      symlinkSync(join(gateway, "..", "gone"), join(modules, "gloom-fixture-peer"), "dir");
+      chmodSync(modules, 0o555);
+      try {
+        const loaded = await loadExternalPlugin(gateway, "cli");
+        // The desktop's second read, to compile it for the view.
+        const again = await loadExternalPlugin(gateway, "cli");
+        await flushCrashReports({ timeoutMs: 500 });
+
+        expect({ name: loaded?.plugin.name, error: loaded?.error, needsRestart: loaded?.needsRestart })
+          .toEqual({ name: "Fixture Gateway", error: undefined, needsRestart: undefined });
+        expect(again?.plugin).toBe(loaded!.plugin);
+        const peerBridge = await import(realpathSync(join(peer, "bridge.ts")));
+        expect((loaded!.plugin as unknown as { slot: object }).slot).toBe(peerBridge.slot);
+        const messages = sent.flatMap((payload) => payload.errors.map((error) => error.message));
+        expect(messages).toEqual([expect.stringMatching(
+          /^Loaded gloom-fixture-gateway past a link to gloom-fixture-peer that does not resolve \[peer-import=folder peer=gloom-fixture-peer dir=gloom-fixture-peer link=symlink->gone\(not-resolving\) link-stat=ENOENT link-writes=0 installs=none loads=1 first-launch=unknown bun=/,
+        )]);
+      } finally {
+        chmodSync(modules, 0o755);
+      }
+    },
+  );
+});
+
+/**
+ * Market Heatmap, Market Halts and Fear & Greed are built in again, and
+ * upgraded installs still have their external checkouts. Loaded beside the
+ * built-in, one fails on the duplicate id and reports a crash on every launch,
+ * so the loader skips it before linking or importing anything, and leaves the
+ * folder as it is for an older Gloom that may share it.
+ */
+describe("leftover checkouts of plugins that are built in now", () => {
+  const imported = `throw new Error("imported");\n`;
+
+  test("are skipped under either product name, by gloom.json id, and when linked", async () => {
+    const pluginsDir = mkdtempSync(join(tmpdir(), "gloom-plugins-"));
+    const devDir = mkdtempSync(join(tmpdir(), "gloom-dev-"));
+    scratch.push(pluginsDir, devDir);
+    const folder = (parent: string, name: string, files: Record<string, string>) => {
+      mkdirSync(join(parent, name));
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(parent, name, file), content);
+      return join(parent, name);
+    };
+    folder(pluginsDir, "gloom-market-heatmap", { "index.ts": imported });
+    folder(pluginsDir, "gloom-fear-greed", { "index.ts": imported });
+    folder(pluginsDir, "gloomberb-market-halts", { "index.ts": imported });
+    folder(pluginsDir, "heatmap-fork", { "gloom.json": JSON.stringify({ id: "market-heatmap" }), "index.ts": imported });
+    symlinkSync(folder(devDir, "gloom-market-halts", { "index.ts": imported }), join(pluginsDir, "gloom-market-halts"), "dir");
+    folder(pluginsDir, "weather", { "index.ts": `export default { id: "weather", name: "Weather" };\n` });
+
+    expect(await listPluginDirectories(pluginsDir)).toEqual([join(pluginsDir, "weather")]);
+    const leftovers = ["gloom-market-heatmap", "gloom-fear-greed", "gloomberb-market-halts", "heatmap-fork", "gloom-market-halts"];
+    for (const name of leftovers) {
+      const dir = join(pluginsDir, name);
+      expect(await loadExternalPlugin(dir)).toBeNull();
+      expect(existsSync(join(dir, "node_modules"))).toBe(false);
+    }
+  });
+
+  test("are skipped by the id they export when there is no gloom.json", async () => {
+    const dir = pluginAt(SHA, { "index.ts": `export default { id: "market-halts", name: "Market Halts" };\n` });
+    expect(await loadExternalPlugin(dir)).toBeNull();
+  });
+});

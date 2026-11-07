@@ -1,0 +1,200 @@
+import { setCloudApiFetchTransport } from "../../../api-client";
+import {
+  createProxyResponse,
+  createProxyResponseHeaders,
+  decodeBase64,
+  readProxyResponseText,
+  toRequestEnvelope,
+  type HttpProxyResponseEnvelope,
+} from "../../../utils/http-proxy-response";
+import { setHttpFetchTransport } from "../../../utils/http-transport";
+import { backendRequest, onBackendMessage } from "./backend-rpc";
+import { logFailure } from "../../../utils/log-failure";
+
+const CLOUD_MARKET_HTTP_TIMEOUT_MS = 10_000;
+/**
+ * The view gives up on a feedback upload after 45 s (api-client/feedback.ts),
+ * but aborting in the view does not stop the Bun process's fetch. Stop it a
+ * little sooner there, so a retry after the timeout cannot store the report twice.
+ */
+const FEEDBACK_SUBMIT_BUN_TIMEOUT_MS = 43_000;
+
+function createAbortError(): Error {
+  return new DOMException("The operation was aborted.", "AbortError");
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal | null | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    throw createAbortError();
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(createAbortError());
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+async function electrobunHttpFetch(url: string, init?: RequestInit): Promise<Response> {
+  if (init?.signal?.aborted) {
+    throw createAbortError();
+  }
+
+  return createProxyResponse(await withAbort(requestBackendHttpFetch(url, init), init?.signal));
+}
+
+async function requestBackendHttpFetch(
+  url: string,
+  init?: RequestInit,
+  timeoutMs?: number,
+): Promise<HttpProxyResponseEnvelope> {
+  return backendRequest("http.fetch", await toRequestEnvelope(url, init, timeoutMs));
+}
+
+async function electrobunCloudApiFetch(url: string, init?: RequestInit): Promise<Response> {
+  if (init?.signal?.aborted) {
+    throw createAbortError();
+  }
+  const path = new URL(url).pathname;
+  const timeoutMs = path.startsWith("/market/")
+    ? CLOUD_MARKET_HTTP_TIMEOUT_MS
+    : path === "/telemetry/attention"
+      ? 5_000
+    : path.endsWith("/feedback") && init?.method === "POST"
+      ? FEEDBACK_SUBMIT_BUN_TIMEOUT_MS
+      : undefined;
+  const response = await withAbort(requestBackendHttpFetch(url, init, timeoutMs), init?.signal);
+
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    statusText: response.statusText,
+    headers: createProxyResponseHeaders(response.headers, response.setCookie),
+    text: async () => readProxyResponseText(response),
+  } as Response;
+}
+
+let nextStreamId = 1;
+
+async function drainStreamText(body: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+/**
+ * Opens a Gloom Cloud response the caller reads as it arrives, such as the
+ * Ask Gloom turn stream.
+ *
+ * The buffered transport above cannot carry one: it resolves only once the
+ * whole body is in, which for server-sent events is never. The Bun process
+ * keeps the body open instead and forwards it as `http.stream.chunk`
+ * messages, reassembled here into a `ReadableStream`.
+ */
+async function electrobunCloudApiStreamFetch(url: string, init?: RequestInit): Promise<Response> {
+  if (init?.signal?.aborted) {
+    throw createAbortError();
+  }
+
+  const streamId = `cloud-stream:${nextStreamId++}`;
+  const encoder = new TextEncoder();
+  let stopListening: (() => void) | null = null;
+  // Assigned by `start`, which the ReadableStream constructor runs before it
+  // returns, so every use below already has it.
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  let settled = false;
+
+  const releaseListeners = () => {
+    if (settled) return false;
+    settled = true;
+    stopListening?.();
+    init?.signal?.removeEventListener("abort", onAbort);
+    return true;
+  };
+  // Only a stream still running is worth cancelling; one that already ended
+  // has nothing left in the Bun process to stop.
+  const cancelUpstream = () => {
+    if (!releaseListeners()) return;
+    void backendRequest("http.stream.cancel", { streamId }).catch(logFailure("desktop-http", "Could not cancel an HTTP stream"));
+  };
+  function onAbort(): void {
+    cancelUpstream();
+    controller.error(createAbortError());
+  }
+
+  // `start` runs synchronously, so the controller exists before the first
+  // chunk can be delivered.
+  const body = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController;
+    },
+    cancel() {
+      cancelUpstream();
+    },
+  });
+
+  // Subscribed before opening: the Bun process forwards as soon as the head
+  // is back, and a listener attached later would miss the first tokens.
+  stopListening = onBackendMessage("http.stream.chunk", streamId, (message) => {
+    if (settled) return;
+    if (typeof message.chunk === "string" && message.chunk) {
+      controller.enqueue(encoder.encode(message.chunk));
+    }
+    if (typeof message.chunkBase64 === "string" && message.chunkBase64) {
+      const bytes = decodeBase64(message.chunkBase64);
+      if (!bytes) {
+        cancelUpstream();
+        controller.error(new Error("The streamed response body is not valid base64."));
+        return;
+      }
+      controller.enqueue(bytes);
+    }
+    if (message.error) {
+      releaseListeners();
+      controller.error(new Error(message.error));
+      return;
+    }
+    if (message.done) {
+      releaseListeners();
+      controller.close();
+    }
+  });
+  init?.signal?.addEventListener("abort", onAbort, { once: true });
+
+  const request = await toRequestEnvelope(url, init);
+  let head;
+  try {
+    head = await backendRequest("http.stream.open", { streamId, ...request });
+  } catch (error) {
+    releaseListeners();
+    controller.close();
+    throw error;
+  }
+
+  return {
+    ok: head.status >= 200 && head.status < 300,
+    status: head.status,
+    statusText: head.statusText,
+    headers: createProxyResponseHeaders(head.headers, head.setCookie),
+    body,
+    text: () => drainStreamText(body),
+  } as unknown as Response;
+}
+
+export function installElectrobunHttpFetchTransport(): void {
+  setHttpFetchTransport(electrobunHttpFetch);
+}
+
+export function installElectrobunCloudApiFetchTransport(): void {
+  setCloudApiFetchTransport(electrobunCloudApiFetch, {
+    streamFetch: electrobunCloudApiStreamFetch,
+  });
+}

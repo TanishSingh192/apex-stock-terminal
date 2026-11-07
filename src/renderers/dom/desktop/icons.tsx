@@ -1,0 +1,268 @@
+/** @jsxImportSource react */
+import { releasePointerFocus } from "../host/focus-scope";
+import { formatShortcutForHost } from "../../../app/keybindings/labels";
+import { ariaKeyShortcut } from "./dialog-actions";
+import type { ReactNode } from "react";
+import type { IconButtonProps, IconName, IconProps } from "../../../components/ui/icon";
+
+/** The desktop icon set, drawn on a 12-unit grid in the current colour. */
+const ICONS: Record<IconName, ReactNode> = {
+  more: (
+    <>
+      <circle cx="2" cy="6" r="1.1" fill="currentColor" />
+      <circle cx="6" cy="6" r="1.1" fill="currentColor" />
+      <circle cx="10" cy="6" r="1.1" fill="currentColor" />
+    </>
+  ),
+  // A question mark, drawn like the other bare glyphs (the pane's `...`).
+  help: (
+    <>
+      <path d="M4.2 4.3a1.85 1.85 0 1 1 2.65 1.65c-.55.28-.85.62-.85 1.22v.33" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="6" cy="9.55" r=".82" fill="currentColor" />
+    </>
+  ),
+  close: <path d="M3 3L9 9M9 3L3 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />,
+  zap: <path d="M7.1 1.2 2.7 6.5h3.1l-.7 4.3 4.4-5.5H6.4l.7-4.1Z" fill="currentColor" />,
+  sqrt: <path d="M1.5 6.6h1.6l1.8 3.6L7.6 2h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />,
+  lock: (
+    <>
+      <rect x="2.5" y="5.5" width="7" height="5" rx="1.2" fill="currentColor" />
+      <path d="M4.25 5.5V4a1.75 1.75 0 0 1 3.5 0v1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </>
+  ),
+  warning: (
+    <>
+      <path d="M5.3 1.7a.8.8 0 0 1 1.4 0l4.1 7.5a.8.8 0 0 1-.7 1.2H1.9a.8.8 0 0 1-.7-1.2l4.1-7.5Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+      <path d="M6 4.4v2.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <circle cx="6" cy="8.6" r=".6" fill="currentColor" />
+    </>
+  ),
+  back: <path d="M7.5 2.5L4 6l3.5 3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />,
+  "chevron-down": <path d="M3 4.8l3 3 3-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />,
+  "chevron-right": <path d="M4.8 3l3 3-3 3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />,
+  search: (
+    <>
+      <circle cx="5.2" cy="5.2" r="3.2" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M7.7 7.7L10.2 10.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </>
+  ),
+  plus: <path d="M6 2.5v7M2.5 6h7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />,
+  check: <path d="M2.6 6.4l2.3 2.3 4.6-5.1" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />,
+  minimize: <path d="M2.5 6h7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />,
+  maximize: <rect x="2.5" y="2.5" width="7" height="7" rx="0.8" stroke="currentColor" strokeWidth="1.2" />,
+  // Drawn on a 24-unit grid and scaled, so strokes match the chat pane's
+  // original icons at the same pixel size.
+  cloud: (
+    <g transform="scale(0.5)">
+      <path d="M7.5 18.5h9.1a4.4 4.4 0 0 0 .8-8.7 6.1 6.1 0 0 0-11.7 1.7A3.6 3.6 0 0 0 7.5 18.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </g>
+  ),
+  "sound-on": (
+    <g transform="scale(0.5)">
+      <path d="M4.5 9.5v5h3.2l4.8 4v-13l-4.8 4H4.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M16 8.5a5 5 0 0 1 0 7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="M18.8 5.8a9 9 0 0 1 0 12.4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </g>
+  ),
+  "sound-off": (
+    <g transform="scale(0.5)">
+      <path d="M4.5 9.5v5h3.2l4.8 4v-13l-4.8 4H4.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M19 5 5 19" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </g>
+  ),
+  // A media player's play and pause, solid so they read at the size of text.
+  play: <path d="M3.6 2.2v7.6a.5.5 0 0 0 .76.43l6.1-3.8a.5.5 0 0 0 0-.86l-6.1-3.8a.5.5 0 0 0-.76.43Z" fill="currentColor" />,
+  pause: (
+    <>
+      <rect x="2.9" y="2.3" width="2.3" height="7.4" rx=".6" fill="currentColor" />
+      <rect x="6.8" y="2.3" width="2.3" height="7.4" rx=".6" fill="currentColor" />
+    </>
+  ),
+  user: (
+    <g transform="scale(0.5)">
+      <circle cx="12" cy="8.5" r="3.4" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M5.5 19.5a6.5 6.5 0 0 1 13 0" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </g>
+  ),
+  "sort-up": <path d="M3.2 7.4 6 4.6l2.8 2.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />,
+  "sort-down": <path d="M3.2 4.6 6 7.4l2.8-2.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />,
+  // Two columns of three dots: the pane's drag handle.
+  grip: (
+    <>
+      <circle cx="4.4" cy="3" r="0.9" fill="currentColor" />
+      <circle cx="7.6" cy="3" r="0.9" fill="currentColor" />
+      <circle cx="4.4" cy="6" r="0.9" fill="currentColor" />
+      <circle cx="7.6" cy="6" r="0.9" fill="currentColor" />
+      <circle cx="4.4" cy="9" r="0.9" fill="currentColor" />
+      <circle cx="7.6" cy="9" r="0.9" fill="currentColor" />
+    </>
+  ),
+  // A framed picture: a sun over hills.
+  image: (
+    <>
+      <rect x="1.5" y="2.25" width="9" height="7.5" rx="1.2" stroke="currentColor" strokeWidth="1.1" />
+      <circle cx="4.4" cy="4.9" r="0.85" fill="currentColor" />
+      <path d="M2 9.1 4.7 6.6l1.6 1.5 1.8-2 2.4 2.5" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  ),
+  // A hand with the thumb raised, on the 24-unit grid; the thumbs down is the
+  // same hand turned over.
+  "thumbs-up": (
+    <g transform="scale(0.5)">
+      <rect x="3" y="10" width="4" height="10" rx="1" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M7 10l3.5-6.5a1.8 1.8 0 0 1 3.3 1.2L13 9.5h5.6a2 2 0 0 1 2 2.4l-1.4 6.5a2 2 0 0 1-2 1.6H7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </g>
+  ),
+  "thumbs-down": (
+    <g transform="scale(0.5) rotate(180 12 12)">
+      <rect x="3" y="10" width="4" height="10" rx="1" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M7 10l3.5-6.5a1.8 1.8 0 0 1 3.3 1.2L13 9.5h5.6a2 2 0 0 1 2 2.4l-1.4 6.5a2 2 0 0 1-2 1.6H7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </g>
+  ),
+  // Ask Gloom: a four-point spark, outlined like the header's other glyphs.
+  ask: (
+    <path
+      d="M6 1.6C6.35 4.1 7.9 5.65 10.4 6 7.9 6.35 6.35 7.9 6 10.4 5.65 7.9 4.1 6.35 1.6 6 4.1 5.65 5.65 4.1 6 1.6Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinejoin="round"
+    />
+  ),
+  // A robot's head: an antenna, two eyes and a mouth.
+  bot: (
+    <>
+      <path d="M6 1.9v1.3" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <circle cx="6" cy="1.45" r=".8" fill="currentColor" />
+      <rect x="1.9" y="3.6" width="8.2" height="6.6" rx="1.7" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="4.5" cy="6.3" r=".95" fill="currentColor" />
+      <circle cx="7.5" cy="6.3" r=".95" fill="currentColor" />
+      <path d="M4.7 8.35h2.6" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+    </>
+  ),
+  // The Gloom mark: a solid core in a ring.
+  team: (
+    <>
+      <circle cx="6" cy="6" r="4.45" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="6" cy="6" r="2.25" fill="currentColor" />
+    </>
+  ),
+  // A cut gem: the table on top, the point below.
+  pro: (
+    <>
+      <path d="M3.6 2.4h4.8l2.3 2.9L6 10.4 1.3 5.3l2.3-2.9Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+      <path d="M1.5 5.3h9M4.8 2.5 4.3 5.3 6 10.1l1.7-4.8-.5-2.8" stroke="currentColor" strokeWidth=".9" strokeLinejoin="round" />
+    </>
+  ),
+  // A clock face at ten past: data that arrives late.
+  clock: (
+    <>
+      <circle cx="6" cy="6" r="4.4" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M6 3.4V6l1.9 1.2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  ),
+  // A pencil, for changing something in place.
+  edit: (
+    <>
+      <path d="M2.2 9.8l.5-2.3 5.4-5.4a1.1 1.1 0 0 1 1.6 0l.2.2a1.1 1.1 0 0 1 0 1.6L4.5 9.3l-2.3.5Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+      <path d="M7.3 2.9l1.8 1.8" stroke="currentColor" strokeWidth="1.1" />
+    </>
+  ),
+  // An envelope: a message written to you.
+  mail: (
+    <>
+      <rect x="1.5" y="2.75" width="9" height="6.5" rx="1.1" stroke="currentColor" strokeWidth="1.1" />
+      <path d="M2 3.4 6 6.5l4-3.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  ),
+  restore: (
+    <>
+      <rect x="2" y="4" width="6" height="6" rx="0.8" stroke="currentColor" strokeWidth="1.1" />
+      <path d="M4 4V2.8A.8.8 0 0 1 4.8 2H9.2a.8.8 0 0 1 .8.8v4.4a.8.8 0 0 1-.8.8H8" stroke="currentColor" strokeWidth="1.1" />
+    </>
+  ),
+};
+
+export function WebIcon({ name, size = 12, color, fullHeight }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 12 12"
+      width={size}
+      height={size}
+      fill="none"
+      aria-hidden="true"
+      data-gloom-icon={name}
+      // The viewBox keeps its size and sits in the middle of the taller box (preserveAspectRatio's default).
+      style={{ flex: "none", display: "block", color, ...(fullHeight ? { height: "100%" } : {}) }}
+    >
+      {ICONS[name]}
+    </svg>
+  );
+}
+
+function pressEventFrom(
+  target: HTMLElement,
+  pixelX: number,
+  pixelY: number,
+  event: { preventDefault(): void; stopPropagation(): void; button?: number },
+) {
+  return {
+    target,
+    pixelX,
+    pixelY,
+    button: event.button ?? 0,
+    preventDefault: () => event.preventDefault(),
+    stopPropagation: () => event.stopPropagation(),
+  };
+}
+
+export function WebIconButton({
+  icon,
+  label,
+  title,
+  shortcut,
+  hasPopup,
+  onPress,
+  pressed,
+  color,
+  disabled = false,
+  size = 12,
+  stopPropagation = true,
+}: IconButtonProps) {
+  return (
+    <button
+      type="button"
+      className="gloom-icon-button"
+      aria-label={label}
+      aria-pressed={pressed}
+      aria-keyshortcuts={ariaKeyShortcut(shortcut)}
+      aria-haspopup={hasPopup}
+      title={title ?? (shortcut ? `${label} (${formatShortcutForHost(shortcut, "platform")})` : label)}
+      disabled={disabled || !onPress}
+      data-gloom-interactive={onPress && !disabled ? "true" : undefined}
+      data-gloom-role="icon-button"
+      data-icon={icon}
+      style={color ? { color } : undefined}
+      onMouseDown={(event) => { if (stopPropagation) event.stopPropagation(); }}
+      onMouseUp={(event) => { if (stopPropagation) event.stopPropagation(); }}
+      onClick={(event) => {
+        if (stopPropagation) event.stopPropagation();
+        if (disabled) return;
+        const target = event.currentTarget;
+        onPress?.(pressEventFrom(target, event.clientX, event.clientY, event));
+        releasePointerFocus(target, event.detail);
+      }}
+      onKeyDown={(event) => {
+        // Same activation as the kit Button: the key is consumed here so a
+        // pane or table behind the button does not also act on it.
+        if (disabled || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        onPress?.(pressEventFrom(event.currentTarget, bounds.right, bounds.bottom, event));
+      }}
+    >
+      <WebIcon name={icon} size={size} />
+    </button>
+  );
+}

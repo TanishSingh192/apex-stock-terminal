@@ -1,0 +1,24 @@
+name: Apex web checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERCEL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun test src/renderers/vercel/upstream.test.ts src/renderers/cloudflare/worker.test.ts src/api-client/socket-health.test.ts src/api-client/research-telemetry.test.ts
+      - run: bun build scripts/vercel-middleware.ts --target=browser --outfile=middleware.js
+      - run: git diff --exit-code -- middleware.js
+      - run: bun run web:audit

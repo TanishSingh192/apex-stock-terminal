@@ -1,0 +1,741 @@
+import { logFailure } from "../../utils/log-failure";
+import { useEffect, type Dispatch } from "react";
+import { apiClient } from "../../api-client";
+import { getDockedPaneIds } from "../../layout/pane-manager";
+import type { PluginRegistry } from "../../plugins/registry";
+import type { AppAction, AppState } from "../../state/app/context";
+import {
+  findPaneInstance,
+  resolveFollowBindingInstance,
+  TICKER_RESEARCH_PANE_ID,
+} from "../../types/config";
+import type { DesktopDeepLinkBridge } from "../../types/desktop-deeplink";
+import type { DesktopWindowBridge } from "../../types/desktop-window";
+import { requestAccountManagementTab } from "../../plugins/builtin/account-management/navigation";
+import { openTeamPane } from "../../team/pane-request";
+import { hasOnlyDmUsernameArgs, parseDmUsernames } from "../../plugins/builtin/chat/channels";
+import { chatController } from "../../plugins/builtin/chat/controller";
+import { getShare, type ShareRecord } from "../../shares/api";
+import type { PaneShareData } from "../../shares/payload";
+import { openSharedPane, openShareLink, registerShareOpener } from "../../shares/open";
+import { openPaneShare } from "../../shares/pane";
+import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
+import { materializeMarketplaceLayout } from "../../shares/portable-layout";
+import { settleTypedListingKey } from "../../tickers/listing-venues";
+
+type CloudDeepLinkRoute = {
+  kind: "cloud-alerts" | "cloud-emails" | "cloud-roundup" | "cloud-success" | "cloud-teams";
+  week: string | null;
+};
+
+type CollectionDeepLinkKind = "collection" | "portfolio" | "watchlist";
+type AlertDeepLinkCondition = "above" | "below" | "crosses";
+type NewsDeepLinkKind = "breaking" | "feed" | "ticker" | "top";
+const SHARE_ID = /^[a-f0-9]{32}$/;
+
+export type DesktopDeepLinkAction =
+  | { type: "open-account-management"; route: CloudDeepLinkRoute; message: string }
+  | { type: "open-ticker"; symbol: string; tabId: string | null; message: string }
+  | { type: "open-function"; code: string; arg: string | null; message: string }
+  | { type: "open-collection"; kind: CollectionDeepLinkKind; collectionId: string; message: string }
+  | {
+      type: "create-alert";
+      values: { symbol: string; condition: AlertDeepLinkCondition; price: string };
+      message: string;
+    }
+  | { type: "open-chat-channel"; channelId: string; messageId: string | null; message: string }
+  | { type: "open-chat-dm"; participants: string; message: string }
+  | { type: "open-news"; kind: NewsDeepLinkKind; symbol: string | null; message: string }
+  | { type: "open-share"; id: string; message: string }
+  | { type: "open-layout"; id: string; message: string }
+  | { type: "unsupported"; message: string };
+
+interface ParsedGloomUrl {
+  url: URL;
+  host: string;
+  segments: string[];
+}
+
+interface DesktopDeepLinkHandlerOptions {
+  dispatch: Dispatch<AppAction>;
+  pluginRegistry: PluginRegistry;
+  stateRef: { current: AppState };
+}
+
+function weekSuffix(week: string | null): string {
+  return week ? ` for ${week}` : "";
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function splitPathSegments(pathname: string): string[] {
+  return pathname
+    .split("/")
+    .map((segment) => safeDecode(segment).trim())
+    .filter(Boolean);
+}
+
+function parseGloomUrl(rawUrl: string): ParsedGloomUrl | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch { /* Intentional ignore: Malformed external deep links are rejected as non-matches. */ return null; }
+  if (url.protocol !== "gloomberb:") return null;
+
+  const host = url.hostname.trim().toLowerCase();
+  if (host) {
+    return { url, host, segments: splitPathSegments(url.pathname) };
+  }
+
+  const segments = splitPathSegments(url.pathname);
+  const opaqueHost = segments.shift()?.toLowerCase();
+  return opaqueHost ? { url, host: opaqueHost, segments } : null;
+}
+
+function param(url: URL, ...names: string[]): string | null {
+  for (const name of names) {
+    const value = url.searchParams.get(name)?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+function normalizeSymbol(value: string | null | undefined): string | null {
+  const trimmed = value?.trim().replace(/^\$/, "");
+  if (!trimmed) return null;
+  return trimmed.toUpperCase();
+}
+
+function normalizeAlertCondition(value: string | null): AlertDeepLinkCondition | null {
+  switch (value?.trim().toLowerCase()) {
+    case ">":
+    case "above":
+    case "over":
+    case "gt":
+      return "above";
+    case "<":
+    case "below":
+    case "under":
+    case "lt":
+      return "below";
+    case "x":
+    case "cross":
+    case "crosses":
+      return "crosses";
+    default:
+      return null;
+  }
+}
+
+function normalizePrice(value: string | null): string | null {
+  const trimmed = value?.trim().replace(/^\$/, "");
+  if (!trimmed) return null;
+  const price = Number.parseFloat(trimmed);
+  return Number.isFinite(price) && price > 0 ? String(price) : null;
+}
+
+function tickerMessage(symbol: string, tabId: string | null): string {
+  return tabId ? `Opened ${symbol} ${tabId} tab.` : `Opened ${symbol}.`;
+}
+
+function collectionMessage(kind: CollectionDeepLinkKind, collectionId: string): string {
+  const label = kind === "watchlist" ? "watchlist" : kind === "portfolio" ? "portfolio" : "collection";
+  return `Opened ${label} ${collectionId}.`;
+}
+
+function parseCloudDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const route = parsed.segments[0] ?? "";
+  const week = parsed.url.searchParams.get("week");
+  if (route === "roundup") {
+    return {
+      type: "open-account-management",
+      route: { kind: "cloud-roundup", week },
+      message: `Opened weekly roundup settings${weekSuffix(week)}.`,
+    };
+  }
+  if (route === "alerts") {
+    return {
+      type: "open-account-management",
+      route: { kind: "cloud-alerts", week },
+      message: `Opened portfolio alert settings${weekSuffix(week)}.`,
+    };
+  }
+  if (route === "emails") {
+    return {
+      type: "open-account-management",
+      route: { kind: "cloud-emails", week: null },
+      message: "Opened email settings.",
+    };
+  }
+  if (route === "teams") {
+    return {
+      type: "open-account-management",
+      route: { kind: "cloud-teams", week: null },
+      message: "Opened teams.",
+    };
+  }
+  if (route === "success") {
+    return {
+      type: "open-account-management",
+      route: { kind: "cloud-success", week: null },
+      message: "Pro is active.",
+    };
+  }
+  return { type: "unsupported", message: "Unsupported Gloom cloud link." };
+}
+
+function parseTickerDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const symbol = normalizeSymbol(parsed.segments[0] ?? param(parsed.url, "symbol", "ticker"));
+  if (!symbol) return { type: "unsupported", message: "Ticker links need a symbol." };
+  const tabId = param(parsed.url, "tab");
+  return { type: "open-ticker", symbol, tabId, message: tickerMessage(symbol, tabId) };
+}
+
+/** A function's code as the command bar writes it: ERN, PERP, 13F. */
+const FUNCTION_CODE = /^[A-Z0-9]{1,12}$/;
+/**
+ * One argument, one word: a symbol or a comma list of them (NVDA, BRK.B,
+ * 7203:TSE, BTC-USD, ES=F, ^GSPC, AAPL,MSFT). No spaces, so a link names one
+ * function and what it opens on, never a second command.
+ */
+const FUNCTION_ARG = /^[A-Z0-9^$][A-Z0-9.:=/!^$,_-]{0,63}$/;
+
+function parseFunctionDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const code = (parsed.segments[0] ?? param(parsed.url, "code"))?.trim().toUpperCase() ?? "";
+  if (!FUNCTION_CODE.test(code)) return { type: "unsupported", message: "Function links need a function code." };
+  const rawArg = param(parsed.url, "arg");
+  const arg = rawArg ? rawArg.toUpperCase().replace(/^\$/, "") : null;
+  if (rawArg !== null && (!arg || !FUNCTION_ARG.test(arg))) {
+    return { type: "unsupported", message: "Function links take one symbol or a list of symbols." };
+  }
+  return { type: "open-function", code, arg, message: arg ? `Opened ${code} ${arg}.` : `Opened ${code}.` };
+}
+
+function parseCollectionDeepLink(parsed: ParsedGloomUrl, kind: CollectionDeepLinkKind): DesktopDeepLinkAction {
+  const collectionId = parsed.segments[0] ?? param(parsed.url, "id", "collection");
+  if (!collectionId) return { type: "unsupported", message: "Collection links need an id." };
+  return {
+    type: "open-collection",
+    kind,
+    collectionId,
+    message: collectionMessage(kind, collectionId),
+  };
+}
+
+function parseAlertDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  if ((parsed.segments[0] ?? "new") !== "new") {
+    return { type: "unsupported", message: "Unsupported Gloom alert link." };
+  }
+  const symbol = normalizeSymbol(param(parsed.url, "symbol", "ticker"));
+  const condition = normalizeAlertCondition(param(parsed.url, "condition", "side", "trigger"));
+  const price = normalizePrice(param(parsed.url, "price", "target"));
+  if (!symbol || !condition || !price) {
+    return { type: "unsupported", message: "Alert links need symbol, condition, and price." };
+  }
+  return {
+    type: "create-alert",
+    values: { symbol, condition, price },
+    message: `Created ${symbol} ${condition} ${price} alert.`,
+  };
+}
+
+function parseChatDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const route = parsed.segments[0] ?? "default";
+  if (route === "channel") {
+    const channelId = parsed.segments[1] ?? param(parsed.url, "id", "channel");
+    if (!channelId) return { type: "unsupported", message: "Chat channel links need a channel id." };
+    const messageId = param(parsed.url, "message", "messageId");
+    return { type: "open-chat-channel", channelId, messageId, message: `Opened chat ${channelId}.` };
+  }
+  if (route === "dm") {
+    const participants = param(parsed.url, "users", "participants", "user") ?? parsed.segments.slice(1).join(",");
+    if (!participants.trim()) return { type: "unsupported", message: "DM links need at least one username." };
+    return { type: "open-chat-dm", participants, message: "Opened DM." };
+  }
+  if (route === "default") {
+    return { type: "open-chat-channel", channelId: "", messageId: null, message: "Opened chat." };
+  }
+  return { type: "open-chat-channel", channelId: route, messageId: null, message: `Opened chat ${route}.` };
+}
+
+function parseNewsDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const ticker = normalizeSymbol(param(parsed.url, "ticker", "symbol") ?? (parsed.segments[0] === "ticker" ? parsed.segments[1] : null));
+  if (ticker) return { type: "open-news", kind: "ticker", symbol: ticker, message: `Opened ${ticker} news.` };
+
+  const route = parsed.segments[0] ?? "top";
+  if (route === "breaking") {
+    return { type: "open-news", kind: "breaking", symbol: null, message: "Opened breaking news." };
+  }
+  if (route === "feed") {
+    return { type: "open-news", kind: "feed", symbol: null, message: "Opened news feed." };
+  }
+  if (route === "top") {
+    return { type: "open-news", kind: "top", symbol: null, message: "Opened top news." };
+  }
+  return { type: "unsupported", message: "Unsupported Gloom news link." };
+}
+
+function parseLayoutDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const id = parsed.segments[0] ?? param(parsed.url, "id", "layout");
+  return id && SHARE_ID.test(id)
+    ? { type: "open-layout", id, message: "Added shared layout." }
+    : { type: "unsupported", message: "Layout links need a valid id." };
+}
+
+function parseShareDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const id = parsed.segments[0] ?? param(parsed.url, "id", "share");
+  return id && SHARE_ID.test(id)
+    ? { type: "open-share", id, message: "Opened shared pane." }
+    : { type: "unsupported", message: "Share links need a valid id." };
+}
+
+export function resolveDesktopDeepLinkAction(rawUrl: string): DesktopDeepLinkAction {
+  const parsed = parseGloomUrl(rawUrl);
+  if (!parsed) return { type: "unsupported", message: "Unsupported Gloom link." };
+
+  switch (parsed.host) {
+    case "cloud":
+      return parseCloudDeepLink(parsed);
+    case "ticker":
+      return parseTickerDeepLink(parsed);
+    case "fn":
+      return parseFunctionDeepLink(parsed);
+    case "portfolio":
+      return parseCollectionDeepLink(parsed, "portfolio");
+    case "watchlist":
+      return parseCollectionDeepLink(parsed, "watchlist");
+    case "collection":
+      return parseCollectionDeepLink(parsed, "collection");
+    case "alert":
+      return parseAlertDeepLink(parsed);
+    case "chat":
+      return parseChatDeepLink(parsed);
+    case "news":
+      return parseNewsDeepLink(parsed);
+    case "share":
+      return parseShareDeepLink(parsed);
+    case "layout":
+      return parseLayoutDeepLink(parsed);
+    default:
+      return { type: "unsupported", message: "Unsupported Gloom link." };
+  }
+}
+
+function notifyError(pluginRegistry: PluginRegistry, body: string): void {
+  pluginRegistry.notify({ body, type: "error" });
+}
+
+function notifySuccess(pluginRegistry: PluginRegistry, body: string): void {
+  pluginRegistry.notify({ body, type: "success" });
+}
+
+/**
+ * A link that changes something (creates an alert, adds a layout, starts a
+ * conversation) waits for a click on a toast that says what it asks: any web
+ * page can open a gloomberb:// link, and a browser told to always allow them
+ * asks nothing more. Links that only show something, a shared pane among
+ * them, run at once.
+ */
+function askBeforeRunning(pluginRegistry: PluginRegistry, body: string, label: string, run: () => void): void {
+  pluginRegistry.notify({
+    title: "Gloom link",
+    body,
+    type: "info",
+    persistent: true,
+    action: { label, onClick: run },
+  });
+}
+
+function requirePane(pluginRegistry: PluginRegistry, paneId: string, unavailableMessage: string): boolean {
+  if (pluginRegistry.panes.has(paneId)) return true;
+  notifyError(pluginRegistry, unavailableMessage);
+  return false;
+}
+
+function resolveCollectionRecord(
+  state: AppState,
+  action: Extract<DesktopDeepLinkAction, { type: "open-collection" }>,
+): { name?: string } | null {
+  const portfolio = state.config.portfolios.find((entry) => entry.id === action.collectionId);
+  const watchlist = state.config.watchlists.find((entry) => entry.id === action.collectionId);
+  if (action.kind === "portfolio") return portfolio ?? null;
+  if (action.kind === "watchlist") return watchlist ?? null;
+  return portfolio ?? watchlist ?? null;
+}
+
+function visiblePaneIds(state: AppState): Set<string> {
+  return new Set([
+    ...getDockedPaneIds(state.config.layout),
+    ...state.config.layout.floating.map((entry) => entry.instanceId),
+    ...state.config.layout.detached.map((entry) => entry.instanceId),
+  ]);
+}
+
+function isVisiblePane(state: AppState, paneId: string | null | undefined): paneId is string {
+  return !!paneId && visiblePaneIds(state).has(paneId);
+}
+
+function resolveVisibleCollectionPaneId(state: AppState): string | null {
+  const followedPaneId = resolveFollowBindingInstance(
+    state.config.layout,
+    state.focusedPaneId,
+    (instance) => instance.paneId === "portfolio-list",
+  )?.instanceId;
+  if (isVisiblePane(state, followedPaneId)) return followedPaneId;
+
+  const focusedPane = state.focusedPaneId ? findPaneInstance(state.config.layout, state.focusedPaneId) : null;
+  if (focusedPane?.paneId === "portfolio-list" && isVisiblePane(state, focusedPane.instanceId)) {
+    return focusedPane.instanceId;
+  }
+
+  const visibleIds = visiblePaneIds(state);
+  return state.config.layout.instances.find((instance) => (
+    instance.paneId === "portfolio-list" && visibleIds.has(instance.instanceId)
+  ))?.instanceId ?? null;
+}
+
+function applyCollectionSelection(
+  collectionId: string,
+  { dispatch, stateRef }: Pick<DesktopDeepLinkHandlerOptions, "dispatch" | "stateRef">,
+): boolean {
+  const targetPaneId = resolveVisibleCollectionPaneId(stateRef.current);
+  if (!targetPaneId) return false;
+  dispatch({ type: "UPDATE_PANE_STATE", paneId: targetPaneId, patch: { collectionId } });
+  dispatch({ type: "FOCUS_PANE", paneId: targetPaneId });
+  return true;
+}
+
+function retryCollectionSelection(
+  collectionId: string,
+  options: Pick<DesktopDeepLinkHandlerOptions, "dispatch" | "stateRef">,
+): void {
+  globalThis.setTimeout(() => {
+    applyCollectionSelection(collectionId, options);
+  }, 50);
+}
+
+function handleOpenTicker(
+  action: Extract<DesktopDeepLinkAction, { type: "open-ticker" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  if (!requirePane(pluginRegistry, TICKER_RESEARCH_PANE_ID, "Ticker research is unavailable.")) return;
+  const unavailableTab = action.tabId && !pluginRegistry.getTickerResearchTabPluginId(action.tabId);
+  const tabId = unavailableTab ? "overview" : action.tabId;
+
+  pluginRegistry.pinTicker(action.symbol, {
+    floating: true,
+    paneType: TICKER_RESEARCH_PANE_ID,
+    tabId: tabId ?? undefined,
+  });
+  if (unavailableTab) {
+    pluginRegistry.notify({ body: `Ticker tab "${action.tabId}" is unavailable. Opening ${action.symbol} overview.`, type: "info" });
+  } else {
+    notifySuccess(pluginRegistry, action.message);
+  }
+}
+
+/**
+ * A function link opens the pane its code names, as typing the code and its
+ * argument in the command bar would. Only codes that open a pane run; a code
+ * for a command (settings, sign out) is refused, so a link only adds a view.
+ */
+function handleOpenFunction(
+  action: Extract<DesktopDeepLinkAction, { type: "open-function" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  const opensPane = [...pluginRegistry.paneTemplates.values()].some(({ shortcut }) => (
+    shortcut?.prefix.toUpperCase() === action.code
+    || shortcut?.aliases?.some((alias) => alias.toUpperCase() === action.code)
+  ));
+  if (!opensPane) {
+    notifyError(pluginRegistry, `${action.code} is not a function this version of Gloom opens from a link.`);
+    return;
+  }
+  pluginRegistry.runCommandBarQuery(action.arg ? `${action.code} ${action.arg}` : action.code);
+}
+
+function handleOpenCollection(
+  action: Extract<DesktopDeepLinkAction, { type: "open-collection" }>,
+  options: DesktopDeepLinkHandlerOptions,
+): void {
+  const collection = resolveCollectionRecord(options.stateRef.current, action);
+  if (!collection) {
+    notifyError(options.pluginRegistry, `Collection "${action.collectionId}" is unavailable.`);
+    return;
+  }
+  if (!requirePane(options.pluginRegistry, "portfolio-list", "Collections are unavailable.")) return;
+
+  options.pluginRegistry.showPane("portfolio-list");
+  if (!applyCollectionSelection(action.collectionId, options)) {
+    retryCollectionSelection(action.collectionId, options);
+  }
+  notifySuccess(options.pluginRegistry, collection.name ? `Opened ${collection.name}.` : action.message);
+}
+
+function handleCreateAlert(
+  action: Extract<DesktopDeepLinkAction, { type: "create-alert" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  const command = pluginRegistry.commands.get("set-alert");
+  if (!command) {
+    notifyError(pluginRegistry, "Alerts are unavailable.");
+    return;
+  }
+  void Promise.resolve(command.execute(action.values)).catch((error) => {
+    notifyError(pluginRegistry, error instanceof Error ? error.message : "Failed to create alert.");
+  });
+}
+
+function handleOpenChatChannel(
+  action: Extract<DesktopDeepLinkAction, { type: "open-chat-channel" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  if (!pluginRegistry.paneTemplates.has("new-chat-pane")) {
+    notifyError(pluginRegistry, "Chat is unavailable.");
+    return;
+  }
+  const options = action.channelId
+    ? {
+        arg: action.channelId,
+        ...(action.messageId ? { values: { messageId: action.messageId } } : {}),
+      }
+    : undefined;
+  void pluginRegistry.createPaneFromTemplateAsync("new-chat-pane", options).then(() => {
+    notifySuccess(pluginRegistry, action.message);
+  }).catch((error) => {
+    notifyError(pluginRegistry, error instanceof Error ? error.message : "Failed to open chat.");
+  });
+}
+
+function handleOpenChatDm(
+  action: Extract<DesktopDeepLinkAction, { type: "open-chat-dm" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  const command = pluginRegistry.commands.get("direct-message");
+  if (!command) {
+    notifyError(pluginRegistry, "Direct messages are unavailable.");
+    return;
+  }
+  void Promise.resolve(command.execute({ participants: action.participants })).then(() => {
+    notifySuccess(pluginRegistry, action.message);
+  }).catch((error) => {
+    notifyError(pluginRegistry, error instanceof Error ? error.message : "Failed to open DM.");
+  });
+}
+
+function handleOpenNews(
+  action: Extract<DesktopDeepLinkAction, { type: "open-news" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  if (action.kind === "ticker") {
+    if (!action.symbol || !pluginRegistry.paneTemplates.has("ticker-news-pane")) {
+      notifyError(pluginRegistry, "Ticker news is unavailable.");
+      return;
+    }
+    // A link's 7203:TSE is the venue its symbol trades on; ticker and alert links settle it where they open.
+    void settleTypedListingKey(action.symbol, { store: pluginRegistry.tickerRepository, dataProvider: pluginRegistry.marketData })
+      .then((symbol) => pluginRegistry.createPaneFromTemplateAsync("ticker-news-pane", { symbol: symbol.toUpperCase() }))
+      .then(() => {
+        notifySuccess(pluginRegistry, action.message);
+      })
+      .catch((error) => {
+        notifyError(pluginRegistry, error instanceof Error ? error.message : "Failed to open ticker news.");
+      });
+    return;
+  }
+
+  const paneId = action.kind === "breaking"
+    ? "news-breaking"
+    : action.kind === "feed"
+      ? "news-feed"
+      : "news-top";
+  if (!requirePane(pluginRegistry, paneId, "News is unavailable.")) return;
+  pluginRegistry.showPane(paneId);
+  notifySuccess(pluginRegistry, action.message);
+}
+
+async function handleOpenLayout(
+  action: Extract<DesktopDeepLinkAction, { type: "open-layout" }>,
+  options: DesktopDeepLinkHandlerOptions,
+): Promise<void> {
+  const entry = await apiClient.getMarketplaceLayout(action.id);
+  if (!entry) throw new Error("This shared layout is unavailable.");
+  const installed = materializeMarketplaceLayout(entry);
+  options.dispatch({
+    type: "INSTALL_LAYOUT_COPY",
+    name: entry.name,
+    layout: installed.layout,
+    paneState: installed.paneState,
+  });
+  notifySuccess(options.pluginRegistry, `Layout "${entry.name}" added.`);
+}
+
+/**
+ * Opens a pane share in this app: the web app's `?share=` hand-off, a
+ * gloomberb://share link and a share link in chat all come through here.
+ * With `fallback`, a share this app cannot read or that holds a snapshot
+ * goes there (its web page) instead of to an error.
+ */
+async function openShareInApp(
+  id: string,
+  pluginRegistry: PluginRegistry,
+  options: { retry: () => void; fallback?: () => void },
+): Promise<void> {
+  let share: ShareRecord | null;
+  try {
+    share = await getShare(id, fetch, { trackView: false });
+  } catch (error) {
+    if (options.fallback) options.fallback();
+    else notifyError(pluginRegistry, error instanceof Error ? error.message : "Could not open shared pane.");
+    return;
+  }
+  if (!share) {
+    notifyError(pluginRegistry, "This share is unavailable or has expired.");
+    return;
+  }
+  if (share.kind !== "pane") {
+    if (options.fallback) options.fallback();
+    else notifyError(pluginRegistry, "This link contains a snapshot, not a live pane.");
+    return;
+  }
+  await openSharedPaneInApp(share.data, pluginRegistry, { retry: options.retry, opened: "Opened shared pane." });
+}
+
+/**
+ * Opens a pane share's pane: one read from a link, or one held here (an Ask
+ * Gloom source). `opened` is the toast that says it opened, for a link the
+ * person cannot see land; a pane opened from where they are needs none.
+ */
+async function openSharedPaneInApp(
+  data: PaneShareData,
+  pluginRegistry: PluginRegistry,
+  options: { retry: () => void; opened?: string },
+): Promise<void> {
+  try {
+    await openPaneShare(pluginRegistry, data);
+    if (options.opened) notifySuccess(pluginRegistry, options.opened);
+  } catch (error) {
+    if (error instanceof PluginOffError) {
+      notifyPluginOff(pluginRegistry, error, options.retry);
+      return;
+    }
+    notifyError(pluginRegistry, error instanceof Error ? error.message : "Could not open shared pane.");
+  }
+}
+
+export function handleDesktopDeepLink(rawUrl: string, options: DesktopDeepLinkHandlerOptions): void {
+  const action = resolveDesktopDeepLinkAction(rawUrl);
+  if (action.type === "unsupported") {
+    notifyError(options.pluginRegistry, action.message);
+    return;
+  }
+
+  switch (action.type) {
+    case "open-account-management":
+      if (!requirePane(options.pluginRegistry, "account-management", "Account management is unavailable.")) return;
+      if (action.route.kind === "cloud-emails") requestAccountManagementTab("emails");
+      if (action.route.kind === "cloud-teams") {
+        // Teams have their own pane; the web hand-off lands there.
+        openTeamPane((templateId, opts) => options.pluginRegistry.createPaneFromTemplate(templateId, opts), {});
+        notifySuccess(options.pluginRegistry, action.message);
+        return;
+      }
+      if (action.route.kind === "cloud-success") {
+        requestAccountManagementTab("pro");
+        // Checkout just completed: re-read the session so the new plan shows at once.
+        void chatController.refreshSession().catch(logFailure("app.runtime.desktop-deeplink", "Checkout session refresh failed"));
+      }
+      options.pluginRegistry.showPane("account-management");
+      notifySuccess(options.pluginRegistry, action.message);
+      return;
+    case "open-ticker":
+      handleOpenTicker(action, options.pluginRegistry);
+      return;
+    case "open-function":
+      // Like a ticker link, it only opens a view, so it runs at once.
+      handleOpenFunction(action, options.pluginRegistry);
+      return;
+    case "open-collection":
+      handleOpenCollection(action, options);
+      return;
+    case "create-alert": {
+      const { symbol, condition, price } = action.values;
+      askBeforeRunning(options.pluginRegistry, `Create an alert for ${symbol} ${condition} ${price}?`, "Create alert", () => {
+        handleCreateAlert(action, options.pluginRegistry);
+      });
+      return;
+    }
+    case "open-chat-channel":
+      handleOpenChatChannel(action, options.pluginRegistry);
+      return;
+    case "open-chat-dm": {
+      // The toast names only what reads as usernames, never the link's own words.
+      const names = parseDmUsernames(action.participants);
+      if (names.length === 0 || !hasOnlyDmUsernameArgs(action.participants)) {
+        notifyError(options.pluginRegistry, "DM links need usernames.");
+        return;
+      }
+      askBeforeRunning(options.pluginRegistry, `Open a conversation with ${names.map((name) => `@${name}`).join(", ")}?`, "Open", () => {
+        handleOpenChatDm(action, options.pluginRegistry);
+      });
+      return;
+    }
+    case "open-news":
+      handleOpenNews(action, options.pluginRegistry);
+      return;
+    case "open-share":
+      // Opening a shared pane only adds a view of what the person just
+      // clicked, so it runs at once.
+      void openShareInApp(action.id, options.pluginRegistry, { retry: () => handleDesktopDeepLink(rawUrl, options) });
+      return;
+    case "open-layout":
+      askBeforeRunning(options.pluginRegistry, "Add the shared layout this link points to?", "Add layout", () => {
+        void handleOpenLayout(action, options).catch((error) => {
+          notifyError(options.pluginRegistry, error instanceof Error ? error.message : "Could not open shared layout.");
+        });
+      });
+      return;
+  }
+}
+
+export function useDesktopDeepLinkRuntime({
+  desktopDeepLinkBridge,
+  desktopWindowKind,
+  dispatch,
+  initialized,
+  pluginRegistry,
+  stateRef,
+}: {
+  desktopDeepLinkBridge?: DesktopDeepLinkBridge;
+  desktopWindowKind?: DesktopWindowBridge["kind"];
+  dispatch: Dispatch<AppAction>;
+  initialized: boolean;
+  pluginRegistry: PluginRegistry;
+  stateRef: { current: AppState };
+}) {
+  // Share links opened inside the app (chat's share chips) take the same path, in every
+  // renderer, and so do the pane shares an Ask Gloom answer holds for its sources.
+  useEffect(() => {
+    if (!initialized) return;
+    return registerShareOpener(
+      (id, { fallback }) => openShareInApp(id, pluginRegistry, {
+        fallback,
+        retry: () => openShareLink(id, fallback),
+      }),
+      (share) => openSharedPaneInApp(share, pluginRegistry, { retry: () => openSharedPane(share) }),
+    );
+  }, [initialized, pluginRegistry]);
+
+  useEffect(() => {
+    if (!initialized || desktopWindowKind === "detached" || !desktopDeepLinkBridge) return;
+    return desktopDeepLinkBridge.subscribe((deeplink) => {
+      handleDesktopDeepLink(deeplink.url, { dispatch, pluginRegistry, stateRef });
+    });
+  }, [desktopDeepLinkBridge, desktopWindowKind, dispatch, initialized, pluginRegistry, stateRef]);
+}

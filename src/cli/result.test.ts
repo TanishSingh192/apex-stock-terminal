@@ -1,0 +1,397 @@
+import { describe, expect, test } from "bun:test";
+import { printCliResult, serializeCliError, serializeCliResult, type CliResultRenderOptions } from "./result";
+import { printCliError } from "./errors";
+import { captureConsole } from "../test-support/console";
+import { setCliColorEnabledOverride, setCliPlainOverride, setCliWidthOverride } from "../utils/cli-output";
+import type { CliGlobalOptions } from "./options";
+import type { ReportFreshness } from "./pane-functions/freshness";
+
+const baseOptions: CliGlobalOptions = {
+  format: "text",
+  quiet: false,
+  color: null,
+  plain: null,
+  refresh: false,
+  dryRun: false,
+  yes: false,
+};
+
+describe("serializeCliResult", () => {
+  test("--limit keeps the first rows and says when they are a series' oldest; --tail keeps the newest in printed order", () => {
+    const ascending = [{ date: "2026-10-05" }, { date: "2026-10-06" }, { date: "2026-10-07" }, { date: "2026-10-08" }];
+    const descending = [...ascending].reverse();
+    const plain = (text: string) => text.replace(/\u001b\[[0-9;]*m/g, "");
+    const dates = (data: unknown[], options: Partial<CliGlobalOptions>, render: CliResultRenderOptions = { dateKey: "date" }) => {
+      const envelope = JSON.parse(serializeCliResult({ data }, { ...baseOptions, format: "json", ...options }, render));
+      return { dates: envelope.data.map((row: { date: string }) => row.date), rows: envelope.metadata?.rows };
+    };
+
+    const note = "showing the oldest 2 of 4 rows; --tail 2 for the latest";
+    expect(dates(ascending, { limit: 2 })).toEqual({
+      dates: ["2026-10-05", "2026-10-06"], rows: { shown: 2, total: 4, kept: "oldest", note },
+    });
+    expect(plain(serializeCliResult({ data: ascending }, { ...baseOptions, limit: 2 }, { dateKey: "date" })).split("\n").at(-1)).toBe(note);
+    expect(dates(ascending, { tail: 2 })).toEqual({ dates: ["2026-10-07", "2026-10-08"], rows: { shown: 2, total: 4, kept: "newest" } });
+    // Newest first, the newest are the first rows: --tail and --limit agree, and nothing needs saying.
+    expect(dates(descending, { tail: 2 })).toEqual({ dates: ["2026-10-08", "2026-10-07"], rows: { shown: 2, total: 4, kept: "newest" } });
+    expect(dates(descending, { limit: 2 }).dates).toEqual(["2026-10-08", "2026-10-07"]);
+    expect(serializeCliResult({ data: descending }, { ...baseOptions, limit: 2 }, { dateKey: "date" })).not.toContain("--tail");
+    // A list with no dates: the last rows, and a command's own default cut.
+    expect(dates(ascending, { tail: 1 }, {}).dates).toEqual(["2026-10-08"]);
+    expect(dates(ascending, {}, { dateKey: "date", defaultLimit: 3 }).rows).toMatchObject({ shown: 3, total: 4, kept: "oldest" });
+    expect(dates(ascending, {}).rows).toBeUndefined();
+  });
+
+  test("includes display column metadata in JSON envelopes", () => {
+    const output = serializeCliResult(
+      { data: [{ quote: { symbol: "AAPL", price: 123 } }] },
+      { ...baseOptions, format: "json" },
+      {
+        rows: (data) => data.map((row) => row.quote),
+        columns: [
+          { key: "symbol", header: "Symbol" },
+          { key: "price", header: "Last", align: "right" },
+        ],
+      },
+    );
+    expect(JSON.parse(output)).toEqual({
+      ok: true,
+      data: [{ quote: { symbol: "AAPL", price: 123 } }],
+      columns: [
+        { key: "symbol", header: "Symbol" },
+        { key: "price", header: "Last", align: "right" },
+      ],
+    });
+  });
+
+  test("renders CSV with provided column order", () => {
+    const output = serializeCliResult(
+      { data: [{ symbol: "AAPL", name: "Apple, Inc." }] },
+      { ...baseOptions, format: "csv" },
+      {
+        columns: [
+          { key: "symbol", header: "Symbol" },
+          { key: "name", header: "Name" },
+        ],
+      },
+    );
+    expect(output).toBe('Symbol,Name\nAAPL,"Apple, Inc."');
+  });
+
+  test("prints one record as aligned label/value lines while CSV and JSON keep raw keys and every real digit, float noise dropped", () => {
+    const data = { dataDir: "/tmp/gloom", changePercent: 0.9499999999999886, enabled: true, tags: [] };
+
+    const text = serializeCliResult({ data }, baseOptions);
+    expect(text.split("\n")).toEqual([
+      "Data Dir        /tmp/gloom",
+      "Change Percent  0.95",
+      "Enabled         yes",
+      "Tags            none",
+    ]);
+    expect(serializeCliResult({ data }, { ...baseOptions, format: "csv" }))
+      .toBe("dataDir,changePercent,enabled,tags\n/tmp/gloom,0.95,true,[]");
+    // A change from a subtraction loses its noise; a sub-penny price, an FX rate and a coin holding keep every digit.
+    const figures = { change: 342.37 - 344.17, price: 0.00001234, rate: 1.083456, holding: 12345.67890123, cap: 4974636099999.9995 };
+    expect(JSON.parse(serializeCliResult({ data: figures }, { ...baseOptions, format: "json" })).data)
+      .toEqual({ change: -1.8, price: 0.00001234, rate: 1.083456, holding: 12345.67890123, cap: 4974636100000 });
+  });
+
+  test("text-only columns reshape the table but leave CSV on the data keys", () => {
+    const data = [{ left: "AAPL", right: "MSFT", correlation: 0.1234, empty: "" }];
+    const options = {
+      textColumns: [
+        { key: "left", header: "Symbols", value: (row: Record<string, unknown>) => `${row.left} / ${row.right}` },
+        { key: "correlation", header: "Correlation" },
+        { key: "empty", header: "Empty" },
+      ],
+    };
+
+    expect(serializeCliResult({ data }, baseOptions, options).split("\n")[0]).toBe("Symbols      Correlation");
+    expect(serializeCliResult({ data }, { ...baseOptions, format: "csv" }, options))
+      .toBe("left,right,correlation,empty\nAAPL,MSFT,0.1234,");
+  });
+
+  test("shows an empty-state message instead of an empty table", () => {
+    expect(serializeCliResult({ data: [] }, baseOptions, { empty: "No alerts." })).toBe("No alerts.");
+  });
+
+  // A spreadsheet reads every cell of a figure column as a number, and every row says why it has none.
+  test("exports write a figure that is no number empty, with the reason in a status column that is there with rows or without", () => {
+    const columns = [{ key: "symbol", header: "Symbol" }, { key: "last", header: "Last" }, { key: "move", header: "Chg%" }];
+    const render: CliResultRenderOptions = { columns, exportStatus: (row) => typeof row.error === "string" ? row.error : null };
+    const rows = [
+      { symbol: "AAPL", last: 349.8, move: 0.45 },
+      { symbol: "STALE", last: 12, move: Number.NaN },
+      { symbol: "ZZZZQQ", last: null, move: null, error: "Not a ticker: ZZZZQQ." },
+    ];
+    const csv = serializeCliResult({ data: rows }, { ...baseOptions, format: "csv" }, render);
+    expect(csv).toBe("Symbol,Last,Chg%,status\nAAPL,349.8,0.45,\nSTALE,12,,Chg%: not available\nZZZZQQ,,,Not a ticker: ZZZZQQ.");
+    expect(serializeCliResult({ data: [] }, { ...baseOptions, format: "csv" }, render)).toBe("Symbol,Last,Chg%,status");
+    const ndjson = serializeCliResult({ data: rows }, { ...baseOptions, format: "ndjson" }, render).split("\n").map((line) => JSON.parse(line));
+    expect(ndjson.map((row) => [row.move, row.status])).toEqual([[0.45, null], [null, "move: not available"], [null, "Not a ticker: ZZZZQQ."]]);
+  });
+
+  test("an infinity is written empty like NaN, and a table with a Status column of its own gets value_status", () => {
+    const render: CliResultRenderOptions = {
+      columns: [{ key: "symbol", header: "Symbol" }, { key: "status", header: "Status" }, { key: "ratio", header: "Ratio" }],
+      exportStatus: () => null,
+    };
+    const rows = [{ symbol: "A", status: "open", ratio: 1.5 }, { symbol: "B", status: "closed", ratio: Infinity }, { symbol: "C", status: "open", ratio: -Infinity }];
+    expect(serializeCliResult({ data: rows }, { ...baseOptions, format: "csv" }, render))
+      .toBe("Symbol,Status,Ratio,value_status\nA,open,1.5,\nB,closed,,Ratio: not available\nC,open,,Ratio: not available");
+    const ndjson = serializeCliResult({ data: rows }, { ...baseOptions, format: "ndjson" }, render).split("\n").map((line) => JSON.parse(line));
+    // The row's own status stays beside the reason, which is under the other name.
+    expect(ndjson.map((row) => [row.status, row.ratio, row.value_status])).toEqual([["open", 1.5, null], ["closed", null, "ratio: not available"], ["open", null, "ratio: not available"]]);
+  });
+
+  test("--tail and --limit keep each series' own rows when rows of several symbols share one table", () => {
+    const bars = ["AAPL", "MSFT"].flatMap((symbol) => ["2026-10-21", "2026-10-22", "2026-10-23"].map((date) => ({ symbol, date })));
+    const kept = (options: Partial<CliGlobalOptions>) => JSON.parse(serializeCliResult({ data: bars }, { ...baseOptions, format: "json", ...options },
+      { dateKey: "date", seriesKey: "symbol" }));
+    expect(kept({ tail: 1 }).data).toEqual([{ symbol: "AAPL", date: "2026-10-23" }, { symbol: "MSFT", date: "2026-10-23" }]);
+    expect(kept({ limit: 1 })).toMatchObject({
+      data: [{ symbol: "AAPL", date: "2026-10-21" }, { symbol: "MSFT", date: "2026-10-21" }],
+      metadata: { rows: { shown: 2, total: 6, kept: "oldest", note: "showing the oldest 1 row of each symbol; --tail 1 for the latest" } },
+    });
+  });
+
+  test("renders NDJSON rows", () => {
+    const output = serializeCliResult(
+      { data: [{ symbol: "AAPL" }, { symbol: "MSFT" }] },
+      { ...baseOptions, format: "ndjson" },
+    );
+    expect(output).toBe('{"symbol":"AAPL"}\n{"symbol":"MSFT"}');
+  });
+
+  test("ends text with the source line, CSV with the export footer, cites it in JSON and keeps NDJSON to rows", () => {
+    const freshness: ReportFreshness = {
+      source: "Gloom Cloud", asOf: "2026-10-09T13:22:00.000Z", status: "delayed", delayMinutes: 15,
+      retrievedAt: "2026-10-09T13:30:00.000Z",
+    };
+    const result = { data: [{ symbol: "AAPL" }], metadata: { range: "1Y" }, freshness };
+    const line = "Source: Gloom Cloud · Fri 9 Oct 2026 13:22 UTC · 15 min delayed";
+    const plain = (text: string) => text.replace(/\u001b\[[0-9;]*m/g, "");
+    expect(plain(serializeCliResult(result, baseOptions)).split("\n").slice(-2)).toEqual(["", line]);
+    expect(plain(serializeCliResult(result, baseOptions, { text: () => "Report" }))).toBe(`Report\n\n${line}`);
+    const source = {
+      name: "Gloom Cloud", publisher: null, observationDate: "2026-10-09T13:22:00.000Z", publicationTime: null,
+      retrievalTime: "2026-10-09T13:30:00.000Z",
+    };
+    const json = JSON.parse(serializeCliResult(result, { ...baseOptions, format: "json" }));
+    expect(json.metadata).toEqual({ range: "1Y", freshness });
+    expect(json.source).toEqual(source);
+    // Every row ends with what it is: the symbol it carries, and the source and as-of the footer cites.
+    expect(serializeCliResult(result, { ...baseOptions, format: "csv" }).split("\n")).toEqual([
+      "symbol,symbol_or_series,currency_or_unit,interval,source,as_of",
+      "AAPL,AAPL,,,Gloom Cloud,2026-10-09T13:22:00.000Z",
+      "", `# ${line}`, "# Publisher: not published", "# Observation date: 2026-10-09T13:22:00.000Z",
+      "# Publication time: not published", "# Retrieval time: 2026-10-09T13:30:00.000Z",
+    ]);
+    expect(JSON.parse(serializeCliResult(result, { ...baseOptions, format: "ndjson" }))).toEqual({
+      symbol: "AAPL", symbol_or_series: "AAPL", currency_or_unit: null, interval: null, source: "Gloom Cloud", as_of: "2026-10-09T13:22:00.000Z",
+    });
+    // A command's own identity wins over the row's fields, and its notes close the CSV.
+    const declared = serializeCliResult(result, { ...baseOptions, format: "csv" }, {
+      exportIdentity: { symbolOrSeries: "DEXSFUS", currencyOrUnit: "bp", interval: "daily" },
+      exportNotes: ["Series begins 1980-01-02."],
+    }).split("\n");
+    expect(declared[1]).toBe("AAPL,DEXSFUS,bp,daily,Gloom Cloud,2026-10-09T13:22:00.000Z");
+    expect(declared.at(-1)).toBe("# note: Series begins 1980-01-02.");
+    // Data that states its own freshness (an `fn` report) is cited in JSON without a second copy in metadata or text.
+    const cited = { data: { rows: [] }, exportFreshness: freshness };
+    expect(JSON.parse(serializeCliResult(cited, { ...baseOptions, format: "json" }))).toEqual({ ok: true, data: { rows: [] }, source });
+    expect(serializeCliResult(cited, baseOptions, { text: () => "Report" })).toBe("Report");
+  });
+});
+
+test("plain text keeps every column with a dash in the empty cells, and JSON, CSV and NDJSON are the same bytes plain or not", () => {
+  // Two econ queries: the second fills no Forecast, which a decorated table leaves out.
+  const columns = [
+    { key: "event", header: "Event" },
+    { key: "forecast", header: "Forecast" },
+    { key: "prior", header: "Prior" },
+  ];
+  const rows = [{ event: "Banxico Interest Rate Decision", forecast: null, prior: "6.50%" }];
+  const render = { columns, rows: (data: typeof rows) => data };
+  const result = { data: rows, freshness: { source: "Gloom Cloud", asOf: "2026-10-23T15:48:00Z", status: "not-a-feed", basis: "calendar" } as ReportFreshness };
+  const print = (plain: boolean, format: CliGlobalOptions["format"]) => {
+    setCliPlainOverride(plain);
+    setCliColorEnabledOverride(false);
+    try {
+      return serializeCliResult(result, { ...baseOptions, format }, render);
+    } finally {
+      setCliPlainOverride(null);
+      setCliColorEnabledOverride(null);
+    }
+  };
+  expect(print(false, "text").split("\n").slice(0, 3)).toEqual([
+    "Event                           Prior",
+    "──────────────────────────────  ─────",
+    "Banxico Interest Rate Decision  6.50%",
+  ]);
+  expect(print(true, "text").split("\n").slice(0, 2)).toEqual([
+    "Event                           Forecast  Prior",
+    "Banxico Interest Rate Decision  —         6.50%",
+  ]);
+  for (const format of ["json", "csv", "ndjson"] as const) expect(print(true, format)).toBe(print(false, format));
+});
+
+test("a CSV or NDJSON export a --limit cut says so: CSV in a closing note line, NDJSON on stderr, rows alone on stdout", async () => {
+  const rows = [{ date: "2026-10-05" }, { date: "2026-10-06" }, { date: "2026-10-07" }];
+  const note = "showing the oldest 2 of 3 rows; --tail 2 for the latest";
+  const freshness = { source: "Gloom Cloud", asOf: "2026-10-23T15:48:00Z", status: "not-a-feed", basis: "calendar" } as ReportFreshness;
+  const render: CliResultRenderOptions = { dateKey: "date", exportNotes: ["kept by the command"] };
+  // With or without a cited source the note follows the rows, ahead of the command's own notes.
+  const cited = serializeCliResult({ data: rows, freshness }, { ...baseOptions, format: "csv", limit: 2 }, render).split("\n");
+  expect(cited.slice(0, 3)).toEqual(["date,symbol_or_series,currency_or_unit,interval,source,as_of", "2026-10-05,,,,Gloom Cloud,2026-10-23T15:48:00Z", "2026-10-06,,,,Gloom Cloud,2026-10-23T15:48:00Z"]);
+  expect(cited.slice(-3)).toEqual([expect.stringContaining("# Retrieval time"), `# note: ${note}`, "# note: kept by the command"]);
+  expect(serializeCliResult({ data: rows }, { ...baseOptions, format: "csv", limit: 2 }, { dateKey: "date" })).toBe(`date\n2026-10-05\n2026-10-06\n\n# note: ${note}`);
+  // Rows that were all kept have nothing to say, and neither does a newest-first series' newest rows.
+  expect(serializeCliResult({ data: rows }, { ...baseOptions, format: "csv", limit: 3 }, { dateKey: "date" })).not.toContain("note");
+  expect(serializeCliResult({ data: [...rows].reverse() }, { ...baseOptions, format: "csv", limit: 2 }, { dateKey: "date" })).not.toContain("note");
+  // NDJSON has no place for a line among its rows: they stay rows alone, and the note goes where warnings do.
+  const printed = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "ndjson", limit: 2 }, { dateKey: "date" }));
+  expect(printed.stdout).toBe('{"date":"2026-10-05"}\n{"date":"2026-10-06"}');
+  expect(printed.stderr).toBe(`note: ${note}`);
+  const whole = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "ndjson" }, { dateKey: "date" }));
+  expect(whole.stderr).toBe("");
+  // A command's own notes (where a stored calendar starts) follow the cut on stderr, as CSV closes with them; --quiet silences both.
+  const noted = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "ndjson", limit: 2 }, { dateKey: "date", exportNotes: ["kept by the command", "and another"] }));
+  expect(noted.stdout).toBe('{"date":"2026-10-05"}\n{"date":"2026-10-06"}');
+  expect(noted.stderr).toBe(`note: ${note}\nnote: kept by the command\nnote: and another`);
+  const quiet = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "ndjson", limit: 2, quiet: true }, { dateKey: "date", exportNotes: ["kept by the command"] }));
+  expect(quiet.stderr).toBe("");
+});
+
+test("a printed CSV is rows alone, its closing source and note lines on stderr, so a spreadsheet opens the file without junk rows", async () => {
+  const rows = [{ date: "2026-10-05" }, { date: "2026-10-06" }, { date: "2026-10-07" }];
+  const freshness = { source: "Gloom Cloud", asOf: "2026-10-23T15:48:00Z", status: "not-a-feed", basis: "calendar" } as ReportFreshness;
+  const printed = await captureConsole(() => printCliResult({ data: rows, freshness }, { ...baseOptions, format: "csv", limit: 2 }, { dateKey: "date" }));
+  expect(printed.stdout.split("\n")).toEqual([
+    "date,symbol_or_series,currency_or_unit,interval,source,as_of",
+    "2026-10-05,,,,Gloom Cloud,2026-10-23T15:48:00Z",
+    "2026-10-06,,,,Gloom Cloud,2026-10-23T15:48:00Z",
+  ]);
+  const notes = printed.stderr.split("\n");
+  expect(notes[0]).toStartWith("Source: Gloom Cloud");
+  expect(notes.at(-1)).toBe("note: showing the oldest 2 of 3 rows; --tail 2 for the latest");
+  expect(notes.some((line) => line.startsWith("#"))).toBe(false);
+  // Several tables keep the `# section:` line over each, which says whose rows follow.
+  const sections = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "csv" }, {
+    tables: { tables: [{ title: "A", columns: ["x"], rows: [[1]] }, { title: "B", columns: ["y"], rows: [[2]] }], footer: ["note: two tables"] },
+  }));
+  expect(sections.stdout).toBe("# section: A\nx\n1\n\n# section: B\ny\n2");
+  expect(sections.stderr).toBe("note: two tables");
+});
+
+test("plain output words the arrows of its tables and nothing else: a note, an answer or an error prints as written", async () => {
+  setCliPlainOverride(true);
+  setCliColorEnabledOverride(false);
+  try {
+    const note = "margin ↑ → buy\n→ keep ←/→ in mind";
+    const { stdout, stderr } = await captureConsole(() => {
+      printCliResult({ data: { text: note }, warnings: ["Read as typed: a ↓ b"] }, baseOptions, { text: (data) => data.text });
+      printCliResult({ data: [{ move: "+25bp ↑", text: "a → b" }] }, baseOptions);
+      printCliError(new Error("Not found: x → y"), baseOptions);
+    });
+    expect(stdout.split("\n")).toEqual(["margin ↑ → buy", "→ keep ←/→ in mind", "Move      Text", "+25bp up  a to b"]);
+    expect(stderr).toBe("warning: Read as typed: a ↓ b\nerror: Not found: x → y");
+  } finally {
+    setCliPlainOverride(null);
+    setCliColorEnabledOverride(null);
+  }
+});
+
+describe("serializeCliError", () => {
+  test("renders stable structured errors for JSON", () => {
+    const output = serializeCliError(
+      { code: "auth_required", message: "Sign in first.", retryable: true },
+      { ...baseOptions, format: "json" },
+    );
+    expect(JSON.parse(output)).toEqual({
+      ok: false,
+      error: { code: "auth_required", message: "Sign in first.", retryable: true },
+    });
+  });
+});
+
+test("large research reports remain complete through a pipe after stdout initialization", async () => {
+  const child = Bun.spawn([process.execPath, "-e", `
+    import { printCliResult } from ${JSON.stringify(new URL("./result.ts", import.meta.url).pathname)};
+    import { DEFAULT_CLI_OPTIONS } from ${JSON.stringify(new URL("./options.ts", import.meta.url).pathname)};
+    // CLI color/terminal detection initializes the stream before reports print.
+    void process.stdout;
+    printCliResult({ data: { rows: Array.from({ length: 6000 }, (_, id) => ({ id, name: "東京 — research report" })) } },
+      { ...DEFAULT_CLI_OPTIONS, format: "json" });
+  `], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, status] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  expect({ status, stderr }).toEqual({ status: 0, stderr: "" });
+  const report = JSON.parse(stdout);
+  expect(report.data.rows).toHaveLength(6000);
+  expect(report.data.rows.at(-1)).toEqual({ id: 5999, name: "東京 — research report" });
+});
+
+test("a narrow --width wraps a report's heading, summary, notes and warnings, keeping the gaps between its facts", async () => {
+  const data = [{ date: "2026-10-29", close: 28.89 }, { date: "2026-10-30", close: 28.36 }];
+  const heading = "Star Bulk Carriers Corp.  ·  NASDAQ\nCurrency USD  ·  daily bars  ·  2026-09-30 to 2026-10-30  ·  23 bars";
+  const drawdown = "Max drawdown -9.9% (daily closes): peak 30.84 on 2026-10-05, trough 27.79 on 2026-10-16, not back to the peak by 2026-10-30";
+  const warning = "GOGL = Corgi GOOGL 2x Daily ETF, Cboe BZX (a different company on the Warsaw Stock Exchange)";
+  const render: CliResultRenderOptions = { heading: `${heading}\n${drawdown}`, footnote: drawdown, dateKey: "date" };
+  setCliColorEnabledOverride(false);
+  try {
+    setCliWidthOverride(56);
+    const { stderr } = await captureConsole(() => printCliResult({ data, warnings: [warning] }, baseOptions, render));
+    const text = serializeCliResult({ data }, baseOptions, render);
+    expect(text.split("\n").slice(0, 5)).toEqual([
+      "Star Bulk Carriers Corp.  ·  NASDAQ",
+      "Currency USD  ·  daily bars  ·  2026-09-30 to",
+      "2026-10-30  ·  23 bars",
+      "Max drawdown -9.9% (daily closes): peak 30.84 on",
+      "2026-10-05, trough 27.79 on 2026-10-16, not back to the",
+    ]);
+    expect([...text.split("\n"), ...stderr.split("\n")].filter((line) => line.length > 56)).toEqual([]);
+    expect(stderr.split("\n")).toEqual(["warning: GOGL = Corgi GOOGL 2x Daily ETF, Cboe BZX (a", "different company on the Warsaw Stock Exchange)"]);
+    expect(serializeCliResult({ data }, { ...baseOptions, format: "json" }, render)).not.toContain("\\n2026-10-30");
+    // Unfitted, every line prints whole.
+    setCliWidthOverride(null);
+    expect(serializeCliResult({ data }, baseOptions, render).split("\n").slice(0, 3)).toEqual(`${heading}\n${drawdown}`.split("\n"));
+  } finally {
+    setCliWidthOverride(null);
+    setCliColorEnabledOverride(null);
+  }
+});
+
+test("COLUMNS fits piped text to its width and never changes JSON, CSV or NDJSON", () => {
+  const data = [
+    { headline: "A long headline that runs well past the fifty-six columns of a narrow pager", source: "Wire", volume: 1200 },
+    { headline: "Another story", source: "Filing", volume: 35 },
+  ];
+  const footer = "Source: Gloom Cloud · a closing line long enough to wrap at fifty-six columns if anything wrapped it";
+  const tables = { tables: [{ title: "Stories", columns: ["Headline", "Source", "Volume"], rows: data.map((row) => [row.headline, row.source, row.volume]) }], footer: [footer] };
+  const render = (format: CliGlobalOptions["format"]) => [
+    serializeCliResult({ data }, { ...baseOptions, format }),
+    ...format === "csv" || format === "ndjson" ? [serializeCliResult({ data }, { ...baseOptions, format }, { tables })] : [],
+  ];
+  const stdout = process.stdout as { isTTY?: boolean };
+  const saved = { columns: process.env.COLUMNS, tty: stdout.isTTY };
+  setCliColorEnabledOverride(false);
+  try {
+    // Piped, as `gloom ... | less` is.
+    stdout.isTTY = false;
+    delete process.env.COLUMNS;
+    const whole = { json: render("json"), csv: render("csv"), ndjson: render("ndjson"), text: render("text") };
+    process.env.COLUMNS = "56";
+    const fitted = { json: render("json"), csv: render("csv"), ndjson: render("ndjson"), text: render("text") };
+    expect(fitted.json).toEqual(whole.json);
+    expect(fitted.csv).toEqual(whole.csv);
+    expect(fitted.ndjson).toEqual(whole.ndjson);
+    expect(fitted.text).not.toEqual(whole.text);
+  } finally {
+    stdout.isTTY = saved.tty;
+    if (saved.columns === undefined) delete process.env.COLUMNS;
+    else process.env.COLUMNS = saved.columns;
+    setCliColorEnabledOverride(null);
+  }
+});

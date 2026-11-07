@@ -1,0 +1,707 @@
+import { join } from "path";
+import { logFailure } from "../../utils/log-failure";
+import { versionCommand } from "./version";
+import { saveConfig } from "../../data/config/store";
+import { builtinPluginGroupMembers } from "../../plugins/ownership";
+import type { AppConfig, TelemetryConfig } from "../../types/config";
+import { canonicalTimeZone } from "../../utils/utc-time";
+import { readBaseCurrency } from "../../utils/base-currency";
+import { NIGHTLY_CHANNEL_SUMMARY, parseUpdateChannel, withUpdateChannel } from "../../updater/channel";
+import type { CliCommandDef } from "../../types/plugin";
+import type { BuiltinCliCommandDef } from "../command-options";
+import { withCliServices, withConfigData } from "../context";
+import { CLI_COMMAND_GROUPS } from "../help";
+import { dryRunNote, formatBytes, formatStatusCell } from "../helpers";
+import { cliStyles, cliTerminalWidth, renderSection, renderTable, wrapText } from "../../utils/cli-output";
+import { getThemeIds } from "../../theme/themes";
+import { requireArg } from "./command-utils";
+import { fail } from "../errors";
+import { describeThemeId, requireThemeId, themeListNote, themeListRows, themeName } from "./themes";
+import {
+  applyKeybindingCliSet,
+  describeKeybindingsForCli,
+  KEYBINDINGS_CONFIG_KEY,
+} from "./keybindings";
+
+const DOCTOR_COUNT_UNITS: Record<string, string> = { plugins: "loaded", capabilities: "registered" };
+/** Automatic crash reports and anonymous usage counts, keyed by their field in `telemetry`. */
+const TELEMETRY_CONFIG_KEYS = {
+  "telemetry.crashReports": "crashReports",
+  "telemetry.usage": "usage",
+  "telemetry.attention": "attention",
+} as const satisfies Record<string, keyof TelemetryConfig>;
+type TelemetryConfigKey = keyof typeof TELEMETRY_CONFIG_KEYS;
+/** The one-time GitHub star line in the terminal's status bar. */
+const STAR_PROMPT_CONFIG_KEY = "starPrompt.enabled";
+/** The zone CLI text shows local times in, beside UTC. */
+const TIMEZONE_CONFIG_KEY = "timezone";
+/** What `config set timezone` takes to go back to UTC alone. */
+const NO_TIMEZONE = "none";
+/** Stable releases, or nightly builds as well. */
+const UPDATE_CHANNEL_CONFIG_KEY = "updates.channel";
+const EDITABLE_CONFIG_KEYS = [
+  "baseCurrency",
+  "refreshIntervalMinutes",
+  "theme",
+  "valueFlashingEnabled",
+  ...Object.keys(TELEMETRY_CONFIG_KEYS),
+  STAR_PROMPT_CONFIG_KEY,
+  TIMEZONE_CONFIG_KEY,
+  UPDATE_CHANNEL_CONFIG_KEY,
+];
+
+function isTelemetryConfigKey(key: string): key is TelemetryConfigKey {
+  return Object.prototype.hasOwnProperty.call(TELEMETRY_CONFIG_KEYS, key);
+}
+
+function isBooleanConfigKey(key: string): boolean {
+  return key === "valueFlashingEnabled" || key === STAR_PROMPT_CONFIG_KEY || isTelemetryConfigKey(key);
+}
+
+/** The canonical zone name `config set timezone` stores, or null to clear it; fails on a name that is not a zone. */
+function parseTimezoneSetting(value: string): string | null {
+  if (value.trim().toLowerCase() === NO_TIMEZONE) return null;
+  return canonicalTimeZone(value) ?? fail(
+    `"${value.trim()}" is not a time zone name.`,
+    `Use an IANA zone name, Region/City, such as Asia/Tokyo, or ${NO_TIMEZONE} for UTC alone.`,
+  );
+}
+
+/**
+ * The code `config set baseCurrency` stores (`cad` is CAD); fails on a name
+ * or sign, naming the code it stands for, and on anything that is no code.
+ */
+function parseBaseCurrencySetting(value: string): string {
+  const reading = readBaseCurrency(value);
+  if ("code" in reading) return reading.code;
+  const [first] = reading.suggestions;
+  return fail(reading.error, first
+    ? `baseCurrency takes an ISO 4217 code: gloom config set baseCurrency ${first}`
+    : "baseCurrency takes an ISO 4217 code such as USD, EUR or CAD.");
+}
+
+/** A saved base currency that is no code (an older version stored names), with what to set instead; null for a code. */
+function baseCurrencyProblem(value: unknown): string | null {
+  const reading = readBaseCurrency(typeof value === "string" ? value : "");
+  if ("code" in reading) return null;
+  const [first] = reading.suggestions;
+  return `${reading.error} Set one: gloom config set baseCurrency ${first ?? "<code>"}`;
+}
+
+function describeBaseCurrency(value: unknown): string {
+  const problem = baseCurrencyProblem(value);
+  return problem ? `${String(value)} ${cliStyles.warning(`(${problem})`)}` : String(value);
+}
+
+function describeTimezone(value: unknown): string {
+  return typeof value === "string" && value ? value : "not set, times print in UTC alone";
+}
+
+/** What `config get telemetry.attention` prints while the setting is untouched. */
+const ATTENTION_DEFAULT = "default";
+
+/**
+ * Attention Counts as set, not as "on": unset is the default, which counts an
+ * account only once the app has shown it its notice, so it is not `true`.
+ */
+function attentionSetting(telemetry: TelemetryConfig | undefined): boolean | typeof ATTENTION_DEFAULT {
+  return telemetry?.attention ?? ATTENTION_DEFAULT;
+}
+
+function describeAttentionSetting(value: unknown): string {
+  return value === ATTENTION_DEFAULT ? "default: on once the app has shown its notice" : describeConfigValue(value);
+}
+
+function describeConfigValue(value: unknown): string {
+  if (value == null) return "nothing";
+  if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "nothing";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function withTimezone(config: AppConfig, timezone: string | null): AppConfig {
+  const { timezone: _previous, ...rest } = config;
+  return timezone ? { ...rest, timezone } : rest;
+}
+
+function summarizeKeybindings(value: unknown): string {
+  const described = value as { actions?: Record<string, unknown>; commands?: Record<string, unknown>; issues?: unknown[] };
+  const parts = [
+    `${Object.keys(described.actions ?? {}).length} actions`,
+    `${Object.keys(described.commands ?? {}).length} command bindings`,
+    ...(described.issues?.length ? [cliStyles.warning(`${described.issues.length} issues`)] : []),
+  ];
+  return `${parts.join(", ")} ${cliStyles.muted("(gloom config get keybindings)")}`;
+}
+
+function renderKeybindings(value: unknown): string {
+  const described = value as {
+    actions: Record<string, { keys: string[]; custom?: boolean; defaults?: string[] }>;
+    commands: Record<string, string>;
+    issues: string[];
+  };
+  const lines = [
+    renderSection("Actions"),
+    renderTable(
+      [{ header: "Action" }, { header: "Keys" }, { header: "Default" }],
+      Object.entries(described.actions).map(([id, action]) => [
+        id,
+        action.keys.length > 0 ? action.keys.join(", ") : cliStyles.muted("unbound"),
+        action.custom ? cliStyles.muted(action.defaults?.join(", ") || "unbound") : "",
+      ]),
+    ),
+    "",
+    renderSection("Command bindings"),
+    Object.keys(described.commands).length > 0
+      ? renderTable(
+        [{ header: "Keys" }, { header: "Runs" }],
+        Object.entries(described.commands).map(([chord, query]) => [chord, query]),
+      )
+      : wrapText("None. Bind one with gloom config set keybindings.commands.<keys> <command>.", cliTerminalWidth() ?? 80)
+        .map((line) => cliStyles.muted(line)).join("\n"),
+  ];
+  if (described.issues.length > 0) {
+    lines.push("", renderSection("Issues"), ...described.issues.map((issue) => cliStyles.warning(issue)));
+  }
+  return lines.join("\n");
+}
+
+function resourceCacheStats(
+  services: Awaited<ReturnType<Parameters<CliCommandDef["execute"]>[1]["initServices"]>>,
+  namespace?: string,
+) {
+  const where = namespace ? "WHERE namespace = ?1" : "";
+  const row = services.persistence.database.connection
+    .query<{ count: number; size: number; expired: number; stale: number }, string[]>(
+      `SELECT COUNT(*) as count,
+              COALESCE(SUM(size_bytes), 0) as size,
+              SUM(CASE WHEN expires_at < strftime('%s','now') * 1000 THEN 1 ELSE 0 END) as expired,
+              SUM(CASE WHEN stale_at < strftime('%s','now') * 1000 THEN 1 ELSE 0 END) as stale
+       FROM resource_cache ${where}`,
+    )
+    .get(...(namespace ? [namespace] : []));
+  return {
+    entries: row?.count ?? 0,
+    sizeBytes: row?.size ?? 0,
+    staleEntries: row?.stale ?? 0,
+    expiredEntries: row?.expired ?? 0,
+  };
+}
+
+export function createSystemCliCommands(): CliCommandDef[] {
+
+  const doctorCommand: CliCommandDef = {
+    name: "doctor",
+    description: "Check that config, cache, plugins, and capabilities load",
+    help: { group: CLI_COMMAND_GROUPS.app, usage: ["doctor"] },
+    execute: async (_args, ctx) => {
+      const checks: Array<{ check: string; status: string; detail: string }> = [];
+      try {
+        await withCliServices(ctx, async (services) => {
+          checks.push({
+            check: "config",
+            status: "ok",
+            detail: services.createdDataDir ? `${services.dataDir} (created now)` : services.dataDir,
+          });
+          checks.push({ check: "database", status: "ok", detail: join(services.dataDir, ".gloomberb-cache.db") });
+          checks.push({ check: "plugins", status: "ok", detail: String(services.services.pluginRegistry.allPlugins.size) });
+          // Official plugins a launch could not install, which the app otherwise just lacks.
+          const { officialPluginsCheck } = await import("../../plugins/extracted-plugins");
+          const { gitInstalled } = await import("../../plugins/installer");
+          const official = officialPluginsCheck(services.config, { gitMissing: () => !gitInstalled() });
+          if (official) checks.push(official);
+          checks.push({ check: "capabilities", status: "ok", detail: String(services.services.pluginRegistry.capabilities.manifests().length) });
+          // Only a saved value no conversion can price is worth a line.
+          const baseCurrencyIssue = baseCurrencyProblem(services.config.baseCurrency);
+          if (baseCurrencyIssue) checks.push({ check: "baseCurrency", status: "warn", detail: baseCurrencyIssue });
+          const theme = services.config.theme;
+          checks.push({
+            check: "theme",
+            status: themeName(theme) ? "ok" : "warn",
+            detail: themeName(theme) ? describeThemeId(theme) : `${describeThemeId(theme)}. Pick one with gloom config set theme <id>.`,
+          });
+        });
+      } catch (error) {
+        checks.push({ check: "runtime", status: "error", detail: error instanceof Error ? error.message : String(error) });
+      }
+      ctx.printResult({ data: checks }, {
+        columns: [
+          { key: "check", header: "Check" },
+          { key: "status", header: "Status", format: formatStatusCell },
+          { key: "detail", header: "Detail", format: (value, row) => DOCTOR_COUNT_UNITS[String(row.check)] ? `${value} ${DOCTOR_COUNT_UNITS[String(row.check)]}` : String(value) },
+        ],
+      });
+      if (checks.some((check) => check.status === "error")) process.exitCode = 1;
+    },
+  };
+
+  const configCommand: CliCommandDef = {
+    name: "config",
+    description: "Show or change settings and keybindings",
+    help: {
+      group: CLI_COMMAND_GROUPS.app,
+      usage: [
+        "config list",
+        "config get <key>",
+        "config set <key> <value>",
+        "config themes",
+        "config set theme <id>",
+        "config set telemetry.crashReports false",
+        "config set telemetry.usage false",
+        "config set telemetry.attention false",
+        "config set starPrompt.enabled false",
+        "config set timezone <Region/City>|none",
+        "config set updates.channel stable|nightly",
+        "config get keybindings",
+        "config set keybindings.actions.<action> <keys>|null|default",
+        "config set keybindings.commands.<keys> <command>|null",
+      ],
+      sections: [{
+        title: "Editable keys",
+        lines: [`${EDITABLE_CONFIG_KEYS.join(", ")}, and keybindings.*`],
+      }, {
+        title: "Time zone",
+        lines: [
+          "Times print in UTC. timezone takes an IANA zone name such as Asia/Tokyo or America/New_York, and CLI text and function reports then show your local time beside every UTC time. Trading days keep their market's date. none goes back to UTC alone. JSON and CSV keep the raw values.",
+        ],
+      }, {
+        title: "Themes",
+        lines: [
+          `theme takes one of these ids, or its name as config themes lists it: ${getThemeIds().join(", ")}.`,
+        ],
+      }, {
+        title: "Release channel",
+        lines: [
+          `The app updates itself from stable releases. With updates.channel nightly (Release Channel in the command bar) it also installs the nightly build: ${NIGHTLY_CHANNEL_SUMMARY}. Back on stable, a nightly build stays until a newer stable release is out. GLOOMBERB_UPDATE_CHANNEL overrides the setting for one run; npm and Bun installs always follow stable.`,
+        ],
+      }],
+      examples: [
+        "config",
+        "config themes",
+        "config set theme colorblind",
+        "config set baseCurrency EUR",
+        "config set timezone Asia/Tokyo",
+        "config get keybindings",
+        "config set keybindings.actions.ticker-search \"Ctrl+T\"",
+        "config set keybindings.commands.Alt+1 \"DES AAPL\"",
+      ],
+    },
+    execute: async (args, ctx) => {
+      const action = args[0] ?? "list";
+      // Listing the themes needs no data folder, so it works before the first run.
+      if (action === "themes") {
+        let current: string | null = null;
+        try {
+          current = await withConfigData(ctx, ({ config }) => config.theme);
+        } catch (error) {
+          logFailure("cli-system", "Read current theme failed")(error);
+          current = null;
+        }
+        ctx.printResult({ data: themeListRows(current) }, {
+          textColumns: [
+            { key: "id", header: "ID", shrink: false },
+            { key: "name", header: "Name", shrink: false },
+            { key: "appearance", header: "Look" },
+            { key: "note", header: "Note", format: (_value, row) => themeListNote(row as ReturnType<typeof themeListRows>[number]) },
+          ],
+        });
+        return;
+      }
+      await withConfigData(ctx, async (context) => {
+        const safeConfig: Record<string, unknown> = {
+          dataDir: context.config.dataDir,
+          baseCurrency: context.config.baseCurrency,
+          refreshIntervalMinutes: context.config.refreshIntervalMinutes,
+          theme: context.config.theme,
+          disabledPlugins: context.config.disabledPlugins,
+          disabledSources: context.config.disabledSources,
+          portfolios: context.config.portfolios.length,
+          watchlists: context.config.watchlists.length,
+          brokerInstances: context.config.brokerInstances.length,
+          [KEYBINDINGS_CONFIG_KEY]: describeKeybindingsForCli(context.config),
+          // Last, so CSV readers that go by position keep their columns.
+          valueFlashingEnabled: context.config.valueFlashingEnabled,
+          "telemetry.crashReports": context.config.telemetry?.crashReports !== false,
+          "telemetry.usage": context.config.telemetry?.usage !== false,
+          "telemetry.attention": attentionSetting(context.config.telemetry),
+          [STAR_PROMPT_CONFIG_KEY]: context.config.starPrompt?.enabled !== false,
+          [TIMEZONE_CONFIG_KEY]: context.config.timezone ?? null,
+          [UPDATE_CHANNEL_CONFIG_KEY]: context.config.updates?.channel ?? "stable",
+        };
+
+        if (action === "list") {
+          ctx.printResult({ data: safeConfig }, {
+            textColumns: Object.keys(safeConfig).map((key) => ({
+              key,
+              header: key,
+              ...(key === KEYBINDINGS_CONFIG_KEY ? { format: summarizeKeybindings } : {}),
+              ...(key === "theme" ? { format: (value: unknown) => describeThemeId(String(value)) } : {}),
+              ...(key === TIMEZONE_CONFIG_KEY ? { format: describeTimezone } : {}),
+              ...(key === "baseCurrency" ? { format: describeBaseCurrency } : {}),
+              ...(key === "telemetry.attention" ? { format: describeAttentionSetting } : {}),
+            })),
+          });
+          return;
+        }
+        if (action === "get") {
+          const key = requireArg(args[1], "Usage: gloom config get <key>", ctx);
+          if (!Object.prototype.hasOwnProperty.call(safeConfig, key)) {
+            ctx.fail(`Unknown config key "${key}".`, `Keys: ${Object.keys(safeConfig).join(", ")}`);
+          }
+          if (key === "theme") {
+            const id = String(safeConfig.theme);
+            ctx.printResult({ data: { key, value: id, name: themeName(id) } }, {
+              text: () => describeThemeId(id),
+            });
+            return;
+          }
+          ctx.printResult({ data: { key, value: safeConfig[key] } }, {
+            text: (data) => key === KEYBINDINGS_CONFIG_KEY ? renderKeybindings(data.value)
+              : key === TIMEZONE_CONFIG_KEY ? describeTimezone(data.value)
+                : key === "baseCurrency" ? describeBaseCurrency(data.value)
+                  : key === "telemetry.attention" ? describeAttentionSetting(data.value) : describeConfigValue(data.value),
+          });
+          return;
+        }
+        if (action === "set") {
+          const key = requireArg(args[1], "Usage: gloom config set <key> <value>", ctx);
+          const value = requireArg(args[2], "Usage: gloom config set <key> <value>", ctx);
+          if (key.startsWith(`${KEYBINDINGS_CONFIG_KEY}.`)) {
+            // The value may carry several chords or a multi-word command, so
+            // everything after the key is the value.
+            const result = applyKeybindingCliSet(context.config, key, args.slice(2).join(" "));
+            if (!result.ok) return ctx.fail(result.message);
+            if (!ctx.cliOptions.dryRun) await saveConfig(result.config);
+            ctx.printResult({
+              data: {
+                changed: !ctx.cliOptions.dryRun,
+                dryRun: ctx.cliOptions.dryRun,
+                key,
+                value: result.value,
+                [KEYBINDINGS_CONFIG_KEY]: describeKeybindingsForCli(result.config),
+              },
+            }, {
+              text: (data) => `Set ${key} to ${describeConfigValue(data.value)}.${dryRunNote(data.dryRun)}`,
+            });
+            return;
+          }
+          if (!EDITABLE_CONFIG_KEYS.includes(key)) {
+            ctx.fail(`Config key "${key}" is not editable from the CLI.`, `Editable keys: ${EDITABLE_CONFIG_KEYS.join(", ")}, keybindings.*`);
+          }
+          if ((isTelemetryConfigKey(key) || key === STAR_PROMPT_CONFIG_KEY) && value !== "true" && value !== "false") {
+            ctx.fail(`Usage: gloom config set ${key} true|false`);
+          }
+          if (key === UPDATE_CHANNEL_CONFIG_KEY && !parseUpdateChannel(value)) {
+            ctx.fail(`Usage: gloom config set ${key} stable|nightly`);
+          }
+          // A display name may come unquoted: config set theme White Phosphor.
+          const parsedValue = key === "theme"
+            ? requireThemeId(args.slice(2).join(" "))
+            : key === "baseCurrency"
+              ? parseBaseCurrencySetting(args.slice(2).join(" "))
+            : key === TIMEZONE_CONFIG_KEY
+              ? parseTimezoneSetting(value)
+              : key === UPDATE_CHANNEL_CONFIG_KEY
+              ? parseUpdateChannel(value)
+              : key === "refreshIntervalMinutes"
+              ? Number(value)
+              : isBooleanConfigKey(key)
+                ? value === "true"
+                : value;
+          const nextConfig = isTelemetryConfigKey(key)
+            ? { ...context.config, telemetry: { ...context.config.telemetry, [TELEMETRY_CONFIG_KEYS[key]]: parsedValue as boolean } }
+            : key === STAR_PROMPT_CONFIG_KEY
+              ? { ...context.config, starPrompt: { ...context.config.starPrompt, enabled: parsedValue as boolean } }
+              : key === TIMEZONE_CONFIG_KEY
+                ? withTimezone(context.config, parsedValue as string | null)
+                : key === UPDATE_CHANNEL_CONFIG_KEY
+                  ? withUpdateChannel(context.config, parsedValue as "stable" | "nightly")
+                  : { ...context.config, [key]: parsedValue };
+          if (!ctx.cliOptions.dryRun) await saveConfig(nextConfig);
+          ctx.printResult({
+            data: {
+              changed: !ctx.cliOptions.dryRun,
+              dryRun: ctx.cliOptions.dryRun,
+              key,
+              value: parsedValue,
+              ...(key === "theme" ? { name: themeName(String(parsedValue)) } : {}),
+            },
+          }, {
+            text: (data) => key === TIMEZONE_CONFIG_KEY && data.value == null
+              ? `Cleared timezone: times print in UTC alone.${dryRunNote(data.dryRun)}`
+              : `Set ${key} to ${key === "theme" ? describeThemeId(String(data.value)) : describeConfigValue(data.value)}.${dryRunNote(data.dryRun)}`,
+          });
+          return;
+        }
+        ctx.fail("Usage: gloom config list|get|set|themes");
+      });
+    },
+  };
+
+  const cacheCommand: CliCommandDef = {
+    name: "cache",
+    description: "Show the size of cached market data, or clear it",
+    help: {
+      group: CLI_COMMAND_GROUPS.app,
+      usage: ["cache status", "cache clear [namespace]"],
+      examples: ["cache", "cache clear --dry-run", "cache clear"],
+    },
+    execute: async (args, ctx) => {
+      const action = args[0] ?? "status";
+      await withCliServices(ctx, async (services) => {
+        if (action === "status") {
+          ctx.printResult({ data: [resourceCacheStats(services)] }, {
+            layout: "record",
+            textColumns: [
+              { key: "entries", header: "Entries" },
+              { key: "sizeBytes", header: "Size", format: (value) => formatBytes(Number(value)) },
+              { key: "staleEntries", header: "Stale" },
+              { key: "expiredEntries", header: "Expired" },
+            ],
+          });
+          return;
+        }
+        if (action === "clear") {
+          const namespace = args[1];
+          const before = resourceCacheStats(services, namespace);
+          if (!ctx.cliOptions.dryRun) services.persistence.resources.clear(namespace);
+          const after = ctx.cliOptions.dryRun ? before : resourceCacheStats(services, namespace);
+          ctx.printResult({ data: [{ changed: !ctx.cliOptions.dryRun, dryRun: ctx.cliOptions.dryRun, namespace: namespace ?? "all", before: before.entries, after: after.entries }] }, {
+            text: ([data]) => {
+              const scope = namespace ? ` from ${namespace}` : "";
+              return data!.dryRun
+                ? `Would clear ${data!.before} cached entries${scope}.${dryRunNote(true)}`
+                : `Cleared ${data!.before - data!.after} cached entries${scope}.`;
+            },
+          });
+          return;
+        }
+        ctx.fail("Usage: gloom cache status|clear");
+      });
+    },
+  };
+
+  const providerCommand: CliCommandDef = {
+    name: "provider",
+    aliases: ["providers"],
+    description: "List data sources and the operations each one serves",
+    help: { group: CLI_COMMAND_GROUPS.app, usage: ["provider status"] },
+    execute: async (_args, ctx) => {
+      await withCliServices(ctx, async (services) => {
+        const disabledSources = new Set(services.config.disabledSources ?? []);
+        const rows = services.services.pluginRegistry.capabilities.manifests().map((manifest) => ({
+          id: manifest.sourceId ?? manifest.id,
+          capability: manifest.id,
+          kind: manifest.kind,
+          enabled: !disabledSources.has(manifest.sourceId ?? manifest.id),
+          operations: manifest.operations.map((operation) => operation.id).join(","),
+        }));
+        ctx.printResult({ data: rows }, {
+          columns: [
+            { key: "id", header: "Source" },
+            { key: "kind", header: "Kind" },
+            { key: "enabled", header: "Enabled" },
+            { key: "operations", header: "Operations" },
+          ],
+          textColumns: [
+            { key: "capability", header: "Capability", shrink: false },
+            { key: "id", header: "Source" },
+            { key: "kind", header: "Kind", shrink: false },
+            { key: "enabled", header: "Enabled" },
+            { key: "operations", header: "Operations", format: (value) => String(value).split(",").join(", ") },
+          ],
+        });
+      });
+    },
+  };
+
+  const pluginCommand: BuiltinCliCommandDef = {
+    name: "plugin",
+    description: "Inspect, turn on or off, link, or check any plugin",
+    // `link` and `doctor` take a checkout's path.
+    keepsArgAsTyped: () => true,
+    help: {
+      group: CLI_COMMAND_GROUPS.plugins,
+      usage: [
+        "plugin list",
+        "plugin info <id>",
+        "plugin enable <id>",
+        "plugin disable <id>",
+        "plugin doctor [id-or-path]",
+        "plugin link <path>",
+      ],
+      sections: [{
+        title: "Naming a plugin",
+        lines: [
+          "Every plugin command takes an installed plugin's id or its folder, as gloom plugins lists them.",
+        ],
+      }, {
+        title: "Developing a plugin",
+        lines: [
+          "link puts a symlink to a local checkout in the plugins folder, so edits are live on the next start.",
+          "doctor checks an installed or linked plugin the way the app and the desktop build will: entry, the Gloom it declares, removed or deprecated imports, export, id, targets, declared hosts, and the browser bundle. Run it before publishing.",
+        ],
+      }],
+      examples: ["plugin list", "plugin info news", "plugin disable hackernews", "plugin link ../my-plugin", "plugin doctor ../my-plugin"],
+    },
+    execute: async (args, ctx) => {
+      const action = args[0] ?? "list";
+      // These work on the folder, not the running registry, so a plugin that
+      // fails to load can still be inspected and repaired.
+      if (action === "doctor") {
+        const { doctorPlugins } = await import("./plugins");
+        const reports = await doctorPlugins(args[1]);
+        ctx.printResult({ data: reports }, {
+          rows: (data) => data.flatMap((report) => report.checks.map((check) => ({
+            plugin: report.name ?? report.directory,
+            check: check.id,
+            status: check.status,
+            detail: check.message,
+          }))),
+          columns: [
+            { key: "plugin", header: "Plugin", shrink: false },
+            { key: "check", header: "Check" },
+            { key: "status", header: "Status", format: formatStatusCell },
+            { key: "detail", header: "Detail" },
+          ],
+        });
+        if (reports.some((report) => report.status === "fail")) process.exitCode = 1;
+        return;
+      }
+      if (action === "link") {
+        const path = requireArg(args[1], "Usage: gloom plugin link <path>", ctx);
+        const { linkPlugin } = await import("../../plugins/installer");
+        const info = await linkPlugin(path, { quiet: ctx.cliOptions.format !== "text" });
+        if (ctx.cliOptions.format !== "text") ctx.printResult({ data: info });
+        return;
+      }
+      await withCliServices(ctx, async (services) => {
+        const pluginRows = () => [...services.services.pluginRegistry.allPlugins.values()].map((plugin) => ({
+          id: plugin.id,
+          name: plugin.name,
+          version: plugin.version,
+          enabled: !services.config.disabledPlugins.includes(plugin.id),
+          panes: services.services.pluginRegistry.getPluginPaneIds(plugin.id).length,
+          templates: services.services.pluginRegistry.getPluginPaneTemplateIds(plugin.id).length,
+          capabilities: services.services.pluginRegistry.capabilities.manifests().filter((manifest) => (
+            services.services.pluginRegistry.getCapabilityPluginId(manifest.id) === plugin.id
+          )).length,
+        }));
+
+        // An installed plugin by its folder too: `gloom install` names the
+        // folder for the repository (`gloom-hackernews`), and `gloom plugins`
+        // shows it beside the id (`hackernews`).
+        const pluginId = async (name: string): Promise<string> => {
+          if (services.services.pluginRegistry.allPlugins.has(name) || builtinPluginGroupMembers(name)) return name;
+          const { installedPluginDirectoriesNamed, installedPluginRegistryId } = await import("../../plugins/installer");
+          const [directory, ...others] = installedPluginDirectoriesNamed(name);
+          if (!directory || others.length > 0) return name;
+          return await installedPluginRegistryId(directory) ?? name;
+        };
+
+        if (action === "list") {
+          ctx.printResult({ data: pluginRows() });
+          return;
+        }
+        if (action === "info") {
+          const id = await pluginId(requireArg(args[1], "Usage: gloom plugin info <id>", ctx));
+          const row = pluginRows().find((plugin) => plugin.id === id);
+          if (!row) ctx.fail(`Plugin "${id}" is not available.`);
+          ctx.printResult({ data: row });
+          return;
+        }
+        if (action === "enable" || action === "disable") {
+          const id = await pluginId(requireArg(args[1], `Usage: gloom plugin ${action} <id>`, ctx));
+          // A retired id that now names a group of built-ins switches all of them.
+          const targetIds = builtinPluginGroupMembers(id) ?? [id];
+          for (const targetId of targetIds) {
+            const plugin = services.services.pluginRegistry.allPlugins.get(targetId);
+            if (!plugin) ctx.fail(`Plugin "${targetId}" is not available.`);
+            if (plugin?.toggleable !== true) ctx.fail(`Plugin "${targetId}" is part of the application and cannot be disabled.`);
+          }
+          const disabled = new Set(services.config.disabledPlugins ?? []);
+          const isOff = () => targetIds.every((targetId) => disabled.has(targetId));
+          const isOn = () => targetIds.every((targetId) => !disabled.has(targetId));
+          const unchanged = action === "enable" ? isOn() : isOff();
+          for (const targetId of targetIds) {
+            if (action === "enable") disabled.delete(targetId);
+            else disabled.add(targetId);
+          }
+          const nextConfig = { ...services.config, disabledPlugins: [...disabled] };
+          if (!ctx.cliOptions.dryRun) await saveConfig(nextConfig);
+          ctx.printResult({ data: { changed: !unchanged && !ctx.cliOptions.dryRun, dryRun: ctx.cliOptions.dryRun, id, enabled: isOn() } }, {
+            text: (data) => {
+              const state = data.enabled ? "on" : "off";
+              if (unchanged) return `${id} is already ${state}.`;
+              return `Turned ${id} ${state}.${dryRunNote(data.dryRun)}`;
+            },
+          });
+          return;
+        }
+        ctx.fail("Usage: gloom plugin list|info|enable|disable|doctor|link");
+      });
+    },
+  };
+
+  const layoutCommand: CliCommandDef = {
+    name: "layout",
+    description: "List saved layouts",
+    help: { group: CLI_COMMAND_GROUPS.app, usage: ["layout"] },
+    execute: async (_args, ctx) => {
+      await withConfigData(ctx, async (config) => {
+        const rows = config.config.layouts.map((layout, index) => ({
+          index,
+          active: index === config.config.activeLayoutIndex,
+          name: layout.name,
+          panes: layout.layout.instances.length,
+          floating: layout.layout.floating.length,
+          detached: layout.layout.detached.length,
+        }));
+        ctx.printResult({ data: rows });
+      });
+    },
+  };
+
+  const paneCommand: CliCommandDef = {
+    name: "pane",
+    description: "List panes and templates with the plugin that owns each",
+    help: { group: CLI_COMMAND_GROUPS.app, usage: ["pane list"] },
+    execute: async (_args, ctx) => {
+      await withCliServices(ctx, async (services) => {
+        const rows = [
+          ...[...services.services.pluginRegistry.panes.entries()].map(([id, pane]) => ({
+            kind: "pane",
+            id,
+            name: pane.name,
+            owner: services.services.pluginRegistry.getPanePluginId(id) ?? "",
+          })),
+          ...[...services.services.pluginRegistry.paneTemplates.entries()].map(([id, template]) => ({
+            kind: "template",
+            id,
+            name: template.label,
+            owner: services.services.pluginRegistry.getPaneTemplatePluginId(id) ?? "",
+          })),
+        ];
+        ctx.printResult({ data: rows }, {
+          columns: [
+            { key: "kind", header: "Kind" },
+            { key: "id", header: "ID", shrink: false },
+            { key: "name", header: "Name" },
+            { key: "owner", header: "Owner" },
+          ],
+        });
+      });
+    },
+  };
+
+  return [
+    versionCommand,
+    doctorCommand,
+    configCommand,
+    cacheCommand,
+    providerCommand,
+    pluginCommand,
+    layoutCommand,
+    paneCommand,
+  ];
+}

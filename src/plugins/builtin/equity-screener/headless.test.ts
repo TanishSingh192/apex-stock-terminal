@@ -1,0 +1,313 @@
+import { expect, test } from "bun:test";
+import { KPI_FIELDS } from "../../../api-client/equity-screener";
+import { isProLock } from "../../../cli/pane-functions/access-gate";
+import { MAX_TOOL_RESULT_BYTES } from "../cloud/askg/protocol";
+import { equityScreenerHeadless } from "./headless";
+import { SCREEN_IDEAS } from "./ideas";
+import { parseScreenDefinition } from "./model";
+import { screenFixture } from "./test-fixture";
+
+test("a full page with more matches is neither an error nor too large for an Ask Gloom tool result", async () => {
+  const data = screenFixture();
+  const row = data.rows[0]!;
+  data.rows = Array.from({ length: 100 }, (_, index) => ({ ...row, symbol: `S${index}` }));
+  // Sparse fields make every real payload "partial"; that is not a failure.
+  Object.assign(data, { status: "partial", nextCursor: "next", universe: { ...data.universe, covered: 700, matched: 680 } });
+  const apiClient = { equityScreener: async () => structuredClone(data) };
+  const result = await equityScreenerHeadless.load({ argument: undefined, options: {} } as never, { apiClient } as never);
+  expect(result.errors).toEqual([]);
+  expect(result.complete).toBe(false);
+  expect(result.metadata).toMatchObject({ matched: 680, returned: 100, hasMore: true,
+    notices: ["Top 100 of 680 matches; --limit lists up to 500, or narrow the criteria to see the rest."] });
+  expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThan(MAX_TOOL_RESULT_BYTES);
+
+  data.warnings = ["Bounded scan: some listings were not evaluated."];
+  const bounded = await equityScreenerHeadless.load({ argument: undefined, options: {} } as never, { apiClient } as never);
+  expect(bounded.errors).toEqual(data.warnings);
+});
+
+test("ATR% can be the metric, and the help says what it is and that IV rank is a rank", async () => {
+  const data = screenFixture();
+  data.rows[0]!.metrics.atrPercent = { ...data.rows[0]!.metrics.atrPercent, value: 3.456, unit: "%", asOf: "2026-09-21", state: "available", scope: "derived" };
+  const apiClient = { equityScreener: async () => structuredClone(data) };
+  const result = await equityScreenerHeadless.load({ argument: undefined, options: { metric: "atrPercent" } } as never, { apiClient } as never);
+  const section = result.sections![0]!;
+  expect(section.columns!.find((column) => column.key === "value")!.header).toBe("ATR%");
+  expect(section.rows![0]).toMatchObject({ value: "3.5", unit: "%", asOf: "2026-09-21", state: "available" });
+  expect(equityScreenerHeadless.options.find((option) => option.key === "metric")!.values).toContainEqual({ value: "atrPercent" });
+  const limitations = equityScreenerHeadless.discovery!.limitations!.join(" ");
+  expect(limitations).toContain("ATR% is the 14-session average true range as a percent of the last close");
+  expect(limitations).toContain("IV rank is a rank, not an IV percentile");
+});
+
+test("the catalog's example definition passes the real validator, and a bad one names the part and the operators", () => {
+  const option = equityScreenerHeadless.options.find((candidate) => candidate.key === "definition")!;
+  // The shell quoting is the catalog's: the JSON sits between single quotes.
+  const json = /^--definition '(.+)'$/.exec(option.example!)![1]!;
+  const definition = parseScreenDefinition(JSON.parse(json));
+  expect(definition.criteria.map((criterion) => criterion.op)).toEqual(["in", "gte", "between"]);
+  expect(option.normalize!(json)).toBe(json);
+  expect(() => option.normalize!(JSON.stringify({ ...definition, criteria: [{ field: "industry", op: "eq", value: "Gold" }] })))
+    .toThrow(/criteria\[0\] \(industry\): op "eq" is not supported: industry takes in, present, missing\. The example in gloom catalog EQS/);
+  expect(() => option.normalize!('{"version":1}')).toThrow(/criteria is missing.*sort is missing.*currency is missing/);
+  // The second example screens a watchlist by its name.
+  const watchlistJson = /^--definition '(.+)'$/.exec(option.examples![0]!)![1]!;
+  expect(parseScreenDefinition(JSON.parse(watchlistJson)).criteria).toEqual([{ field: "symbol", op: "in", value: ["Watchlist"] }]);
+});
+
+test("a symbol criterion naming a watchlist screens its bare symbols and says so", async () => {
+  const sent: unknown[] = [];
+  // The server answers with the definition it ran, as it does.
+  const apiClient = { equityScreener: async (_path: string, init: { body: string }) => {
+    const { limit: _limit, cursor: _cursor, ...definition } = JSON.parse(init.body);
+    sent.push(definition);
+    return { ...screenFixture(), definition };
+  } };
+  const members = ["NFE", "SAP:XETRA", "CZR"].map((ticker) => ({ metadata: { ticker } }));
+  const ctx = {
+    apiClient,
+    config: { watchlists: [{ id: "wl-hy3", name: "HY3" }] },
+    resolveWatchlist: async (name: string) => (name.toLowerCase() === "hy3" ? members : null),
+  };
+  const definition = JSON.stringify({ version: 1, currency: "USD", criteria: [{ field: "symbol", op: "in", value: ["hy3"] }], sort: { field: "marketCap", direction: "desc" } });
+  const result = await equityScreenerHeadless.load({ argument: undefined, options: { definition } } as never, ctx as never);
+  expect(sent[0]).toMatchObject({ criteria: [{ field: "symbol", op: "in", value: ["NFE", "SAP", "CZR"] }] });
+  expect(result.notes?.[0]).toBe("Read hy3 as watchlist HY3 (3 symbols).");
+});
+
+test("a KPI the server holds back from Free says why once, in KPIS's words; a Pro KPI with gaps says what a gap is", async () => {
+  // The server leaves KPI and guidance fields out of every row for a caller without Gloom Pro.
+  const free = screenFixture();
+  for (const row of free.rows) for (const field of KPI_FIELDS) delete (row.metrics as Partial<typeof row.metrics>)[field];
+  const load = (data: typeof free) => equityScreenerHeadless.load({ argument: undefined, options: { metric: "kpiBacklog" } } as never,
+    { apiClient: { equityScreener: async () => structuredClone(data) } } as never);
+  const locked = await load(free);
+  expect(locked.errors).toEqual(["The free screener shows no KPI values; Gloom Pro shows each company's Backlog."]);
+  expect(isProLock(locked.errors![0]!)).toBe(true);
+  expect(locked.sections![0]!.rows![0]).toMatchObject({ value: "--", state: "locked" });
+  expect(locked.notes).toBeUndefined();
+
+  const pro = await load(screenFixture());
+  expect(pro.errors).toEqual([]);
+  expect(pro.sections![0]!.rows![0]).toMatchObject({ state: "unavailable" });
+  expect(pro.notes).toEqual(["1 of 1 row has no Backlog. Coverage follows available company disclosures; missing data is not zero."]);
+});
+
+test("a screen its currency emptied says the currency keeps only listings quoted in it, and gives the screen in USD", async () => {
+  // A CAD screen of tobacco companies said "No data." though the USD one lists seven.
+  const tobacco = { ...screenFixture(), rows: [] };
+  tobacco.definition = { ...tobacco.definition, currency: "CAD", criteria: [{ field: "industry", op: "in", value: ["Tobacco"] }] };
+  tobacco.universe = { ...tobacco.universe, covered: 4287, matched: 0, currencies: ["USD", "CAD"] };
+  const load = async (data: typeof tobacco) => {
+    const result = await equityScreenerHeadless.load({ argument: undefined, options: { definition: JSON.stringify(data.definition) } } as never,
+      { apiClient: { equityScreener: async () => structuredClone(data) } } as never);
+    return (result.sections![0] as { empty?: string }).empty;
+  };
+  const empty = (await load(tobacco))!.split("\n");
+  expect(empty[0]).toBe("No listing quoted in CAD matches. Currency CAD keeps only the listings quoted in CAD and converts nothing.");
+  const base = JSON.parse(/--definition '(.+)'$/.exec(empty[1]!)![1]!);
+  expect(empty[1]).toStartWith("In the base currency, USD: gloom fn EQS --definition '");
+  expect(base).toEqual({ ...tobacco.definition, currency: "USD" });
+  // A currency no covered listing is quoted in says so; an empty screen in USD keeps the plain empty line.
+  const usdOnly = { ...tobacco, universe: { ...tobacco.universe, currencies: ["USD"] } };
+  expect(await load(usdOnly)).toStartWith("None of the 4,287 covered listings is quoted in CAD. Currency CAD keeps only the listings quoted in CAD and converts nothing; the covered listings are quoted in USD.");
+  expect(await load({ ...tobacco, definition: { ...tobacco.definition, currency: "USD" } })).toBeUndefined();
+});
+
+test("--preset golden-cross runs the Ideas screen on days since the cross, and a preset is one choice of three", async () => {
+  const data = screenFixture();
+  data.definition = structuredClone(SCREEN_IDEAS.find((idea) => idea.id === "golden-cross")!.definition);
+  data.rows[0]!.metrics.goldenCrossDays = { ...data.rows[0]!.metrics.goldenCrossDays, value: 4, unit: "days", asOf: "2026-09-21", state: "available", scope: "derived" };
+  const queried: unknown[] = [];
+  const apiClient = { equityScreener: async (_path: string, init?: { body?: string }) => {
+    const { version, currency, criteria, sort } = JSON.parse(init!.body!);
+    queried.push({ version, currency, criteria, sort });
+    return structuredClone(data);
+  } };
+  const load = (options: Record<string, string>) => equityScreenerHeadless.load({ argument: undefined, options } as never, { apiClient } as never);
+  const result = await load({ preset: "golden-cross" });
+  expect(queried[0]).toEqual({
+    version: 1,
+    currency: "USD",
+    criteria: [{ field: "goldenCrossDays", op: "lte", value: 10 }, { field: "marketCap", op: "gte", value: 2_000_000_000 }],
+    sort: { field: "goldenCrossDays", direction: "asc" },
+  });
+  const section = result.sections![0]!;
+  expect(section.columns!.find((column) => column.key === "value")!.header).toBe("GOLDEN X AGO");
+  expect(section.rows![0]).toMatchObject({ symbol: "AAPL", value: "4", unit: "days", asOf: "2026-09-21" });
+  // --metric still names the column.
+  const priced = await load({ preset: "golden-cross", metric: "priceVsSma200Percent" });
+  expect(priced.sections![0]!.columns!.find((column) => column.key === "value")!.header).toBe("VS SMA200%");
+
+  expect(equityScreenerHeadless.options.find((option) => option.key === "preset")!.values!.map((value) => value.value))
+    .toEqual(SCREEN_IDEAS.map((idea) => idea.id));
+  await expect(load({ preset: "golden-cross", saved: "Growth" })).rejects.toThrow("Choose one of --preset, --saved and --definition.");
+  // Every idea is a definition the validator takes.
+  for (const idea of SCREEN_IDEAS) expect(parseScreenDefinition(idea.definition)).toEqual(idea.definition);
+});
+
+test("--preset top-grades leads with the composite and its label, with the five grades as letters beside it", async () => {
+  const data = screenFixture();
+  data.definition = structuredClone(SCREEN_IDEAS.find((idea) => idea.id === "top-grades")!.definition);
+  const derived = { asOf: "2026-11-02", state: "available" as const, scope: "derived" as const };
+  const metrics = data.rows[0]!.metrics;
+  metrics.gradeComposite = { ...metrics.gradeComposite, ...derived, value: 4.74, unit: "1-5" };
+  for (const [field, value] of [["valueGrade", 5], ["growthGrade", 13], ["profitabilityGrade", 13], ["momentumGrade", 10], ["revisionsGrade", 12]] as const)
+    metrics[field] = { ...metrics[field], ...derived, value, unit: "1-13" };
+  const queried: unknown[] = [];
+  const apiClient = { equityScreener: async (_path: string, init?: { body?: string }) => {
+    const { criteria, sort } = JSON.parse(init!.body!);
+    queried.push({ criteria, sort });
+    return structuredClone(data);
+  } };
+  const result = await equityScreenerHeadless.load({ argument: undefined, options: { preset: "top-grades" } } as never, { apiClient } as never);
+  expect(queried[0]).toEqual({
+    criteria: [{ field: "gradeComposite", op: "gte", value: 4.5 }, { field: "marketCap", op: "gte", value: 2_000_000_000 }],
+    sort: { field: "gradeComposite", direction: "desc" },
+  });
+  const section = result.sections![0]!;
+  expect(section.columns!.map((column) => column.header)).toEqual(expect.arrayContaining(["COMPOSITE", "VALUE", "GROWTH", "PROFIT", "MOMENTUM", "REVISIONS"]));
+  expect(section.rows![0]).toMatchObject({ value: "4.74 Top", valueGrade: "C-", growthGrade: "A+", profitabilityGrade: "A+", momentumGrade: "B+", revisionsGrade: "A" });
+});
+
+test("--limit pages to its rows; the sort field and every --metric get a column, and the states shown are explained", async () => {
+  const data = screenFixture();
+  data.definition = { ...data.definition, sort: { field: "dividendYieldPercent", direction: "desc" } };
+  const metric = (value: number, state: "partial" | "stale") => ({ ...data.rows[0]!.metrics.trailingPE, value, state });
+  const row = (symbol: string, yieldPercent: number, state: "partial" | "stale") => ({
+    ...data.rows[0]!, symbol,
+    metrics: { ...data.rows[0]!.metrics, trailingPE: metric(15, state), beta: metric(0.8, "partial"),
+      dividendYieldPercent: { ...metric(yieldPercent, "partial"), unit: "%" } },
+  });
+  const pages = [[row("EIX", 6, "partial"), row("AVA", 5.3, "stale")], [row("POR", 5, "partial")]];
+  const asked: Array<{ limit: number; cursor: string | null }> = [];
+  const apiClient = { equityScreener: async (_path: string, init?: { body?: string }) => {
+    const { limit, cursor } = JSON.parse(init!.body!);
+    asked.push({ limit, cursor });
+    const page = asked.length - 1;
+    return structuredClone({ ...data, rows: pages[page]!, nextCursor: page === 0 ? "next" : null,
+      universe: { ...data.universe, covered: 700, matched: 3 } });
+  } };
+  const result = await equityScreenerHeadless.load({ argument: undefined,
+    options: { definition: JSON.stringify(data.definition), metric: "trailingPE,beta", limit: 3 } } as never, { apiClient } as never);
+  expect(asked).toEqual([{ limit: 3, cursor: null }, { limit: 1, cursor: "next" }]);
+  const section = result.sections![0]!;
+  expect(section.rows!.map((entry) => entry.symbol)).toEqual(["EIX", "AVA", "POR"]);
+  // P/E leads with its unit, rank, date and state; beta and the sort field follow.
+  expect(section.columns!.map((column) => column.key).slice(-3)).toEqual(["state", "beta", "dividendYieldPercent"]);
+  expect(section.rows![0]).toMatchObject({ value: "15.0", unit: "x", state: "partial", beta: "0.80", dividendYieldPercent: "6.0" });
+  expect(result.notes!.map((note) => note.split(" means ")[0])).toEqual(["A partial State", "A stale State"]);
+  expect(result.complete).toBe(true);
+  // Last and Chg% are columns of every report: a --metric naming them adds neither again, and their raw numbers stay.
+  const shown = await equityScreenerHeadless.load({ argument: undefined,
+    options: { definition: JSON.stringify(data.definition), metric: "trailingPE,price,changePercent", limit: 1 } } as never,
+  { apiClient: { equityScreener: async () => {
+    const priced = row("EIX", 6, "partial");
+    priced.metrics = { ...priced.metrics, price: { ...metric(58.19, "partial"), unit: "USD" }, changePercent: { ...metric(0.71, "partial"), unit: "%" } };
+    return structuredClone({ ...data, rows: [priced], nextCursor: null });
+  } } } as never);
+  const shownSection = shown.sections![0]!;
+  const keys = shownSection.columns!.map((column) => column.key);
+  expect(keys.filter((key) => key === "price" || key === "changePercent")).toEqual(["price", "changePercent"]);
+  expect(keys.at(-1)).toBe("dividendYieldPercent");
+  expect(shownSection.rows![0]).toMatchObject({ price: 58.19, changePercent: 0.71 });
+  // Repeated flags and a comma list read as one list, each metric once.
+  expect(equityScreenerHeadless.options.find((option) => option.key === "metric")!.normalize!("trailingPE, beta,trailingPE"))
+    .toBe("trailingPE,beta");
+  expect(() => equityScreenerHeadless.options.find((option) => option.key === "metric")!.normalize!("trailingPE,pe"))
+    .toThrow('Invalid --metric value "pe"');
+});
+
+test("a sector or industry that names nothing says the names it was likely meant as, instead of No data", async () => {
+  const run = async (criteria: unknown[], rows: boolean) => {
+    const data = screenFixture();
+    data.definition = { ...data.definition, criteria: criteria as never };
+    if (!rows) data.rows = [];
+    data.universe = { ...data.universe, sectors: ["Technology", "Utilities"] };
+    const apiClient = { equityScreener: async () => structuredClone(data) };
+    return equityScreenerHeadless.load({ argument: undefined, options: { definition: JSON.stringify(data.definition) } } as never,
+      { apiClient } as never);
+  };
+  const empty = await run([{ field: "sector", op: "in", value: ["Utility"] }], false);
+  expect((empty.sections![0] as { empty?: string }).empty)
+    .toBe('No sector is named "Utility". Closest: Utilities. gloom catalog EQS lists every sector and industry.');
+  // With rows, the value that matched nothing is a warning beside them; a sector given as an industry says which it is.
+  const some = await run([{ field: "industry", op: "in", value: ["Solar", "Utilities", "Banks"] }], true);
+  expect(some.warnings).toEqual(['No industry is named "Utilities"; it is a sector name, so use "field": "sector". '
+    + 'No industry is named "Banks". Closest: Banks - Diversified, Banks - Regional. gloom catalog EQS lists every sector and industry.']);
+  // A GICS sector name points at the sector it is here.
+  const gics = await run([{ field: "sector", op: "in", value: ["Information Technology"] }], false);
+  expect((gics.sections![0] as { empty?: string }).empty).toStartWith('No sector is named "Information Technology". Closest: Technology.');
+  expect(equityScreenerHeadless.discovery!.reference!.map(({ title, items }) => [title, items.length])).toEqual([["Sectors", 11], ["Industries", 144]]);
+});
+
+test("--preset value, quality and garp run on the fundamental fields, leading with their own metric", async () => {
+  const queried: { criteria: unknown; sort: unknown }[] = [];
+  const data = screenFixture();
+  data.rows[0]!.metrics.roicPercent = { ...data.rows[0]!.metrics.roicPercent, value: 71.27, unit: "%", asOf: "2026-06-27", state: "available", scope: "derived" };
+  data.rows[0]!.metrics.netDebtToEbitda = { ...data.rows[0]!.metrics.netDebtToEbitda, value: null, unit: "x", state: "unavailable", notMeaningful: true, reason: "Trailing EBITDA is not positive" };
+  const apiClient = { equityScreener: async (_path: string, init?: { body?: string }) => {
+    const { criteria, sort } = JSON.parse(init!.body!);
+    queried.push({ criteria, sort });
+    return { ...structuredClone(data), definition: { version: 1, currency: "USD", criteria, sort } };
+  } };
+  const load = (options: Record<string, string>) => equityScreenerHeadless.load({ argument: undefined, options } as never, { apiClient } as never);
+  const quality = await load({ preset: "quality" });
+  expect(queried[0]).toEqual({
+    criteria: [
+      { field: "roicPercent", op: "gte", value: 15 },
+      { field: "netDebtToEbitda", op: "lte", value: 2 },
+      { field: "revenueCagr5YPercent", op: "gte", value: 5 },
+      { field: "fcfYieldPercent", op: "gt", value: 0 },
+      { field: "marketCap", op: "gte", value: 2_000_000_000 },
+    ],
+    sort: { field: "roicPercent", direction: "desc" },
+  });
+  const section = quality.sections![0]!;
+  expect(section.columns!.find((column) => column.key === "value")!.header).toBe("ROIC%");
+  expect(section.rows![0]).toMatchObject({ symbol: "AAPL", value: "71.3", unit: "%", asOf: "2026-06-27" });
+  // N/M as FA prints it, not a missing value.
+  const leverage = await load({ preset: "value", metric: "netDebtToEbitda" });
+  expect(leverage.sections![0]!.rows![0]).toMatchObject({ symbol: "AAPL", value: "N/M" });
+  expect(queried[1]!.sort).toEqual({ field: "fcfYieldPercent", direction: "desc" });
+  await load({ preset: "garp" });
+  expect(queried[2]).toMatchObject({
+    criteria: expect.arrayContaining([{ field: "forwardEpsGrowthPercent", op: "between", value: [10, 25] }, { field: "forwardPE", op: "lte", value: 20 }]),
+    sort: { field: "forwardEpsGrowthPercent", direction: "desc" },
+  });
+});
+
+test("--preset on the classic scores: Graham and Altman print N/M where the score is undefined, membership Yes or No", async () => {
+  const queried: { criteria: unknown; sort: unknown }[] = [];
+  const data = screenFixture();
+  const metrics = data.rows[0]!.metrics;
+  metrics.magicFormulaRank = { ...metrics.magicFormulaRank, value: 22, unit: "rank", asOf: "2026-06-27", state: "available", scope: "derived" };
+  metrics.grahamUpsidePercent = { ...metrics.grahamUpsidePercent, value: null, unit: "%", state: "unavailable", notMeaningful: true, reason: "Trailing EPS is not positive" };
+  metrics.altmanZScore = { ...metrics.altmanZScore, value: 13.784, unit: "", asOf: "2026-06-27", state: "available", scope: "derived" };
+  metrics.sp500Member = { ...metrics.sp500Member, value: 1, unit: "0/1", asOf: "2026-10-29", state: "available", scope: "derived" };
+  const apiClient = { equityScreener: async (_path: string, init?: { body?: string }) => {
+    const { criteria, sort } = JSON.parse(init!.body!);
+    queried.push({ criteria, sort });
+    return { ...structuredClone(data), definition: { version: 1, currency: "USD", criteria, sort } };
+  } };
+  const load = (options: Record<string, string>) => equityScreenerHeadless.load({ argument: undefined, options } as never, { apiClient } as never);
+  const magic = await load({ preset: "magic-formula", metric: "magicFormulaRank,altmanZScore,sp500Member" });
+  expect(queried[0]).toEqual({
+    criteria: [{ field: "magicFormulaRank", op: "lte", value: 100 }, { field: "marketCap", op: "gte", value: 2_000_000_000 }],
+    sort: { field: "magicFormulaRank", direction: "asc" },
+  });
+  const section = magic.sections![0]!;
+  expect(section.columns!.find((column) => column.key === "value")!.header).toBe("MAGIC RANK");
+  expect(section.rows![0]).toMatchObject({ symbol: "AAPL", value: "22" });
+  expect(Object.values(section.rows![0]!)).toEqual(expect.arrayContaining(["13.78", "Yes"]));
+  const graham = await load({ preset: "graham-number" });
+  expect(graham.sections![0]!.rows![0]).toMatchObject({ symbol: "AAPL", value: "N/M" });
+  expect(queried[1]).toEqual({
+    criteria: [
+      { field: "grahamUpsidePercent", op: "gte", value: 0 },
+      { field: "profitableYears", op: "gte", value: 10 },
+      { field: "marketCap", op: "gte", value: 2_000_000_000 },
+    ],
+    sort: { field: "grahamUpsidePercent", direction: "desc" },
+  });
+});

@@ -1,0 +1,689 @@
+import { formatNumber } from "../../../utils/format";
+import { TREASURY_CURVE_CUTOFF } from "../shared/treasury-cutoffs";
+import { STAT_CATEGORIES, type StatDef } from "./defs";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DAILY = 6 * DAY_MS;
+const WEEKLY = 21 * DAY_MS;
+// GDPNow is dated at quarter start but updated through the following month's
+// advance GDP release; allow that ~120-day span plus two weeks.
+const NOWCAST_QUARTERLY = 135 * DAY_MS;
+// FRED dates a print at the start of its period, so an on-time print is two
+// periods plus the release lag old just before the next one lands. Each limit
+// adds about two weeks to the slowest normal lag of its group.
+const MONTHLY_EARLY = 90 * DAY_MS; // CPI, PPI, jobs, output, retail, housing starts: lag up to ~19d
+const MONTHLY_LATE = 105 * DAY_MS; // PCE, income, new home sales, sentiment, M2: lag up to ~31d
+const MONTHLY_LAGGED = 115 * DAY_MS; // JOLTS, durables, factory orders, trade: lag up to ~40d
+const QUARTERLY = 235 * DAY_MS; // GDP, productivity: two quarters plus a lag up to ~38d
+
+const pct = (value: number) => `${formatNumber(value, 1)}%`;
+const pct2 = (value: number) => `${formatNumber(value, 2)}%`;
+const plain = (value: number) => formatNumber(value, 1);
+const index2 = (value: number) => formatNumber(value, 2);
+/** FRED reports payrolls and claims in thousands already. */
+const thousands = (value: number) => `${formatNumber(value / 1000, value >= 10_000 ? 1 : 2)}M`;
+const signedThousands = (value: number) =>
+  `${value > 0 ? "+" : ""}${formatNumber(value, 0)}k`;
+const billions = (value: number) => `${formatNumber(value, 0)}B`;
+/** A spread already scaled to basis points; the label says the unit. */
+const basisPoints = (value: number) => formatNumber(value, 0);
+
+function stat(def: StatDef): StatDef {
+  return def;
+}
+
+export const STATS: readonly StatDef[] = [
+  // ---- Inflation -------------------------------------------------------
+  stat({
+    id: "cpi-yoy",
+    measurementBasis: "Not seasonally adjusted",
+    label: "CPI",
+    shortLabel: "CPI y/y",
+    category: "inflation",
+    seriesId: "CPIAUCNS",
+    transform: "yoy",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 2, label: "2%" },
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Headline consumer prices against a year earlier, not seasonally adjusted, including food and energy.",
+    limit: 900,
+  }),
+  stat({
+    id: "core-cpi-yoy",
+    measurementBasis: "NSA · excludes food & energy",
+    label: "Core CPI",
+    shortLabel: "Core CPI y/y",
+    category: "inflation",
+    seriesId: "CPILFENS",
+    transform: "yoy",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 2, label: "2%" },
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Consumer prices excluding food and energy against a year earlier, not seasonally adjusted.",
+    limit: 900,
+  }),
+  stat({
+    id: "pce-yoy",
+    aliases: ["pce", "pce inflation", "pce price index"],
+    label: "PCE Prices",
+    shortLabel: "PCE y/y",
+    category: "inflation",
+    seriesId: "PCEPI",
+    transform: "yoy",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 2, label: "2%" },
+    staleAfterMs: MONTHLY_LATE,
+    note: "The price index for personal consumption, broader in scope than CPI.",
+    limit: 900,
+  }),
+  stat({
+    id: "core-pce-yoy",
+    measurementBasis: "Excludes food & energy",
+    label: "Core PCE Prices",
+    shortLabel: "Core PCE y/y",
+    category: "inflation",
+    seriesId: "PCEPILFE",
+    transform: "yoy",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 2, label: "2% reference" },
+    staleAfterMs: MONTHLY_LATE,
+    note: "Excludes food and energy to track underlying PCE inflation. The Fed target applies to overall PCE inflation.",
+    limit: 900,
+  }),
+  stat({
+    id: "ppi-yoy",
+    measurementBasis: "Final demand · not seasonally adjusted",
+    label: "Producer Prices",
+    shortLabel: "PPI y/y",
+    category: "inflation",
+    seriesId: "PPIFID",
+    transform: "yoy",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Final-demand producer prices against a year earlier, not seasonally adjusted.",
+    limit: 900,
+  }),
+
+  // ---- Labor -----------------------------------------------------------
+  stat({
+    id: "unemployment",
+    label: "Unemployment Rate",
+    shortLabel: "Unemployment",
+    category: "labor",
+    seriesId: "UNRATE",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Share of the labour force without work and looking for it.",
+    limit: 900,
+  }),
+  stat({
+    id: "payrolls",
+    label: "Nonfarm Payrolls",
+    shortLabel: "Payrolls m/m",
+    category: "labor",
+    seriesId: "PAYEMS",
+    transform: "change",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: signedThousands,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Jobs added or lost last month, the single most watched release.",
+    // The jobs report as it is called: `ECST nfp` opens it.
+    aliases: ["nfp", "nonfarm", "nonfarm payrolls", "jobs report"],
+    keywords: ["jobs report", "nfp", "nonfarm"],
+    limit: 900,
+  }),
+  stat({
+    id: "initial-claims",
+    measurementBasis: "Weekly",
+    label: "Initial Jobless Claims",
+    shortLabel: "Claims",
+    category: "labor",
+    seriesId: "ICSA",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "",
+    formatValue: (value) => `${formatNumber(value / 1000, 0)}k`,
+    reference: null,
+    staleAfterMs: WEEKLY,
+    note: "Weekly filings for unemployment benefits, the fastest labour signal.",
+  }),
+  stat({
+    id: "job-openings",
+    label: "Job Openings",
+    shortLabel: "Openings",
+    category: "labor",
+    seriesId: "JTSJOL",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: thousands,
+    reference: null,
+    staleAfterMs: MONTHLY_LAGGED,
+    note: "Unfilled positions employers report, a read on labour demand.",
+    limit: 400,
+  }),
+
+  // ---- Growth ----------------------------------------------------------
+  stat({
+    id: "real-gdp",
+    aliases: ["gdp", "gdp growth"],
+    measurementBasis: "q/q annualized",
+    label: "Real GDP",
+    shortLabel: "Real GDP q/q",
+    category: "growth",
+    seriesId: "GDPC1",
+    transform: "qoq-annualized",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: QUARTERLY,
+    note: "Inflation-adjusted output, stated at the annual rate the quarter implies.",
+    limit: 400,
+  }),
+  stat({
+    id: "industrial-production",
+    measurementBasis: "y/y",
+    label: "Industrial Production",
+    shortLabel: "Ind. prod.",
+    category: "growth",
+    seriesId: "INDPRO",
+    transform: "yoy",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Output of factories, mines and utilities against a year earlier.",
+    limit: 900,
+  }),
+  stat({
+    id: "capacity-utilization",
+    label: "Capacity Utilization",
+    shortLabel: "Capacity use",
+    category: "growth",
+    seriesId: "TCU",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "How much of industry's capacity is in use, a slack and inflation gauge.",
+    limit: 900,
+  }),
+  stat({
+    id: "durable-goods",
+    label: "Durable Goods Orders",
+    shortLabel: "Durables m/m",
+    category: "growth",
+    seriesId: "DGORDER",
+    transform: "mom",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_LAGGED,
+    note: "New orders for goods meant to last, a forward read on investment.",
+    limit: 500,
+  }),
+  stat({
+    id: "factory-orders",
+    label: "Factory Orders",
+    shortLabel: "Factory m/m",
+    category: "growth",
+    seriesId: "AMTMNO",
+    transform: "mom",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_LAGGED,
+    note: "New orders across manufacturing, durable and not.",
+    limit: 500,
+  }),
+
+  // ---- Nowcasts & conditions --------------------------------------------
+  stat({
+    id: "gdpnow",
+    measurementBasis: "Estimate · q/q annualized",
+    label: "Atlanta Fed GDPNow",
+    shortLabel: "GDPNow",
+    category: "nowcasts",
+    seriesId: "GDPNOW",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: NOWCAST_QUARTERLY,
+    note: "Atlanta Fed model estimate of real GDP growth, updated within the quarter. Already an annualized percentage change, not a GDP level.",
+    keywords: ["nowcast", "GDP nowcast"],
+  }),
+  stat({
+    id: "nfci",
+    measurementBasis: "Weekly · index",
+    label: "Chicago Fed Financial Conditions",
+    shortLabel: "Chicago NFCI",
+    category: "nowcasts",
+    seriesId: "NFCI",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "",
+    formatValue: index2,
+    reference: { value: 0, label: "average" },
+    staleAfterMs: WEEKLY,
+    note: "Chicago Fed National Financial Conditions Index. Positive values mean tighter-than-average conditions; negative values mean looser conditions.",
+  }),
+  stat({
+    id: "financial-stress",
+    measurementBasis: "Weekly · index",
+    label: "St. Louis Fed Financial Stress",
+    shortLabel: "St. Louis FSI",
+    category: "nowcasts",
+    seriesId: "STLFSI4",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "",
+    formatValue: index2,
+    reference: { value: 0, label: "average" },
+    staleAfterMs: WEEKLY,
+    note: "St. Louis Fed Financial Stress Index, current fourth version. Positive values mean above-average stress; negative values mean below-average stress.",
+  }),
+  stat({
+    id: "median-cpi",
+    measurementBasis: "m/m annualized · seasonally adjusted",
+    label: "Cleveland Fed Median CPI",
+    shortLabel: "Median CPI",
+    category: "nowcasts",
+    seriesId: "MEDCPIM158SFRBCLE",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Cleveland Fed weighted median consumer price change. Published as an annualized monthly percentage change, not a year-over-year inflation rate.",
+  }),
+
+  // ---- Consumer --------------------------------------------------------
+  stat({
+    id: "retail-sales",
+    measurementBasis: "Not adjusted for prices",
+    label: "Retail Sales",
+    shortLabel: "Retail y/y",
+    category: "consumer",
+    seriesId: "RSAFS",
+    transform: "yoy",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "What households actually spent at retailers, not adjusted for prices.",
+    limit: 500,
+  }),
+  stat({
+    id: "core-retail-sales",
+    measurementBasis: "y/y · excludes motor vehicles",
+    label: "Core Retail Sales",
+    shortLabel: "Core retail",
+    category: "consumer",
+    seriesId: "RSFSXMV",
+    transform: "yoy",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Retail sales excluding motor vehicles, which swing the headline around.",
+    limit: 500,
+  }),
+  stat({
+    id: "consumer-sentiment",
+    measurementBasis: "Michigan survey",
+    label: "Consumer Sentiment",
+    shortLabel: "Sentiment",
+    category: "consumer",
+    seriesId: "UMCSENT",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: plain,
+    reference: null,
+    staleAfterMs: MONTHLY_LATE,
+    note: "Michigan's survey of how households feel about their finances.",
+    limit: 900,
+  }),
+  stat({
+    id: "personal-income",
+    measurementBasis: "Before tax",
+    label: "Personal Income",
+    shortLabel: "Income m/m",
+    category: "consumer",
+    seriesId: "PI",
+    transform: "mom",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_LATE,
+    note: "What households received before tax, month on month.",
+    limit: 900,
+  }),
+  stat({
+    id: "personal-spending",
+    label: "Personal Spending",
+    shortLabel: "Spending m/m",
+    category: "consumer",
+    seriesId: "PCE",
+    transform: "mom",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_LATE,
+    note: "What households spent, the largest single component of GDP.",
+    limit: 900,
+  }),
+
+  // ---- Housing ---------------------------------------------------------
+  stat({
+    id: "housing-starts",
+    measurementBasis: "Annual rate",
+    label: "Housing Starts",
+    shortLabel: "Starts",
+    category: "housing",
+    seriesId: "HOUST",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: thousands,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Homes broken ground on, at an annual rate.",
+    limit: 900,
+  }),
+  stat({
+    id: "building-permits",
+    label: "Building Permits",
+    shortLabel: "Permits",
+    category: "housing",
+    seriesId: "PERMIT",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: thousands,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Permits issued, which lead starts by a month or two.",
+    limit: 900,
+  }),
+  stat({
+    id: "new-home-sales",
+    measurementBasis: "Annual rate",
+    label: "New Home Sales",
+    shortLabel: "New homes",
+    category: "housing",
+    seriesId: "HSN1F",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: thousands,
+    reference: null,
+    staleAfterMs: MONTHLY_LATE,
+    note: "Newly built homes sold, at an annual rate.",
+    limit: 900,
+  }),
+  stat({
+    id: "mortgage-30y",
+    measurementBasis: "Weekly · Freddie Mac PMMS",
+    label: "30-Year Mortgage Rate",
+    shortLabel: "30Y mortgage rate",
+    category: "housing",
+    seriesId: "MORTGAGE30US",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: null,
+    staleAfterMs: WEEKLY,
+    note: "Freddie Mac's weekly average 30-year fixed mortgage rate, what a home purchase is financed at.",
+    keywords: ["mortgage rates", "PMMS", "Freddie Mac", "homebuilders"],
+  }),
+  stat({
+    id: "mortgage-spread",
+    measurementBasis: "30Y mortgage minus 10Y Treasury on the PMMS date",
+    label: "Mortgage–10Y Spread (bp)",
+    shortLabel: "Mortgage–10Y (bp)",
+    category: "housing",
+    seriesId: "MORTGAGE30US10Y",
+    derivedFrom: ["mortgage-30y", "ten-year"],
+    transform: "level",
+    // Gloom Cloud serves it in percentage points, as FRED does its spreads.
+    scale: 100,
+    direction: "neutral",
+    axisUnit: "",
+    formatValue: basisPoints,
+    reference: null,
+    staleAfterMs: WEEKLY,
+    note: "The 30-year mortgage rate less the 10-year Treasury yield on each survey date, how much mortgages pay over Treasuries.",
+    keywords: ["mortgage spread", "PMMS", "homebuilders"],
+  }),
+  // ---- Rates & money ---------------------------------------------------
+  stat({
+    id: "fed-funds",
+    measurementBasis: "Daily · overnight",
+    label: "Effective Federal Funds Rate",
+    shortLabel: "Fed funds",
+    category: "rates",
+    seriesId: "EFFR",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: null,
+    staleAfterMs: DAILY,
+    note: "Daily effective overnight rate; the FOMC sets a separate target range.",
+    rankMoves: true,
+  }),
+  stat({
+    id: "ten-year",
+    label: "10-Year Treasury",
+    shortLabel: "10Y yield",
+    category: "rates",
+    seriesId: "DGS10",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: null,
+    staleAfterMs: DAILY,
+    note: "The benchmark long rate that discounts almost everything else.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
+  }),
+  stat({
+    id: "two-year",
+    label: "2-Year Treasury",
+    shortLabel: "2Y yield",
+    category: "rates",
+    seriesId: "DGS2",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: null,
+    staleAfterMs: DAILY,
+    note: "The short end, which tracks where policy is expected to go.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
+  }),
+  stat({
+    id: "curve-spread",
+    measurementBasis: "10Y minus 2Y",
+    label: "10Y minus 2Y Spread",
+    shortLabel: "2s10s",
+    category: "rates",
+    seriesId: "T10Y2Y",
+    derivedFrom: ["ten-year", "two-year"],
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct2,
+    basisPoints: true,
+    reference: { value: 0, label: "inversion" },
+    staleAfterMs: DAILY,
+    note: "The curve spread. Below zero it has preceded every modern recession.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
+  }),
+  stat({
+    id: "real-ten-year",
+    measurementBasis: "Inflation-protected",
+    label: "10-Year Real Yield",
+    shortLabel: "10Y real",
+    category: "rates",
+    seriesId: "DFII10",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: { value: 0, label: "zero" },
+    staleAfterMs: DAILY,
+    note: "The inflation-protected long rate, the real cost of money.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
+  }),
+  stat({
+    id: "m2-yoy",
+    label: "M2 Money Stock",
+    shortLabel: "M2 y/y",
+    category: "rates",
+    seriesId: "M2SL",
+    transform: "yoy",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: MONTHLY_LATE,
+    note: "Money supply growth, which contracted outright for the first time in 2022.",
+    limit: 900,
+  }),
+
+  // ---- Trade & costs ---------------------------------------------------
+  stat({
+    id: "trade-balance",
+    measurementBasis: "Goods & services · exports minus imports",
+    label: "Trade Balance",
+    shortLabel: "Trade balance",
+    category: "trade",
+    seriesId: "BOPGSTB",
+    transform: "level",
+    scale: 0.001,
+    direction: "higher-is-good",
+    axisUnit: "",
+    formatValue: billions,
+    reference: { value: 0, label: "balanced" },
+    staleAfterMs: MONTHLY_LAGGED,
+    note: "Goods and services exported less imported, persistently negative.",
+    limit: 500,
+  }),
+  stat({
+    id: "productivity",
+    measurementBasis: "q/q annualized · output per hour",
+    label: "Nonfarm Productivity",
+    shortLabel: "Productivity",
+    category: "trade",
+    seriesId: "OPHNFB",
+    transform: "qoq-annualized",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: QUARTERLY,
+    note: "Output per hour worked. It is what lets pay rise without inflation.",
+    limit: 400,
+  }),
+  stat({
+    id: "unit-labor-costs",
+    measurementBasis: "q/q annualized",
+    label: "Unit Labor Costs",
+    shortLabel: "Labor costs",
+    category: "trade",
+    seriesId: "ULCNFB",
+    transform: "qoq-annualized",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: QUARTERLY,
+    note: "What a unit of output costs in labour, pay growth net of productivity.",
+    limit: 400,
+  }),
+];
+
+export const DEFAULT_STAT_ID = STATS[0]!.id;
+
+/** A statistic an argument names, and what to say when it had to be read. */
+interface StatArgRead {
+  stat: StatDef;
+  /** "Read "PCE" as PCE Prices (PCE y/y)." when the argument is a name or a prefix, not the statistic's id, label or FRED series; null when it spelled one. */
+  readAs: string | null;
+}
+
+/**
+ * Reads a shortcut argument like `ECST cpi` as a statistic. What it is called
+ * comes before what FRED files it under: a statistic's id, its label, one of
+ * its common names (`PCE`, `gdp`), then a FRED series id, then the start of
+ * an id or a label, and only then a group the catalog lists (`inflation` is
+ * its first statistic, CPI y/y), so a word that named a statistic before
+ * keeps naming it (`consumer` is consumer sentiment). A name, a start or a
+ * group says what it read, and a name that is also another statistic's FRED
+ * series (`PCE` is personal spending there) points at it.
+ */
+export function readStatArg(arg: string | null | undefined): StatArgRead | null {
+  const query = arg?.trim().toLowerCase();
+  if (!query) return null;
+  const exact = STATS.find((entry) => entry.id === query)
+    ?? STATS.find((entry) => entry.label.toLowerCase() === query || entry.shortLabel.toLowerCase() === query);
+  if (exact) return { stat: exact, readAs: null };
+  const named = STATS.find((entry) => entry.aliases?.some((alias) => alias.toLowerCase() === query));
+  const series = STATS.find((entry) => entry.seriesId.toLowerCase() === query);
+  if (!named && series) return { stat: series, readAs: null };
+  const stat = named ?? STATS.find((entry) =>
+    entry.id.startsWith(query)
+    || entry.label.toLowerCase().startsWith(query)
+    || entry.shortLabel.toLowerCase().startsWith(query));
+  if (!stat) {
+    // A group's word (the catalog lists them as keywords) that names no statistic reads as the group's first one.
+    const group = STAT_CATEGORIES.find((entry) => entry.id === query || entry.label.toLowerCase() === query);
+    const first = group ? STATS.find((entry) => entry.category === group.id) : undefined;
+    return first ? { stat: first, readAs: `Read "${arg!.trim()}" as ${first.label} (${first.shortLabel}), the first ${group!.label.toLowerCase()} statistic.` } : null;
+  }
+  const otherSeries = series && series !== stat
+    ? ` FRED's series ${series.seriesId} is ${series.label.toLowerCase()}: type ${series.id} for it.` : "";
+  return { stat, readAs: `Read "${arg!.trim()}" as ${stat.label} (${stat.shortLabel}).${otherSeries}` };
+}
+
+/** Resolves shortcut arguments like `ECST cpi` onto a statistic. */
+export function resolveStatArg(arg: string | null | undefined): StatDef | null {
+  return readStatArg(arg)?.stat ?? null;
+}

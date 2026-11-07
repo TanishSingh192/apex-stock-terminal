@@ -1,0 +1,276 @@
+import { apiClient } from "../../../api-client";
+import { createTtlCache } from "../../../data/ttl-cache";
+import { getSharedMarketDataCoordinator, MarketDataCoordinator, resolveEntryValue } from "../../../market-data/coordinator";
+import type { InstrumentRef, OptionsRequest } from "../../../market-data/request-types";
+import type { QueryEntry } from "../../../market-data/result-types";
+import type { DataProvider } from "../../../types/data-provider";
+import type { OptionsChain, Quote } from "../../../types/financials";
+import { daysToExpiryFrom } from "../shared/volatility";
+import type { YieldPoint } from "../yield-curve/treasury-data";
+import {
+  buildSurfaceExpiry, normalizeSurfaceSettings, pendingSurfaceExpiry, surfaceCalendarWarnings, withSurfaceTermSlopes,
+  type SurfaceExpiry, type SurfaceFailure, type SurfaceSettings, type SurfaceSnapshot,
+} from "./model";
+import { abortable, abortError } from "../../../utils/async-deadline";
+import { errorMessage } from "../../../utils/errors";
+import { expiredExpiryText, findListedExpiry, isLiveOptionExpiry, liveOptionExpiries, optionExpiryVenue, unlistedExpiryText } from "../../../utils/option-expiry";
+import { optionModelSpot } from "../options/model-spot";
+import { logFailure } from "../../../utils/log-failure";
+
+const DEFAULT_SURFACE_EXPIRY_LIMIT = 18;
+/** Expiries read at a time from a source that takes them one by one. */
+const SURFACE_LOAD_CONCURRENCY = 4;
+/**
+ * Expiries asked at once from a source that batches them (`batchesExpiries`):
+ * the API client sends one listing's expiries asked in one moment in batch
+ * requests of six, side by side.
+ */
+const SURFACE_BATCHED_CONCURRENCY = 48;
+/** Each kept expiry must be at least this much further out than the previous one. */
+const SURFACE_TENOR_RATIO = 1.35;
+
+/**
+ * Daily and weekly listings are thinned geometrically so a bounded request spans
+ * the term structure instead of the front month. Every expiry within the limit is
+ * still loaded when the catalogue is short; a larger limit adds the skipped
+ * expiries starting from the longest tenor.
+ */
+export function selectSurfaceExpiries(catalogue: readonly number[], limit: number, now: number): number[] {
+  const sorted = [...new Set(catalogue)].sort((a, b) => a - b);
+  const kept: number[] = [];
+  const skipped: number[] = [];
+  let lastDays = 0;
+  for (const expiration of sorted) {
+    const days = daysToExpiryFrom(expiration, now);
+    if (kept.length === 0 || days >= lastDays * SURFACE_TENOR_RATIO) {
+      kept.push(expiration);
+      lastDays = days;
+    } else skipped.push(expiration);
+  }
+  return [...kept, ...skipped.reverse()].slice(0, Math.max(0, limit)).sort((a, b) => a - b);
+}
+
+export interface SurfaceLoaderDependencies {
+  loadOptions(request: OptionsRequest, options?: { forceRefresh?: boolean; batch?: boolean }): Promise<QueryEntry<OptionsChain>>;
+  loadYieldCurve(): Promise<YieldPoint[]>;
+  /** Whether `loadOptions` reaches a source that batches expiries asked together; absent, four are read at a time. */
+  batchesExpiries?(): boolean | Promise<boolean>;
+  now?: () => number;
+}
+
+/** The pane and headless path both use the existing coordinator's option-chain loader. */
+export function createSurfaceDependencies(
+  marketData?: DataProvider,
+  cloudApi: { getCloudYieldCurve(): Promise<YieldPoint[]> } = apiClient,
+): SurfaceLoaderDependencies {
+  const coordinator = marketData ? new MarketDataCoordinator(marketData) : getSharedMarketDataCoordinator();
+  return {
+    loadOptions: (request, options) => coordinator
+      ? coordinator.loadOptions(request, options)
+      : Promise.reject(new Error("Market data coordinator unavailable")),
+    batchesExpiries: () => coordinator?.batchesOptions() ?? false,
+    loadYieldCurve: () => cloudApi.getCloudYieldCurve(),
+  };
+}
+
+/** The Treasury curve is published daily; repeated live reloads read it once per window. */
+const TREASURY_CURVE_REUSE_MS = 30 * 60_000;
+
+/**
+ * Dependencies whose Treasury curve is loaded once and reused for `reuseMs`,
+ * shared by concurrent callers. A failed load is not kept, so the next reload
+ * retries it.
+ */
+export function withReusedYieldCurve(
+  dependencies: SurfaceLoaderDependencies,
+  reuseMs = TREASURY_CURVE_REUSE_MS,
+): SurfaceLoaderDependencies {
+  const curves = createTtlCache<YieldPoint[]>({ ttlMs: reuseMs });
+  return { ...dependencies, loadYieldCurve: () => curves.load("curve", () => dependencies.loadYieldCurve()) };
+}
+
+export interface SurfaceLoadRequest {
+  instrument: InstrumentRef;
+  spot: number;
+  spotAsOf?: string | number | null;
+  /**
+   * The underlying's quote, to read the spot from as OMON reads it
+   * (`optionModelSpot`): a chain from a closed session is priced at that
+   * session's official close, which the quote carries, so the same chain
+   * gives the same surface whatever trades before the next open. Without
+   * it, or without a chain to date, `spot` is used as given.
+   */
+  quote?: Quote | null;
+  settings?: Partial<SurfaceSettings>;
+  limit?: number;
+  /** Listed expiries required by a selection, added to the representative sample. */
+  requiredExpiries?: readonly number[];
+  /**
+   * Load exactly these listed expiries instead of a representative sample.
+   * The catalogue is then read from cache and only these slices refresh.
+   */
+  expiries?: readonly number[];
+  signal?: AbortSignal;
+  onSnapshot?: (snapshot: SurfaceSnapshot) => void;
+  forceRefresh?: boolean;
+}
+
+const CANCELLED = "Surface load was cancelled";
+
+/**
+ * Publishes immutable partial snapshots as each expiry completes. Cancellation
+ * stops queued work and emissions, but does not abort a shared OMON request.
+ * Increasing limit reuses the same coordinator keys for already-loaded expiries.
+ */
+export async function loadVolatilitySurface(
+  request: SurfaceLoadRequest,
+  dependencies: SurfaceLoaderDependencies = createSurfaceDependencies(),
+): Promise<SurfaceSnapshot> {
+  const now = dependencies.now?.() ?? Date.now();
+  const settings = normalizeSurfaceSettings(request.settings);
+  const limit = Number.isFinite(request.limit) ? Math.max(1, Math.floor(request.limit!)) : DEFAULT_SURFACE_EXPIRY_LIMIT;
+  const symbol = request.instrument.symbol.trim().toUpperCase();
+  const entries = new Map<number, QueryEntry<OptionsChain>>();
+  const errors = new Map<number, string>();
+  const models = new Map<number, { entry: QueryEntry<OptionsChain>; curve: readonly YieldPoint[]; value: SurfaceExpiry }>();
+  let catalogue: number[] = [];
+  let selected: number[] = [];
+  let curve: YieldPoint[] = [];
+  let curvePending = true;
+  let cataloguePending = true;
+  let catalogueError: string | null = null;
+  let catalogueReason: string | undefined;
+  let requiredFailures: SurfaceFailure[] = [];
+  let catalogueExpiration: number | null = null;
+  let treasuryError: string | null = null;
+  let finished = false;
+  let spot = request.spot;
+  let spotAsOf = request.spotAsOf ?? null;
+  let spotBasis: SurfaceSnapshot["spotBasis"] = null;
+  const checkAbort = () => { if (request.signal?.aborted) throw abortError(CANCELLED); };
+  const snapshot = (): SurfaceSnapshot => {
+    const failures: SurfaceFailure[] = [];
+    if (catalogueError) failures.push({ expiration: null, message: catalogueError, ...catalogueReason ? { reasonCode: catalogueReason } : {} });
+    failures.push(...requiredFailures);
+    if (treasuryError) failures.push({ expiration: null, message: treasuryError });
+    const projected = selected.map((expiration) => {
+      const entry = entries.get(expiration);
+      const error = errors.get(expiration) ?? entry?.error?.message ?? null;
+      if (error) failures.push({ expiration, message: error });
+      const chain = entry ? resolveEntryValue(entry) : null;
+      if (!entry || !chain) {
+        const empty = pendingSurfaceExpiry(expiration, now);
+        if (entry || error) { empty.state = "error"; empty.error = error ?? "Options chain unavailable"; }
+        return empty;
+      }
+      const cached = models.get(expiration);
+      if (cached?.entry === entry && cached.curve === curve) return cached.value;
+      const value = buildSurfaceExpiry({ chain, expiration, spot, curve, settings, now,
+        source: entry.source, stale: !!entry.error || (entry.staleAt != null && entry.staleAt <= now), error });
+      models.set(expiration, { entry, curve, value });
+      return value;
+    });
+    const expiries = withSurfaceTermSlopes(projected);
+    const loaded = selected.filter((expiration) => entries.has(expiration) || errors.has(expiration)).length;
+    const failed = failures.filter((failure) => failure.expiration != null).length;
+    const ready = expiries.some((expiry) => expiry.fit != null);
+    const pending = cataloguePending || curvePending || loaded < selected.length;
+    const phase = pending && !finished ? (loaded > 0 ? "partial" : "loading")
+      : failures.length > 0 ? (ready ? "partial" : "error") : "ready";
+    const dates = [...new Set(expiries.flatMap((expiry) => expiry.rateAsOf))];
+    return {
+      symbol, spot, spotAsOf, ...spotBasis ? { spotBasis } : {}, phase, settings, catalogue: [...catalogue],
+      requested: selected.length, loaded, failed, expiries, failures,
+      warnings: [...new Set([...expiries.flatMap((expiry) => expiry.warnings), ...surfaceCalendarWarnings(expiries)])],
+      rateAsOf: dates.length === 1 ? dates[0]! : null, fetchedAt: now,
+    };
+  };
+  const publish = () => {
+    if (!request.signal?.aborted) request.onSnapshot?.(snapshot());
+  };
+  checkAbort();
+  publish();
+  // Asked while the catalogue loads, so it costs the expiries no wait.
+  const batched = Promise.resolve().then(() => dependencies.batchesExpiries?.()).then((answer) => answer === true, logFailure("vol-surface.client", "Read expiry batching support failed", false));
+  const treasury = Promise.resolve().then(() => dependencies.loadYieldCurve()).then((value) => {
+    if (request.signal?.aborted) return;
+    curve = value;
+  }).catch((error) => { treasuryError = `Treasury: ${errorMessage(error)}`; }).finally(() => {
+    curvePending = false;
+    publish();
+  });
+
+  // Expiries close on the listing's clock: a coin's options (Deribit) settle at 08:00 UTC on any day.
+  const expiryVenue = optionExpiryVenue(request.instrument.symbol, request.instrument.exchange);
+  try {
+    const initial = await abortable(dependencies.loadOptions({ instrument: request.instrument },
+      { forceRefresh: request.expiries ? false : request.forceRefresh }), request.signal, CANCELLED);
+    checkAbort();
+    const chain = resolveEntryValue(initial);
+    // Every expiry is valued at one spot, read against the catalogue chain's time before any expiry is fitted.
+    const modelSpot = request.quote ? optionModelSpot(request.quote, chain, now, request.instrument.exchange) : null;
+    if (modelSpot) {
+      spot = modelSpot.price;
+      spotAsOf = modelSpot.observedAt;
+      spotBasis = { basis: modelSpot.basis, session: modelSpot.session,
+        sessionDate: modelSpot.basis === "close" ? request.quote!.regularCloseSessionDate ?? null : null };
+    }
+    const initialContracts = chain ? [...chain.calls, ...chain.puts] : [];
+    const representedExpiry = initialContracts[0]?.expiration;
+    if (representedExpiry != null && initialContracts.every((contract) => contract.expiration === representedExpiry)
+      && chain?.expirationDates.includes(representedExpiry)) catalogueExpiration = representedExpiry;
+    catalogueError = initial.error?.message ?? null;
+    catalogueReason = initial.error?.reasonCode;
+    if (!chain) catalogueError ??= "Options expiry catalogue unavailable";
+    catalogue = liveOptionExpiries(chain?.expirationDates ?? [], now, expiryVenue);
+    // A typed date is that day's UTC midnight; the catalogue's stamp for the
+    // same expiry is matched by calendar date, as OMON matches it.
+    const required = [...new Set([...(request.requiredExpiries ?? []), ...(request.expiries ?? [])]
+      .filter((expiration) => Number.isFinite(expiration) && expiration > 0)
+      .map((expiration) => findListedExpiry(expiration, catalogue) ?? expiration))];
+    const listed = new Set(catalogue);
+    selected = [...new Set([...request.expiries ? [] : selectSurfaceExpiries(catalogue, limit, now),
+      ...required.filter((expiration) => listed.has(expiration))])].sort((a, b) => a - b);
+    // An expiry whose last session has closed is named as expired, with the nearest live one to pick.
+    requiredFailures = required.filter((expiration) => !listed.has(expiration)).map((expiration) => ({
+      expiration, message: isLiveOptionExpiry(expiration, now, expiryVenue) ? unlistedExpiryText(expiration, catalogue)
+        : expiredExpiryText(expiration, catalogue, now, { exchange: expiryVenue }),
+    }));
+    if (chain && catalogue.length === 0) catalogueError ??= "No unexpired option expiries available";
+  } catch (error) {
+    if (request.signal?.aborted) throw abortError(CANCELLED);
+    catalogueError = errorMessage(error);
+    catalogueReason = undefined;
+  } finally {
+    cataloguePending = false;
+    publish();
+  }
+
+  // A source that takes expiries one by one is asked four at a time, and a cancelled load asks for no more.
+  const batch = await abortable(batched, request.signal, CANCELLED);
+  const concurrency = batch ? SURFACE_BATCHED_CONCURRENCY : SURFACE_LOAD_CONCURRENCY;
+  let next = 0;
+  const worker = async () => {
+    while (!request.signal?.aborted && next < selected.length) {
+      const expiration = selected[next++]!;
+      try {
+        // The catalogue response already refreshed its own slice, unless it came from cache.
+        const entry = await dependencies.loadOptions({ instrument: request.instrument, expirationDate: expiration },
+          { forceRefresh: !!request.forceRefresh && (!!request.expiries || expiration !== catalogueExpiration), ...(batch ? { batch } : {}) });
+        if (request.signal?.aborted) return;
+        entries.set(expiration, entry);
+        if (!resolveEntryValue(entry) && !entry.error) errors.set(expiration, "Options chain unavailable");
+      } catch (error) {
+        if (request.signal?.aborted) return;
+        errors.set(expiration, errorMessage(error));
+      }
+      publish();
+    }
+  };
+  await abortable(Promise.all([treasury, ...Array.from({ length: Math.min(concurrency, selected.length) }, worker)]), request.signal, CANCELLED);
+  checkAbort();
+  finished = true;
+  const result = snapshot();
+  request.onSnapshot?.(result);
+  return result;
+}

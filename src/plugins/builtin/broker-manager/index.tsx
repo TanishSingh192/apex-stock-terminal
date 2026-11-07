@@ -1,0 +1,412 @@
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import {
+  getVisibleBrokerConfigFields,
+  type BrokerProfileDraft,
+} from "../../../brokers/profile-form";
+import { signedInBrokerAdapter } from "../../../brokers/signed-in/adapter";
+import {
+  attachSignedInBrokerPersistence,
+  getSignedInBrokers,
+  refreshSignedInBrokers,
+  resetSignedInBrokerCatalog,
+  subscribeSignedInBrokers,
+} from "../../../brokers/signed-in/catalog";
+import { Button, DataTableStackView, EmptyState } from "../../../components";
+import { t } from "../../../i18n";
+import { useAppLanguage } from "../../../i18n/react";
+import {
+  useAppDispatch,
+  useAppSelector,
+  usePaneAppConfig,
+  usePaneInstanceId,
+  usePaneStateValue,
+} from "../../../state/app/context";
+import type { BrokerAdapter } from "../../../types/broker";
+import type { PaneProps } from "../../../types/plugin";
+import { Box, useUiCapabilities } from "../../../ui";
+import { getCurrentPluginTarget } from "../../current-target";
+import { usePluginBrokerActions, usePluginPaneState } from "../../runtime";
+import type { PluginModule } from "../plugin-module";
+import { BrokerAddFlowContent, useBrokerAddFlow } from "./add-flow";
+import { BROKER_ADD_REQUEST_KEY } from "./add-request";
+import { BrokerDetailContent, type BrokerEditKey } from "./detail";
+import { useBrokerManagerFooter } from "./footer";
+import { useBrokerManagerKeyboard } from "./keyboard";
+import {
+  buildBrokerProfileRows,
+  type BrokerProfileRow,
+} from "./model";
+import { useBrokerManagerActions } from "./pane-actions";
+import { useSignInEnds } from "./sign-in-end";
+import {
+  buildBrokerColumns,
+  renderBrokerCell,
+  type BrokerColumn,
+} from "./table";
+import { logFailure } from "../../../utils/log-failure";
+
+export function BrokersPane({ focused, width, height }: PaneProps) {
+  const language = useAppLanguage();
+  const dispatch = useAppDispatch();
+  const config = usePaneAppConfig();
+  const paneId = usePaneInstanceId();
+  const brokerAccounts = useAppSelector((state) => state.brokerAccounts);
+  const brokerSyncErrors = useAppSelector((state) => state.brokerSyncErrors);
+  const { getBrokerAdapter, getBrokerLogo } = usePluginBrokerActions();
+  const desktop = useUiCapabilities().nativePaneChrome === true;
+  // The profile is remembered by id so a reload lands on the same row.
+  const [selectedId, setSelectedId] = usePluginPaneState<string | null>("selectedId", null);
+  const [detailOpen, setDetailOpen] = usePluginPaneState<boolean>("detailOpen", false);
+  const [editDraft, setEditDraft] = useState<BrokerProfileDraft | null>(null);
+  const [activeEditKey, setActiveEditKey] = useState<BrokerEditKey>("label");
+  const [statusVersion, setStatusVersion] = useState(0);
+
+  const adapters = useMemo(() => {
+    const next = new Map<string, BrokerAdapter | null>();
+    for (const instance of config.brokerInstances) {
+      if (!next.has(instance.brokerType)) next.set(instance.brokerType, getBrokerAdapter(instance.brokerType));
+    }
+    return next;
+  }, [config.brokerInstances, getBrokerAdapter]);
+
+  useEffect(() => {
+    const disposers = config.brokerInstances.flatMap((instance) => {
+      const adapter = getBrokerAdapter(instance.brokerType);
+      const dispose = adapter?.subscribeStatus?.(instance, () => setStatusVersion((version) => version + 1));
+      return dispose ? [dispose] : [];
+    });
+    return () => {
+      for (const dispose of disposers) dispose();
+    };
+  }, [config.brokerInstances, getBrokerAdapter]);
+
+  // Signed-in profiles take their broker's name from the connector list.
+  const signedInBrokers = useSyncExternalStore(subscribeSignedInBrokers, getSignedInBrokers, getSignedInBrokers);
+  const { ends: signInEnds, reload: reloadSignInEnds } = useSignInEnds(config.brokerInstances);
+  const rows = useMemo(
+    () => buildBrokerProfileRows(config, adapters, brokerAccounts, signInEnds, getBrokerLogo, brokerSyncErrors),
+    [adapters, brokerAccounts, brokerSyncErrors, config, getBrokerLogo, language, signInEnds, signedInBrokers, statusVersion],
+  );
+  const selectedIndex = Math.max(0, rows.findIndex((row) => row.id === selectedId));
+  const selectedRow = rows[selectedIndex] ?? null;
+  const selectedAccounts = selectedRow ? brokerAccounts[selectedRow.id] ?? [] : [];
+  const editFields = editDraft && selectedRow?.adapter
+    ? getVisibleBrokerConfigFields(selectedRow.adapter, editDraft.values)
+    : [];
+  const editKeys = useMemo<BrokerEditKey[]>(
+    () => ["label", "enabled", ...editFields.map((field) => field.key), "localOnly"],
+    [editFields],
+  );
+  const editSelectKeys = useMemo<ReadonlySet<BrokerEditKey>>(
+    () => new Set(["enabled", "localOnly", ...editFields.filter((field) => field.type === "select").map((field) => field.key)]),
+    [editFields],
+  );
+  const editScope = `broker-edit:${paneId}`;
+
+  useEffect(() => {
+    if (rows.length === 0 && detailOpen) setDetailOpen(false);
+  }, [detailOpen, rows.length, setDetailOpen]);
+
+  useEffect(() => {
+    if (!editDraft) return;
+    if (!editKeys.includes(activeEditKey)) setActiveEditKey(editKeys[0] ?? "label");
+  }, [activeEditKey, editDraft, editKeys]);
+
+  // After a connect or sync, which can renew a sign-in or find it ended.
+  const refreshStatuses = useCallback(() => {
+    setStatusVersion((version) => version + 1);
+    reloadSignInEnds();
+  }, [reloadSignInEnds]);
+
+  const {
+    busy,
+    paneBusy,
+    message,
+    editError,
+    rowActivity,
+    setBusy,
+    setMessage,
+    setRowNote,
+    startEdit,
+    cancelEdit,
+    saveEdit,
+    connectSelected,
+    enableSelected,
+    syncSelected,
+    selectedProfileActions,
+    openProfileAction,
+    removeSelected,
+  } = useBrokerManagerActions({
+    rows,
+    selectedRow,
+    editDraft,
+    setEditDraft,
+    setActiveEditKey,
+    setDetailOpen,
+    setSelectedId,
+    refreshStatuses,
+  });
+
+  const selectAddedProfile = useCallback((instanceId: string) => {
+    setSelectedId(instanceId);
+    setEditDraft(null);
+    setDetailOpen(false);
+  }, [setDetailOpen, setSelectedId]);
+  const addFlow = useBrokerAddFlow({ setBusy, setMessage, setRowNote, onProfileAdded: selectAddedProfile });
+  const adding = addFlow.flow !== null;
+  const { start: startAddFlow } = addFlow;
+  const startAdd = useCallback(() => {
+    setEditDraft(null);
+    setDetailOpen(false);
+    startAddFlow();
+  }, [setDetailOpen, startAddFlow]);
+
+  // Add Broker Account from the command bar or a menu asks through pane state.
+  // Work under way stays: an add already open is the one asked for, and an
+  // edit is saved or cancelled first.
+  const [addRequest, setAddRequest] = usePaneStateValue<number | null>(BROKER_ADD_REQUEST_KEY, null);
+  const editing = editDraft !== null;
+  useEffect(() => {
+    if (addRequest == null) return;
+    setAddRequest(null);
+    if (adding) return;
+    if (editing) setMessage({ tone: "info", text: t("Save or cancel the edit first.") });
+    else startAdd();
+  }, [addRequest, adding, editing, setAddRequest, setMessage, startAdd]);
+
+  // A text field has the keyboard, so global shortcuts wait.
+  const capturesInput = !!editDraft || addFlow.capturesInput;
+  useEffect(() => {
+    if (!focused || !capturesInput) return;
+    dispatch({ type: "SET_INPUT_CAPTURED", captured: true });
+    return () => {
+      dispatch({ type: "SET_INPUT_CAPTURED", captured: false });
+    };
+  }, [capturesInput, dispatch, focused]);
+
+  const hasSelectedRow = selectedRow !== null;
+  const selectedHasAdapter = !!selectedRow?.adapter;
+  const canUseSelectedBroker = selectedHasAdapter && !busy;
+  const canOpenSelectedAction = selectedProfileActions.some((action) => !action.disabled && action.paneId);
+  const canRemoveSelected = hasSelectedRow && !busy;
+
+  useBrokerManagerFooter({
+    busy,
+    paneBusy,
+    message,
+    actions: {
+      connectSelected,
+      enableSelected,
+      openProfileAction,
+      removeSelected,
+      saveEdit,
+      startAdd,
+      startEdit,
+      syncSelected,
+    },
+    canOpenSelectedAction,
+    canRemoveSelected,
+    canUseSelectedBroker,
+    disabledSelected: selectedRow?.instance.enabled === false ? selectedRow.brokerName : null,
+    editing: !!editDraft || adding,
+  });
+
+  const cycleEditSelect = useCallback((key: BrokerEditKey, direction: -1 | 1) => {
+    if (key === "enabled" || key === "localOnly") {
+      setEditDraft((current) => current ? { ...current, [key]: !current[key] } : current);
+      return;
+    }
+    const options = editFields.find((field) => field.key === key)?.options ?? [];
+    if (options.length === 0) return;
+    setEditDraft((current) => {
+      if (!current) return current;
+      const index = options.findIndex((option) => option.value === current.values[key]);
+      const next = options[index < 0 ? 0 : (index + direction + options.length) % options.length];
+      return next ? { ...current, values: { ...current.values, [key]: next.value } } : current;
+    });
+  }, [editFields]);
+
+  useBrokerManagerKeyboard({
+    activeEditKey,
+    editing: !!editDraft,
+    focused,
+    scope: editScope,
+    selectKeys: editSelectKeys,
+    onCancelEdit: cancelEdit,
+    onCycleSelect: cycleEditSelect,
+    saveEdit,
+  });
+
+  const bodyHeight = Math.max(5, height);
+  const tableWidth = Math.max(24, width);
+  const columns = useMemo(() => buildBrokerColumns(tableWidth), [language, tableWidth]);
+
+  const renderCell = useCallback(
+    (row: BrokerProfileRow, column: BrokerColumn) => renderBrokerCell(row, column, desktop, rowActivity(row)),
+    [desktop, rowActivity],
+  );
+
+  const openSelectedDetail = useCallback((_index: number, row: BrokerProfileRow) => {
+    setSelectedId(row.id);
+    cancelEdit();
+    setDetailOpen(true);
+  }, [cancelEdit, setDetailOpen, setSelectedId]);
+
+  const selectBrokerRow = useCallback((_index: number, row: BrokerProfileRow) => {
+    setSelectedId(row.id);
+    if (selectedRow?.id !== row.id) cancelEdit();
+  }, [cancelEdit, selectedRow?.id, setSelectedId]);
+
+  const updateDraftValue = useCallback((key: string, value: string) => {
+    setEditDraft((current) => current
+      ? { ...current, values: { ...current.values, [key]: value } }
+      : current);
+  }, []);
+
+  const updateDraftLabel = useCallback((label: string) => {
+    setEditDraft((current) => current ? { ...current, label } : current);
+  }, []);
+
+  const updateDraftEnabled = useCallback((enabled: boolean) => {
+    setEditDraft((current) => current ? { ...current, enabled } : current);
+  }, []);
+
+  const updateDraftLocalOnly = useCallback((localOnly: boolean) => {
+    setEditDraft((current) => current ? { ...current, localOnly } : current);
+  }, []);
+
+  const saveCurrentEdit = useCallback(() => {
+    saveEdit().catch(logFailure("broker-manager", "Save broker profile edit failed"));
+  }, [saveEdit]);
+
+  // The detail insets one cell each side like the table cells.
+  const detailContentWidth = Math.max(24, tableWidth - 2);
+  const detailContent = adding ? (
+    <BrokerAddFlowContent
+      addFlow={addFlow}
+      busy={busy}
+      focused={focused}
+      width={detailContentWidth}
+      // The stack's Back and title take a row.
+      height={Math.max(1, bodyHeight - 1)}
+      scope={`broker-add:${paneId}`}
+    />
+  ) : (
+    <BrokerDetailContent
+      row={selectedRow}
+      accounts={selectedAccounts}
+      editDraft={editDraft}
+      editFields={editFields}
+      activeEditKey={activeEditKey}
+      editKeys={editKeys}
+      busy={busy}
+      activity={selectedRow ? rowActivity(selectedRow) : {}}
+      editError={editError}
+      width={detailContentWidth}
+      editScope={editScope}
+      paneFocused={focused}
+      onActiveEditKeyChange={setActiveEditKey}
+      onDraftLabelChange={updateDraftLabel}
+      onDraftEnabledChange={updateDraftEnabled}
+      onDraftLocalOnlyChange={updateDraftLocalOnly}
+      onDraftValueChange={updateDraftValue}
+      onSaveEdit={saveCurrentEdit}
+      onCancelEdit={cancelEdit}
+    />
+  );
+
+  return (
+    <Box flexDirection="column" flexGrow={1}>
+      <Box height={bodyHeight} overflow="hidden">
+        <DataTableStackView<BrokerProfileRow, BrokerColumn>
+          focused={focused}
+          detailOpen={adding || (detailOpen && !!selectedRow)}
+          onBack={adding ? addFlow.leave : () => {
+            cancelEdit();
+            setDetailOpen(false);
+          }}
+          detailContent={detailContent}
+          detailTitle={adding ? addFlow.title : selectedRow?.label}
+          rootWidth={tableWidth}
+          rootHeight={bodyHeight}
+          selection={{
+            kind: "index",
+            selectedIndex,
+            onChange: (index, row) => selectBrokerRow(index, row),
+          }}
+          onActivate={(row, index) => openSelectedDetail(index, row)}
+          columns={columns}
+          items={rows}
+          sortColumnId={null}
+          sortDirection="asc"
+          getItemKey={(row) => row.id}
+          renderCell={renderCell}
+          // The same add the footer's a and the command bar start; as the state's first
+          // action it also answers Enter.
+          emptyContent={(
+            <Box width="100%" paddingX={1} paddingY={1}>
+              <EmptyState
+                title={t("No broker profiles.")}
+                actions={<Button label="Add Broker Account" onPress={startAdd} />}
+              />
+            </Box>
+          )}
+          emptyStateTitle={t("No broker profiles.")}
+        />
+      </Box>
+    </Box>
+  );
+}
+
+export const brokerManagerModule: PluginModule = {
+  panes: [
+    {
+      id: "brokers",
+      name: "Brokers",
+      personalData: "account",
+      icon: "B",
+      component: BrokersPane,
+      reportFreshness: { status: "not-a-feed", basis: "broker connections", local: true },
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 92, height: 24 },
+      portableShare: {
+        private: { title: true, params: true, settings: true, state: true },
+      },
+    },
+  ],
+  paneTemplates: [
+    {
+      id: "brokers-pane",
+      paneId: "brokers",
+      label: "Brokers",
+      description: "Open broker profiles and connection status",
+      keywords: ["broker", "brokers", "connection", "status"],
+      shortcut: { prefix: "BR" },
+      createInstance: () => ({ placement: "floating" }),
+    },
+  ],
+
+  setup(ctx) {
+    // Brokers whose connection the Gloom account holds; the backend lists them.
+    ctx.registerBroker(signedInBrokerAdapter);
+    attachSignedInBrokerPersistence(ctx.persistence);
+    // The app fetches the connector list; a CLI run and the desktop's Bun half read the saved one.
+    if (getCurrentPluginTarget() !== "cli") void refreshSignedInBrokers();
+
+    ctx.registerCommand({
+      id: "open-brokers",
+      label: "Open Brokers",
+      description: "Manage broker profiles and connection status",
+      keywords: ["broker", "brokers", "connection", "accounts", "sync"],
+      category: "navigation",
+      execute: () => {
+        ctx.showPane("brokers");
+      },
+    });
+  },
+
+  dispose() {
+    resetSignedInBrokerCatalog();
+  },
+};

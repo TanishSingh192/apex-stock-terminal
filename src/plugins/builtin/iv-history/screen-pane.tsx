@@ -1,0 +1,190 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DataTableView, PaneStatusBody, Prose, QueryBar, usePaneFooter, usePaneNoticeFooter, type DataTableColumn, type DataTableKeyEvent } from "../../../components";
+import { useAsyncResource } from "../../../react/async-resource";
+import { usePaneCollection, usePaneSettingValue, usePluginAppActions, useTickers } from "../../../public/react";
+import { useThemeColors } from "../../../theme/theme-context";
+import type { PaneProps } from "../../../types/plugin";
+import { Box, Text, useUiCapabilities } from "../../../ui";
+import { wrapTextLines } from "../../../utils/text-wrap";
+import { useAutoRefresh } from "../../../react/auto-refresh";
+import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
+import { loadIvScreen, loadScreenVolatilities, type ScreenHv } from "./client";
+import { formatPoints, formatRank, formatSpot, formatVol, readingLabel, sharedDates, shortDate, vcaDefinitions, verdictLabel } from "./format";
+import { projectRichCheap, readingSource, type RichCheapRow, richCheapDates, screenPaneNotices, type VcaPreset } from "./model";
+import { vcaUniverse } from "./universe";
+import { MovedTickerState } from "../../../components/layout/pane/ticker-fate-gate";
+import type { MovedTickerChange } from "../../../tickers/ticker-changes";
+
+type SortId = Exclude<keyof RichCheapRow, "stale">;
+const HV_WINDOW = 20;
+/** Pane borders and the footer's own padding. */
+const FOOTER_MARGIN = 6;
+const COLUMNS: DataTableColumn[] = [
+  { id: "symbol", label: "Symbol", width: 8, align: "left" },
+  { id: "iv30", label: "IV30", width: 7, align: "right" },
+  { id: "date", label: "As of", width: 11, align: "right" },
+  { id: "spot", label: "Spot", width: 9, align: "right" },
+  { id: "rank", label: "IVR", width: 5, align: "right" },
+  { id: "percentile", label: "IVP", width: 5, align: "right" },
+  { id: "verdict", label: "Rich/Cheap", width: 11, align: "left" },
+  { id: "iv1y", label: "IV1Y", width: 7, align: "right" },
+  { id: "iv1yPercentile", label: "IVP1Y", width: 6, align: "right" },
+  { id: "termSlope", label: "30-90", width: 7, align: "right" },
+  { id: "riskReversal", label: "25D RR", width: 9, align: "right" },
+  { id: "skewDate", label: "RR as of", width: 11, align: "right" },
+  { id: "hv", label: `HV${HV_WINDOW}`, width: 7, align: "right" },
+  { id: "hvDate", label: "HV as of", width: 9, align: "right" },
+  { id: "ivHv", label: "IV/HV", width: 6, align: "right" },
+];
+
+export function IvScreenPane({ paneId, width, height, focused }: PaneProps) {
+  const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
+  const [scope, setScope] = usePaneSettingValue("scope", "etfs");
+  const [symbolsText, setSymbolsText] = usePaneSettingValue("symbols", "");
+  const [symbolsActive, setSymbolsActive] = useState(false);
+  const { collectionId } = usePaneCollection();
+  const tickers = useTickers();
+  const { createPaneFromTemplate } = usePluginAppActions();
+  const universe = useMemo(() => vcaUniverse(scope, symbolsText, collectionId, [...tickers.values()]), [scope, symbolsText, collectionId, tickers]);
+  const key = universe.instruments.map((instrument) => instrument.symbol).join(",");
+  const controller = useRef<AbortController | null>(null);
+  const [hv, setHv] = useState<Map<string, ScreenHv | null>>(new Map());
+  // Symbols whose company moved: their rows have no HV and the footer says where each company went.
+  const [moved, setMoved] = useState<Array<{ symbol: string; change: MovedTickerChange }>>([]);
+  const loader = useCallback(async () => {
+    controller.current?.abort();
+    const current = new AbortController();
+    controller.current = current;
+    const payload = await loadIvScreen(universe.instruments.map((instrument) => instrument.symbol), { signal: current.signal });
+    setHv(new Map());
+    setMoved([]);
+    void loadScreenVolatilities(universe.instruments, Promise.resolve(payload.rows), HV_WINDOW, { signal: current.signal,
+      onValue: (symbol, value) => { if (!current.signal.aborted) setHv((previous) => new Map(previous).set(symbol, value)); },
+      onFates: (fates) => {
+        const changes = [...fates].flatMap(([symbol, fate]) => fate.moved ? [{ symbol, change: fate.moved }] : []);
+        if (changes.length === 0) return;
+        setMoved(changes);
+        setHv((previous) => {
+          const next = new Map(previous);
+          for (const change of changes) next.set(change.symbol, null);
+          return next;
+        });
+      } });
+    return payload;
+  }, [key]);
+  const resource = useAsyncResource(universe.instruments.length ? loader : null);
+  useEffect(() => () => controller.current?.abort(), [loader]);
+  useAutoRefresh(resource.updatedAt, resource.load);
+  const [sort, setSort] = useState<{ columnId: SortId; direction: SortDirection }>({ columnId: "percentile", direction: "desc" });
+  const rows = useMemo(() => {
+    const projected = projectRichCheap(resource.data?.rows ?? [], hv);
+    return projected.sort((left, right) => compareSortValues(left[sort.columnId], right[sort.columnId], sort.direction));
+  }, [resource.data, hv, sort]);
+  const dates = useMemo(() => richCheapDates(rows), [rows]);
+  // A date every row shares moves to the footer; a column no row fills, or whose dates agree, is left out.
+  const hasSkew = useMemo(() => rows.some((row) => row.riskReversal != null), [rows]);
+  // A close solved from quote midpoints names itself, which a date alone has no room for.
+  const dateWidth = useMemo(() => rows.some((row) => !row.stale && readingSource(row.method, row.basis) === "close mid") ? 15 : 11, [rows]);
+  const columns = useMemo(() => COLUMNS.filter((column) => {
+    switch (column.id) {
+      case "date": return !dates.reading;
+      case "iv1y": return rows.some((row) => row.iv1y != null);
+      case "iv1yPercentile": return rows.some((row) => row.iv1yPercentile != null);
+      case "riskReversal": return hasSkew;
+      case "skewDate": return dates.skewApart;
+      case "hvDate": return dates.hvApart;
+      default: return true;
+    }
+  }).map((column) => column.id === "date" ? { ...column, width: dateWidth } : column), [rows, dates, hasSkew, dateWidth]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const coverageNotices = useMemo(() => screenPaneNotices(rows), [rows]);
+  // One symbol to screen whose company moved has nothing to show but where it went, as a ticker's panes say.
+  const movedOnly = universe.instruments.length === 1 && moved[0]?.symbol === universe.instruments[0]!.symbol ? moved[0]!.change : null;
+  const notices = [universe.error, resource.error, ...(movedOnly ? [] : [...moved.map((entry) => entry.change.note), ...coverageNotices])]
+    .filter((value): value is string => !!value);
+  usePaneNoticeFooter({ registrationId: "iv-screen-notices", notices, focused });
+  const openHistory = (row: RichCheapRow) => createPaneFromTemplate("iv-history-pane", { symbol: row.symbol });
+  // The full wording gives way to the short form in a pane too narrow to show the rank date.
+  const fullDatesText = useMemo(() => sharedDates(dates).join(" · "), [dates]);
+  const datesText = fullDatesText.length + FOOTER_MARGIN > width ? sharedDates(dates, true).join(" · ") : fullDatesText;
+  usePaneFooter("iv-screen", () => ({ info: [
+    ...(resource.loading ? [{ id: "loading", parts: [{ text: "loading", tone: "muted" as const }] }] : []),
+    ...(datesText ? [{ id: "dates", parts: [{ text: datesText, tone: "muted" as const }] }] : []),
+  ] }), [resource.loading, datesText]);
+  const handleKey = (event: DataTableKeyEvent): boolean => {
+    if (event.ctrl || event.alt || event.meta || event.name !== "r") return false;
+    void resource.reload();
+    event.preventDefault?.(); event.stopPropagation?.(); return true;
+  };
+  const cell = (row: RichCheapRow, id: string): { text: string; color?: string } => {
+    switch (id) {
+      case "symbol": return { text: row.symbol, color: colors.textBright };
+      case "iv30": return { text: formatVol(row.iv30), color: row.stale ? colors.textDim : colors.warning };
+      case "spot": return { text: formatSpot(row.spot), color: colors.textDim };
+      case "date": return { text: row.date ? readingLabel(row.date, row.method, true, { basis: row.basis, stale: row.stale })
+        : row.status === "queued" || row.status === "backfilling" ? row.status : "--", color: row.stale ? colors.warning : colors.textDim };
+      case "rank": return { text: formatRank(row.rank) };
+      case "percentile": return { text: formatRank(row.percentile) };
+      case "verdict": return { text: verdictLabel(row.verdict), color: row.verdict === "rich" ? colors.negative : row.verdict === "cheap" ? colors.positive : colors.textDim };
+      case "iv1y": return { text: formatVol(row.iv1y) };
+      case "iv1yPercentile": return { text: formatRank(row.iv1yPercentile) };
+      case "termSlope": return { text: formatPoints(row.termSlope), color: row.termSlope != null && row.termSlope > 0 ? colors.negative : colors.text };
+      case "riskReversal": return { text: formatPoints(row.riskReversal) };
+      case "skewDate": return { text: row.skewDate ? readingLabel(row.skewDate, "quote-mid", true) : "--", color: colors.textDim };
+      case "hv": return { text: hv.has(row.symbol) ? formatVol(row.hv) : "...", color: colors.positive };
+      case "hvDate": return { text: row.hvDate ? shortDate(row.hvDate) : "--", color: colors.textDim };
+      case "ivHv": return { text: row.ivHv == null ? "--" : row.ivHv.toFixed(2) };
+      default: return { text: "" };
+    }
+  };
+  const custom = scope === "custom";
+  // The skew's sign and VIX beside IV30 are units of the figures above them, so they stay under the table.
+  const definitionLines = useMemo(() => vcaDefinitions({ skew: hasSkew }), [hasSkew]);
+  const definitions = useMemo(() => definitionLines.flatMap((line) => wrapTextLines(line, Math.max(1, width - 2))), [definitionLines, width]);
+  return <Box width={width} height={height} flexDirection="column" overflow="hidden">
+    <QueryBar width={width} filters={[
+      { id: "universe", label: "Universe", value: VCA_SCOPE_OPTIONS.some((option) => option.value === scope) ? scope : "etfs",
+        options: VCA_UNIVERSE_OPTIONS, onChange: setScope },
+      ...(custom ? [{ id: "symbols", kind: "text" as const, label: "Symbols", value: symbolsText, placeholder: "AAPL, MSFT, SPY",
+        width: SYMBOLS_FIELD_WIDTH, debounceMs: SYMBOLS_DEBOUNCE_MS, focused, active: symbolsActive, onActiveChange: setSymbolsActive,
+        onChange: setSymbolsText }] : []),
+    ]} />
+    {movedOnly ? <MovedTickerState change={movedOnly} paneId={paneId} /> : <PaneStatusBody subject="volatility rich/cheap" loading={resource.loading && !resource.data} error={universe.error && !universe.instruments.length ? universe.error : !resource.data ? resource.error : null}>
+      <DataTableView<RichCheapRow> focused={focused && !symbolsActive} columns={columns} items={rows} rootWidth={width}
+        rootHeight={Math.max(2, height - 1 - definitions.length)}
+        getItemKey={(row) => row.symbol} sortColumnId={sort.columnId} sortDirection={sort.direction} emptyStateTitle="No symbols to screen."
+        onHeaderClick={(id) => setSort((current) => nextHeaderSort(current, id as SortId, { firstDirection: "desc" }))}
+        selection={{ kind: "id", selectedId: selected ?? rows[0]?.symbol ?? "", getId: (row) => row.symbol, onChange: (id) => setSelected(id) }}
+        onActivate={openHistory} onRootKeyDown={handleKey}
+        getExportMetadata={() => [["universe", universe.label], ["as of", fullDatesText || undefined],
+          ["IV", "30-day ATM, annualized"], ["IV1Y", "one-year ATM, annualized"], ["rank window", "prior 52 weeks of trade-close readings"], ["HV", `${HV_WINDOW}-session close-to-close`]]}
+        renderCell={(row, column) => cell(row, column.id)} />
+      {nativePaneChrome ? (
+        // The desktop and the web wrap each definition at the pane's width, under a table that fills the rest.
+        <Box flexDirection="column" paddingX={1} flexShrink={0}>
+          {definitionLines.map((line) => <Prose key={line} text={line} width={Math.max(1, width - 2)} color={colors.textDim} figures={false} />)}
+        </Box>
+      ) : (
+        <Box flexDirection="column" paddingX={1} height={definitions.length} flexShrink={0}>
+          {definitions.map((line, index) => <Text key={index} fg={colors.textDim}>{line}</Text>)}
+        </Box>
+      )}
+    </PaneStatusBody>}
+  </Box>;
+}
+
+export const VCA_SCOPE_OPTIONS = [
+  { value: "etfs", label: "Index and sector ETFs" },
+  { value: "megacaps", label: "US mega caps" },
+  { value: "collection", label: "Linked watchlist or portfolio" },
+  { value: "custom", label: "Custom symbols" },
+] as const satisfies ReadonlyArray<{ value: VcaPreset | "collection" | "custom"; label: string }>;
+/** The bar's menu keeps the settings wording; its trigger uses the short form. */
+const VCA_UNIVERSE_SHORT: Record<(typeof VCA_SCOPE_OPTIONS)[number]["value"], string> = {
+  etfs: "ETFs", megacaps: "Mega caps", collection: "Linked list", custom: "Custom",
+};
+const VCA_UNIVERSE_OPTIONS = VCA_SCOPE_OPTIONS.map((option) => ({ ...option, short: VCA_UNIVERSE_SHORT[option.value] }));
+const SYMBOLS_FIELD_WIDTH = 24;
+/** Symbols apply once typing pauses, so a half-typed ticker does not start a screen. */
+const SYMBOLS_DEBOUNCE_MS = 700;

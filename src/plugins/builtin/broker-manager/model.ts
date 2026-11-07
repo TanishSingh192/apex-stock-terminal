@@ -1,0 +1,181 @@
+import { brokerProfileLogo, type BrokerPluginLogo } from "../../../brokers/logos";
+import type { BrokerAdapter, BrokerConnectionStatus } from "../../../types/broker";
+import type { AppConfig, BrokerInstanceConfig } from "../../../types/config";
+import type { BrokerAccount } from "../../../types/trading";
+import { formatCurrency } from "../../../utils/format";
+import { t } from "../../../i18n";
+import type { SignInEnds } from "./sign-in-end";
+
+export type BrokerDisplayState =
+  | "disabled"
+  | "unavailable"
+  | "configured"
+  /** An error only a new sign-in clears. */
+  | "sign-in"
+  | BrokerConnectionStatus["state"];
+
+export interface BrokerProfileRow {
+  id: string;
+  label: string;
+  brokerType: string;
+  brokerName: string;
+  mode: string;
+  state: BrokerDisplayState;
+  stateLabel: string;
+  message: string;
+  updatedAt: number;
+  lastSyncedAt: number;
+  accountCount: number;
+  accountSummary: string;
+  accountIds: string[];
+  /** When the broker ends this profile's sign-in, once Gloom says it is time to connect again. */
+  signInEndsAt: number | null;
+  /** The broker's logo for the desktop and the web (brokers/logos.ts); null draws its initial. */
+  logo: string | null;
+  instance: BrokerInstanceConfig;
+  adapter: BrokerAdapter | null;
+}
+
+function titleCase(value: string): string {
+  return value
+    .split(/[\s_-]+/g)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function formatBrokerMode(value: unknown): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text ? titleCase(text) : t("Configured");
+}
+
+function summarizeBrokerAccounts(accounts: BrokerAccount[]): string {
+  if (accounts.length === 0) return "0 acct";
+  const currencies = new Set(accounts.map((account) => account.currency || ""));
+  const canSum = currencies.size === 1 && accounts.every((account) => typeof account.netLiquidation === "number");
+  if (!canSum) return `${accounts.length} acct${accounts.length === 1 ? "" : "s"}`;
+  const currency = currencies.values().next().value ?? "";
+  const total = accounts.reduce((sum, account) => sum + (account.netLiquidation ?? 0), 0);
+  return formatCurrency(total, currency);
+}
+
+function resolveMode(
+  adapter: BrokerAdapter | null,
+  instance: BrokerInstanceConfig,
+  status: BrokerConnectionStatus | null,
+): string {
+  const values = adapter?.toConfigValues?.(instance) ?? instance.config;
+  return formatBrokerMode(
+    status?.mode
+      ?? values.connectionMode
+      ?? instance.connectionMode
+      ?? instance.config.connectionMode,
+  );
+}
+
+function resolveState(
+  instance: BrokerInstanceConfig,
+  adapter: BrokerAdapter | null,
+  mode: string,
+  status: BrokerConnectionStatus | null,
+): { state: BrokerDisplayState; label: string; message: string; updatedAt: number } {
+  if (instance.enabled === false) {
+    return {
+      state: "disabled",
+      label: t("Disabled"),
+      message: t("Gloom does not connect or sync this profile while it is disabled."),
+      updatedAt: 0,
+    };
+  }
+  if (!adapter) {
+    return { state: "unavailable", label: t("Unavailable"), message: t("Broker plugin is not available"), updatedAt: 0 };
+  }
+  if (mode.toLowerCase() === "flex") {
+    return {
+      state: "configured",
+      label: t("Sync only"),
+      message: t("Flex profiles sync on demand"),
+      updatedAt: status?.updatedAt ?? 0,
+    };
+  }
+  if (!status) {
+    return { state: "configured", label: t("Configured"), message: t("Ready to test or sync"), updatedAt: 0 };
+  }
+
+  if (status.state === "error" && status.needsSignIn) {
+    return { state: "sign-in", label: t("Sign-in needed"), message: status.message || "", updatedAt: status.updatedAt };
+  }
+  const labels: Record<BrokerConnectionStatus["state"], string> = {
+    disconnected: t("Disconnected"),
+    connecting: t("Connecting"),
+    connected: t("Connected"),
+    error: t("Error"),
+  };
+  return {
+    state: status.state,
+    label: labels[status.state],
+    message: status.message || "",
+    updatedAt: status.updatedAt,
+  };
+}
+
+export function buildBrokerProfileRows(
+  config: AppConfig,
+  adapters: ReadonlyMap<string, BrokerAdapter | null>,
+  brokerAccounts: Record<string, BrokerAccount[]>,
+  signInEnds: SignInEnds = new Map(),
+  pluginLogo: BrokerPluginLogo = () => null,
+  syncErrors: Readonly<Record<string, string>> = {},
+): BrokerProfileRow[] {
+  return config.brokerInstances.map((instance) => {
+    const adapter = adapters.get(instance.brokerType) ?? null;
+    const status = adapter?.getStatus?.(instance) ?? null;
+    // An adapter that fronts several brokers names the broker and how it connects.
+    const described = adapter?.describeInstance?.(instance) ?? null;
+    const mode = described?.method ?? resolveMode(adapter, instance, status);
+    const connection = resolveState(instance, adapter, mode, status);
+    const syncError = syncErrors[instance.id];
+    const state = syncError && !["disabled", "unavailable", "sign-in"].includes(connection.state)
+      ? { ...connection, state: "error" as const, label: t("Sync failed"), message: t(syncError) }
+      : connection;
+    const accounts = brokerAccounts[instance.id] ?? [];
+    const portfolioLastSyncedAt = Math.max(
+      0,
+      ...config.portfolios
+        .filter((portfolio) => portfolio.brokerInstanceId === instance.id)
+        .map((portfolio) => portfolio.lastSyncedAt ?? 0),
+    );
+    const accountLastUpdatedAt = Math.max(0, ...accounts.map((account) => account.updatedAt ?? 0));
+    const lastSyncedAt = instance.lastSyncedAt ?? (portfolioLastSyncedAt || accountLastUpdatedAt);
+
+    return {
+      id: instance.id,
+      label: instance.label,
+      brokerType: instance.brokerType,
+      brokerName: described?.brokerName ?? adapter?.name ?? instance.brokerType.toUpperCase(),
+      mode,
+      state: state.state,
+      stateLabel: state.label,
+      message: state.message,
+      updatedAt: state.updatedAt,
+      lastSyncedAt,
+      accountCount: accounts.length,
+      accountSummary: summarizeBrokerAccounts(accounts),
+      accountIds: accounts.map((account) => account.accountId),
+      // Say nothing next to a failure or a profile that does not connect.
+      signInEndsAt: state.state === "error" || state.state === "sign-in" || state.state === "disabled" || state.state === "unavailable"
+        ? null
+        : signInEnds.get(instance.id) ?? null,
+      logo: brokerProfileLogo(instance, adapter, pluginLogo),
+      instance,
+      adapter,
+    };
+  });
+}
+
+/** The row to select once `removedId` goes: the one after it, else the one before. */
+export function neighbourBrokerProfileId(instances: readonly BrokerInstanceConfig[], removedId: string): string | null {
+  const index = instances.findIndex((instance) => instance.id === removedId);
+  if (index < 0) return null;
+  return instances[index + 1]?.id ?? instances[index - 1]?.id ?? null;
+}

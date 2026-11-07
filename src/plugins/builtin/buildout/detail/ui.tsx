@@ -1,0 +1,236 @@
+import { useMemo } from "react";
+import { TickerBadgeList } from "../../../../components";
+import { MarkdownText } from "../../../../components/markdown-text";
+import { Button } from "../../../../components/ui/button";
+import { ExternalLinkText } from "../../../../components/ui/external-link";
+import { ClippedText } from "../../../../components/ui/display";
+import type { InlineTickerCatalogEntry } from "../../../../state/hooks/inline-tickers";
+import { colors } from "../../../../theme/colors";
+import { Box, Text, TextAttributes } from "../../../../ui";
+import { truncateWithEllipsis } from "../../../../utils/text-wrap";
+import { listingKey, sourceDetailEntries, text, textOrNull, tickerSymbol } from "../format";
+import type { BuildoutRelatedCompany, BuildoutSource } from "../model/types";
+
+export type InlineTickerCatalog = Record<string, InlineTickerCatalogEntry>;
+
+export type DetailSpec = {
+  label: string;
+  value?: string | null;
+  color?: string;
+};
+
+export function DetailSpecGrid({ items, width, marginTop = 1 }: { items: DetailSpec[]; width: number; marginTop?: number }) {
+  const visibleItems = items.filter((item) => textOrNull(item.value) != null);
+  if (visibleItems.length === 0) return null;
+
+  const columnCount = width >= 110 ? 4 : width >= 78 ? 3 : width >= 52 ? 2 : 1;
+  const columnWidth = Math.max(18, Math.floor(width / columnCount));
+  const rows: DetailSpec[][] = [];
+  for (let index = 0; index < visibleItems.length; index += columnCount) {
+    rows.push(visibleItems.slice(index, index + columnCount));
+  }
+
+  return (
+    <Box marginTop={marginTop} flexDirection="column">
+      {rows.map((row, rowIndex) => (
+        <Box key={rowIndex} flexDirection="row" height={1} width={width} overflow="hidden">
+          {row.map((item) => {
+            const labelWidth = Math.min(Math.max(item.label.length + 2, 8), Math.max(8, Math.floor(columnWidth * 0.45)));
+            const valueWidth = Math.max(0, columnWidth - labelWidth);
+            const labelText = truncateWithEllipsis(`${item.label}:`, Math.max(0, labelWidth - 1)).padEnd(labelWidth);
+            return (
+              <Box key={item.label} flexDirection="row" width={columnWidth} height={1} overflow="hidden">
+                <Text fg={colors.textMuted}>{labelText}</Text>
+                <ClippedText fg={item.color ?? colors.text} text={text(item.value, "")} width={valueWidth} cut={truncateWithEllipsis} />
+              </Box>
+            );
+          })}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+export function InlineSources({ domains, width }: { domains: readonly string[]; width: number }) {
+  if (domains.length === 0) return null;
+  const label = "Sources: ";
+  return (
+    <Box marginTop={1} flexDirection="row" width={width} height={1} overflow="hidden">
+      <Text fg={colors.textMuted}>{label}</Text>
+      <ClippedText fg={colors.textDim} text={domains.join(", ")} width={Math.max(0, width - label.length)} cut={truncateWithEllipsis} />
+    </Box>
+  );
+}
+
+export function DetailListLine({
+  label,
+  values,
+  width,
+}: {
+  label: string;
+  values: readonly string[];
+  width: number;
+}) {
+  if (values.length === 0) return null;
+  const prefix = `${label}: `;
+  return (
+    <Box flexDirection="row" width={width} height={1} overflow="hidden">
+      <Text fg={colors.textMuted}>{prefix}</Text>
+      <ClippedText fg={colors.textDim} text={values.join(", ")} width={Math.max(0, width - prefix.length)} cut={truncateWithEllipsis} />
+    </Box>
+  );
+}
+
+/** A ticker as the dataset writes it, with the venue it names when it names one. */
+export interface DatasetTicker {
+  ticker?: string | null;
+  exchange?: string | null;
+}
+
+/**
+ * The dataset's tickers, drawn one way: a chip for each the app can look up,
+ * price and open, a number-only Asian listing through the venue the dataset
+ * names, and bold plain text for one it cannot read. Never a chip that skips
+ * the lookup and so looks different from the resolved ones.
+ */
+export function ListingBadges({ tickers, width, fallbackColor = colors.textBright }: {
+  tickers: readonly DatasetTicker[];
+  width: number;
+  fallbackColor?: string;
+}) {
+  const { symbols, listings } = useMemo(() => {
+    const shown: string[] = [];
+    const known: Record<string, string | null> = {};
+    for (const entry of tickers) {
+      const symbol = tickerSymbol(entry.ticker);
+      if (!symbol) continue;
+      shown.push(symbol);
+      const key = listingKey(entry.ticker, entry.exchange);
+      if (key !== symbol) known[symbol] = key;
+    }
+    return { symbols: shown, listings: known };
+  }, [tickers]);
+  return <TickerBadgeList symbols={symbols} width={width} fallbackColor={fallbackColor} listings={listings} />;
+}
+
+export function RelatedCompaniesLine({
+  label,
+  companies,
+  width,
+}: {
+  label: string;
+  companies: readonly BuildoutRelatedCompany[] | undefined;
+  width: number;
+}) {
+  const items = companies ?? [];
+  if (items.length === 0) return null;
+
+  const visible = items.slice(0, 8);
+  const withTicker = visible.filter((company) => tickerSymbol(company.ticker) != null);
+  const names = visible
+    .filter((company) => !tickerSymbol(company.ticker))
+    .map((company) => textOrNull(company.name))
+    .filter((name): name is string => name != null);
+  const overflow = items.length > visible.length ? ` +${items.length - visible.length}` : "";
+  const prefix = `${label}: `;
+  const badgeWidth = Math.min(Math.max(0, width - prefix.length - (names.length > 0 ? 1 : 0)), Math.max(0, withTicker.length * 9));
+  return (
+    <Box flexDirection="row" width={width} height={1} overflow="hidden">
+      <Text fg={colors.textMuted}>{prefix}</Text>
+      {withTicker.length > 0 ? (
+        <ListingBadges tickers={withTicker} width={badgeWidth} />
+      ) : null}
+      <ClippedText fg={colors.textDim} text={`${names.length > 0 ? names.join(", ") : ""}${overflow}`} width={Math.max(0, width - prefix.length - badgeWidth)} cut={truncateWithEllipsis} />
+    </Box>
+  );
+}
+
+export function SourceDetailLines({
+  sources,
+  width,
+  maxItems = 3,
+}: {
+  sources: readonly BuildoutSource[] | undefined;
+  width: number;
+  maxItems?: number;
+}) {
+  const entries = sourceDetailEntries(sources, maxItems);
+  if (entries.length === 0) return null;
+  return (
+    <Box marginTop={1} flexDirection="column" width={width}>
+      {entries.map((entry, index) => {
+        const prefix = entry.domain ? `${entry.domain}${entry.tier ? ` T${entry.tier}` : ""}` : "";
+        const body = entry.title ?? entry.note ?? "";
+        const bodyText = prefix ? `: ${body}` : body;
+        return (
+          <Box key={`${entry.domain ?? "source"}:${index}`} flexDirection="row" height={1} width={width} overflow="hidden">
+            {prefix ? (
+              entry.url ? (
+                <ExternalLinkText url={entry.url} label={prefix} color={colors.textMuted} />
+              ) : (
+                <Text fg={colors.textMuted}>{prefix}</Text>
+              )
+            ) : null}
+            <ClippedText fg={colors.textMuted} text={bodyText} width={Math.max(0, width - prefix.length)} cut={truncateWithEllipsis} />
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+export function MarkdownBlock({
+  text: markdown,
+  width,
+  catalog,
+  openTicker,
+  marginTop = 1,
+}: {
+  text?: string | null;
+  width: number;
+  catalog: InlineTickerCatalog;
+  openTicker: (symbol: string) => void;
+  marginTop?: number;
+}) {
+  if (!markdown) return null;
+  return (
+    <Box marginTop={marginTop}>
+      <MarkdownText
+        text={markdown}
+        lineWidth={width}
+        textColor={colors.textDim}
+        catalog={catalog}
+        openTicker={openTicker}
+      />
+    </Box>
+  );
+}
+
+export function FavoriteCell({
+  starred,
+  busy,
+  failed = false,
+  selected,
+  onPress,
+}: {
+  starred: boolean;
+  busy: boolean;
+  /** The last star did not take: a `!` in the error tone, the reason in the row's detail. */
+  failed?: boolean;
+  selected: boolean;
+  onPress?: () => void;
+}) {
+  return (
+    <Button
+      label={failed ? starred ? "Unstarring failed. Remove favorite" : "Starring failed. Add favorite" : starred ? "Remove favorite" : "Add favorite"}
+      displayLabel={busy ? "*" : failed ? "!" : starred ? "★" : "☆"}
+      width={2}
+      compact
+      variant="plain"
+      active={selected || starred}
+      disabled={busy || !onPress}
+      stopPropagation
+      onPress={onPress}
+    >{failed && !busy ? <Text fg={colors.negative} attributes={TextAttributes.BOLD}>!</Text> : undefined}</Button>
+  );
+}

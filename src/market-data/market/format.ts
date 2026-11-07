@@ -1,0 +1,792 @@
+import type { PriceBasis } from "../../types/instrument";
+import type { Quote } from "../../types/financials";
+import { resolvePriceBasis } from "./price-basis";
+import { isIndexLevel } from "./index-level";
+import { currencyPriceDigits, formatCompact, formatCurrency, formatCurrencyCode } from "../../utils/format";
+import { minorUnitSign } from "../../utils/currency-units";
+import { fxRateDigits } from "../../utils/currency-pair";
+
+export type AssetDisplayKind = "cash" | "crypto" | "equity" | "contract" | "other";
+
+export interface AssetDisplayContext {
+  /** The price's currency; the thousandth currencies (OMR, KWD) keep three decimals above one unit. */
+  currency?: string;
+  isCashBalance?: boolean;
+  assetCategory?: string;
+  contractSecType?: string;
+  multiplier?: number;
+  priceBasis?: PriceBasis | null;
+  quantityCurrency?: string;
+  /**
+   * The tick table the listing trades on, when its tick is finer than its
+   * currency's minor unit: `hkex-reduced`, the spread table Hong Kong's
+   * exchange traded products trade on (0.002 from 1 to 5, 0.005 from 5 to 10),
+   * whose prices under 10 print to three decimals (5.325, not 5.33).
+   */
+  listingTickTable?: "hkex-reduced";
+}
+
+export interface MarketFormatOptions extends AssetDisplayContext {
+  maxWidth?: number;
+  minimumFractionDigits?: number;
+  precisionOffset?: number;
+  priceRange?: number;
+  fixedFractionDigits?: number;
+  /** Source units per displayed currency unit; a price quoted in pence keeps its pence decimals in pounds. */
+  quotedUnitDivisor?: number;
+  /** Write the currency's code after a money price (259.36 USD) instead of its sign ($259.36): a report for a base currency other than USD. */
+  currencyCode?: boolean;
+  /**
+   * A futures contract's tick, the smallest move its price makes: the price
+   * prints to the tick's decimals, 0.0063535 for the yen's 0.0000005 and
+   * 1.11570 for the euro's 0.00005, never fewer.
+   */
+  tick?: number;
+  /** A price that holds still for the session, such as the previous close. With
+   * `fixedFractionDigits`, the kind's decimal ceiling is read at this price
+   * instead of at the value, so a live price keeps its decimals as it moves. */
+  referencePrice?: number;
+}
+
+/** Hong Kong's exchange traded products (ETFs, leveraged and inverse products) trade on its reduced spread table. */
+const HKEX_REDUCED_SPREAD_TYPES = new Set(["ETF", "ETN", "ETP", "FUND"]);
+const HKEX_VENUES = new Set(["HKEX", "HKG", "HKSE", "SEHK"]);
+
+/** The tick table a quote's listing trades on, when its tick is finer than its currency's minor unit (see `listingTickTable`). */
+function quoteListingTickTable(
+  quote: Partial<Pick<Quote, "instrumentType" | "exchangeName" | "listingExchangeName">> | null | undefined,
+): AssetDisplayContext["listingTickTable"] {
+  const venue = (quote?.listingExchangeName || quote?.exchangeName || "").trim().toUpperCase();
+  return HKEX_VENUES.has(venue) && HKEX_REDUCED_SPREAD_TYPES.has(normalizeType(quote?.instrumentType)) ? "hkex-reduced" : undefined;
+}
+
+/** The decimals a listing's tick asks for at a price, beyond its currency's; undefined when the currency's are enough. */
+function listingTickDigits(table: AssetDisplayContext["listingTickTable"], price: number | undefined): number | undefined {
+  if (table !== "hkex-reduced" || price === undefined || !Number.isFinite(price)) return undefined;
+  return Math.abs(price) < 10 ? 3 : undefined;
+}
+
+/** Current price fields use the quote's source metadata; stored cost/mark
+ * conventions and independent history must not supply its missing basis. */
+export function quoteFormatOptions(
+  quote: (Pick<Quote, "instrumentType" | "priceBasis" | "providerPriceDivisor"> & Partial<Pick<Quote, "exchangeName" | "listingExchangeName">>) | null | undefined,
+  fallbackAssetCategory?: string,
+  metadataInstrumentType?: string,
+): MarketFormatOptions {
+  // Separate metadata may identify a bond whose convention is unknown. It must
+  // never turn a saved bond into a monetary quote or supply a par declaration.
+  const fallback = metadataInstrumentType?.trim().toUpperCase() === "BOND" ? "BOND" : fallbackAssetCategory;
+  const divisor = quote?.providerPriceDivisor;
+  const tickTable = quoteListingTickTable(quote);
+  return {
+    assetCategory: quote?.instrumentType?.trim() || fallback,
+    priceBasis: quote?.priceBasis,
+    ...(divisor != null && Number.isFinite(divisor) && divisor > 1 ? { quotedUnitDivisor: divisor } : {}),
+    ...(tickTable ? { listingTickTable: tickTable } : {}),
+  };
+}
+
+/** A hundredth of a cent, one basis point of a dollar peg: the decimals CRYP prints a stablecoin to. */
+const NEAR_PAR_COIN_PRICE_DIGITS = 4;
+
+/**
+ * The decimals a coin trading near a dollar prints to, a dollar stablecoin's
+ * 0.9989 and 1.0003 and a bond token's 0.9762, whatever digits its source sent
+ * (0.99886, 0.97619265): four either side of par, as CRYP prints them, so
+ * `quote`, `ticker` and `G` read one price. Undefined for any other price,
+ * which keeps its kind's own decimals (a sub-cent coin's eight).
+ */
+export function nearParCoinPriceDigits(
+  quote: Pick<Quote, "instrumentType" | "currency" | "previousClose" | "price"> | null | undefined,
+): number | undefined {
+  if (!quote || resolveAssetDisplayKind({ assetCategory: quote.instrumentType }) !== "crypto") return undefined;
+  if ((quote.currency ?? "USD").trim().toUpperCase() !== "USD") return undefined;
+  const reference = [quote.previousClose, quote.price].find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+  return reference != null && reference >= 0.9 && reference < 1.1 ? NEAR_PAR_COIN_PRICE_DIGITS : undefined;
+}
+
+/** Decimals a sub-unit quote adds in the major unit: two for pence shown in pounds. */
+function quotedUnitFractionDigits(divisor: number | undefined): number {
+  return divisor != null && Number.isFinite(divisor) && divisor > 1 ? Math.min(3, Math.round(Math.log10(divisor))) : 0;
+}
+
+const CASH_TYPES = new Set(["CASH", "FX", "FOREX", "CCY", "CURRENCY", "CURRENCYPAIR"]);
+const CRYPTO_TYPES = new Set(["CRYPTO", "CRYPTOCURRENCY", "DIGITALCURRENCY", "COIN", "TOKEN"]);
+const EQUITY_TYPES = new Set(["STK", "STOCK", "COMMONSTOCK", "EQUITY", "ETF", "ETN", "ETP", "FUND", "MUTUALFUND", "CEF", "ADR"]);
+const CONTRACT_TYPES = new Set(["OPT", "OPTION", "OPTIONS", "FUT", "FUTURE", "FUTURES", "FOP"]);
+
+const currencySymbols = new Map<string, string>();
+const numberFormatters = new Map<string, Intl.NumberFormat>();
+
+function normalizeType(value?: string): string {
+  return (value ?? "").trim().toUpperCase().replace(/[\s_-]+/g, "");
+}
+
+function getNumberFormatter(
+  minimumFractionDigits: number,
+  maximumFractionDigits: number,
+  useGrouping: boolean,
+): Intl.NumberFormat {
+  const key = `${minimumFractionDigits}:${maximumFractionDigits}:${useGrouping ? 1 : 0}`;
+  let formatter = numberFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("en-US", {
+      minimumFractionDigits,
+      maximumFractionDigits,
+      useGrouping,
+    });
+    numberFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
+/** The currency's symbol as prices show it (A$, €, CHF); a code Intl rejects shows as itself. */
+export function getCurrencySymbol(currency: string): string {
+  const normalizedCurrency = currency.trim().toUpperCase() || "USD";
+  const cached = currencySymbols.get(normalizedCurrency);
+  if (cached) return cached;
+
+  let symbol = normalizedCurrency;
+  try {
+    const formatter = new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: normalizedCurrency,
+      currencyDisplay: "symbol",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    });
+    symbol = formatter.formatToParts(0).find((part) => part.type === "currency")?.value ?? normalizedCurrency;
+  } catch { /* Intentional ignore: A user-entered currency code rejected by Intl retains the code as its symbol. */ }
+  currencySymbols.set(normalizedCurrency, symbol);
+  return symbol;
+}
+
+function fitsWidth(text: string, maxWidth: number | undefined): boolean {
+  return maxWidth == null || text.length <= maxWidth;
+}
+
+function isEffectivelyInteger(value: number): boolean {
+  return Math.abs(value - Math.round(value)) < 1e-9;
+}
+
+function formatVariableNumber(
+  value: number,
+  maxFractionDigits: number,
+  maxWidth: number | undefined,
+  minimumFractionDigits = 0,
+): string {
+  // Intl signs a negative zero (-0.00): a move rounded to nothing, as a cell that pre-rounds leaves it, is unsigned.
+  if (value === 0) value = 0;
+  const groupedModes = [true, false];
+
+  for (const useGrouping of groupedModes) {
+    for (let decimals = maxFractionDigits; decimals >= minimumFractionDigits; decimals -= 1) {
+      const formatter = getNumberFormatter(Math.min(minimumFractionDigits, decimals), decimals, useGrouping);
+      const formatted = formatter.format(value);
+      if (fitsWidth(formatted, maxWidth)) return formatted;
+    }
+  }
+  // A cell too narrow for the minimum gives up decimals one at a time.
+  for (let decimals = minimumFractionDigits - 1; decimals > 0; decimals -= 1) {
+    const formatted = getNumberFormatter(decimals, decimals, false).format(value);
+    if (fitsWidth(formatted, maxWidth)) return formatted;
+  }
+
+  return getNumberFormatter(0, 0, false).format(value);
+}
+
+function getQuantityMaxFractionDigits(kind: AssetDisplayKind, value: number): number {
+  if (isEffectivelyInteger(value)) return 0;
+
+  switch (kind) {
+    case "cash":
+      return 6;
+    case "crypto":
+      return 8;
+    case "equity":
+      return 4;
+    case "contract":
+      return 4;
+    case "other":
+    default:
+      return 4;
+  }
+}
+
+function getBasePriceMaxFractionDigits(kind: AssetDisplayKind, value: number, currency?: string): number {
+  switch (kind) {
+    case "cash":
+      // A currency pair's precision (EUR/USD 1.12625, USD/JPY 157.880), which
+      // also keeps a provider's float32 tail (157.8800048828125) out.
+      return fxRateDigits(currency, value);
+    case "crypto":
+      // Sub-cent coins need eight decimals to stay distinguishable from zero,
+      // but a four-figure coin does not. Scaling the ceiling by magnitude keeps
+      // that detail where it carries information instead of surfacing the
+      // provider's float tail on quotes like 109556.1640625.
+      return Math.abs(value) >= 100 ? 2 : Math.abs(value) >= 1 ? 4 : 8;
+    case "equity":
+      return Math.abs(value) >= 1 ? currencyPriceDigits(currency) : 4;
+    case "contract":
+      // Currency futures include five- and seven-decimal prices. This is a
+      // display ceiling, not a declaration of the contract's minimum tick.
+      return 8;
+    case "other":
+    default:
+      return Math.abs(value) >= 1 ? currencyPriceDigits(currency) : 4;
+  }
+}
+
+function getAdaptivePriceFractionDigits(priceRange: number | undefined, precisionOffset = 0): number | null {
+  if (priceRange === undefined || !Number.isFinite(priceRange) || priceRange <= 0) return null;
+
+  // The chart price axis renders four labels by default, so the visible range
+  // divided across three intervals is a good proxy for the current zoom step.
+  const visibleStep = priceRange / 3;
+  if (!Number.isFinite(visibleStep) || visibleStep <= 0) return null;
+
+  return Math.max(0, Math.ceil(-Math.log10(visibleStep)) + precisionOffset);
+}
+
+/** Keep four significant digits for tiny prices even when instrument metadata
+ * is absent. Decimal formatting below this floor otherwise turns real prices
+ * and day-range endpoints into identical zeroes. */
+function tinyPriceFractionDigits(value: number): number {
+  const absolute = Math.abs(value);
+  return absolute > 0 && absolute < 0.01 && Number.isFinite(absolute)
+    ? Math.max(0, 3 - Math.floor(Math.log10(absolute))) : 0;
+}
+
+function formatPriceNumber(value: number, decimals: number, maxWidth: number | undefined, minimumDecimals = 0): string {
+  const tinyDecimals = tinyPriceFractionDigits(value);
+  const rendered = tinyDecimals > 20
+    ? "0"
+    : formatVariableNumber(value, Math.max(decimals, tinyDecimals), tinyDecimals > 0 ? undefined : maxWidth, minimumDecimals);
+  if (value === 0 || !Number.isFinite(value) || (Number(rendered.replaceAll(",", "")) !== 0 && fitsWidth(rendered, maxWidth))) return rendered;
+  return scientificPrice(value, maxWidth);
+}
+
+/** A constrained cell must not imply a worthless asset or unchanged price. */
+function scientificPrice(value: number, maxWidth: number | undefined): string {
+  for (let precision = 4; precision >= 1; precision -= 1) {
+    const scientific = Number(value.toPrecision(precision)).toExponential();
+    if (fitsWidth(scientific, maxWidth)) return scientific;
+  }
+  return "…";
+}
+
+/** Dated OHLC values may have no instrument or unit metadata. Display their
+ * numeric precision without treating them as equity prices or assigning units. */
+export function formatPriceObservation(
+  value: number,
+  options: Pick<MarketFormatOptions, "maxWidth" | "minimumFractionDigits"> = {},
+): string {
+  if (!Number.isFinite(value)) return "—";
+  return formatPriceNumber(value, 8, options.maxWidth, Math.max(0, Math.min(8, options.minimumFractionDigits ?? 0)));
+}
+
+/** The most decimals formatMarketPrice shows for this asset kind and magnitude,
+ * for callers that render a whole column with one fixed decimal count. */
+export function marketPriceFractionDigitCeiling(value: number, context: AssetDisplayContext): number {
+  return Math.max(
+    getBasePriceMaxFractionDigits(resolveAssetDisplayKind(context), value, context.currency),
+    tinyPriceFractionDigits(value),
+  );
+}
+
+function getPriceMaxFractionDigits(
+  kind: AssetDisplayKind,
+  value: number,
+  priceRange: number | undefined,
+  precisionOffset: number,
+  quotedUnitDigits = 0,
+  currency?: string,
+): number {
+  const baseMaxFractionDigits = kind === "other" && priceRange !== undefined
+    ? 6
+    : getBasePriceMaxFractionDigits(kind, value, currency) + quotedUnitDigits;
+  const adaptiveFractionDigits = getAdaptivePriceFractionDigits(priceRange, precisionOffset);
+  return adaptiveFractionDigits === null
+    ? baseMaxFractionDigits
+    : Math.min(baseMaxFractionDigits, adaptiveFractionDigits);
+}
+
+function getCostMaxFractionDigits(kind: AssetDisplayKind, currency?: string): number {
+  switch (kind) {
+    case "cash":
+      return 6;
+    case "crypto":
+      return 8;
+    case "contract":
+      return 4;
+    case "equity":
+    case "other":
+    default:
+      return currencyPriceDigits(currency);
+  }
+}
+
+function compactScaledPrice(
+  value: number,
+  divisor: number,
+  suffix: string,
+  currency: string,
+  maxWidth: number | undefined,
+): string {
+  const sign = value < 0 ? "-" : "";
+  const marks = currencyMarks(currency, currency.trim().toUpperCase() || "USD");
+  const numericWidth = maxWidth == null
+    ? undefined
+    : Math.max(1, maxWidth - sign.length - marks.prefix.length - suffix.length - marks.suffix.length);
+  const formatted = formatVariableNumber(Math.abs(value) / divisor, 1, numericWidth, 1);
+  return `${sign}${marks.prefix}${formatted}${suffix}${marks.suffix}`;
+}
+
+export function resolveAssetDisplayKind({
+  isCashBalance,
+  assetCategory,
+  contractSecType,
+  multiplier,
+}: AssetDisplayContext): AssetDisplayKind {
+  if (isCashBalance) return "cash";
+
+  const normalizedType = normalizeType(contractSecType || assetCategory);
+  if (CRYPTO_TYPES.has(normalizedType) || normalizedType.includes("CRYPTO")) return "crypto";
+  if (CASH_TYPES.has(normalizedType) || normalizedType.includes("FOREX") || normalizedType.includes("CURRENCY")) return "cash";
+  if (EQUITY_TYPES.has(normalizedType)) return "equity";
+  if (CONTRACT_TYPES.has(normalizedType)) return "contract";
+  if ((multiplier ?? 1) > 1) return "contract";
+  return "other";
+}
+
+export function formatMarketQuantity(value: number | undefined, options: MarketFormatOptions = {}): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  if (options.priceBasis === "percent-of-par") {
+    const suffix = `${options.quantityCurrency ? ` ${options.quantityCurrency}` : ""} face`;
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - suffix.length);
+    const quantity = formatMarketQuantity(value, { ...options, priceBasis: "per-unit", maxWidth });
+    const compact = formatCompact(value);
+    const numeric = fitsWidth(quantity, maxWidth) ? quantity : fitsWidth(compact, maxWidth) ? compact : formatPriceNumber(value, 0, maxWidth);
+    return `${numeric}${suffix}`;
+  }
+  const kind = resolveAssetDisplayKind(options);
+  const maxFractionDigits = getQuantityMaxFractionDigits(kind, value);
+  return formatVariableNumber(value, maxFractionDigits, options.maxWidth);
+}
+
+const EIGHTHS = ["", "⅛", "¼", "⅜", "½", "⅝", "¾", "⅞"];
+
+/**
+ * A Treasury future's price the way traders read it: whole points, then 32nds
+ * with the eighth-of-a-32nd tick as a fraction (104.484375 is 104-15½, ZT's
+ * 103.0078125 is 103-00¼). An adjusted generic off that grid keeps its 32nds
+ * to two decimals (104-15.37).
+ */
+export function formatThirtySeconds(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const eighths = Math.abs(value) * 256;
+  const whole = Math.round(eighths);
+  if (Math.abs(eighths - whole) > 1e-6) {
+    const points = Math.floor(Math.abs(value));
+    return `${sign}${points}-${((Math.abs(value) - points) * 32).toFixed(2).padStart(5, "0")}`;
+  }
+  const points = Math.floor(whole / 256);
+  const rest = whole - points * 256;
+  return `${sign}${points}-${String(Math.floor(rest / 8)).padStart(2, "0")}${EIGHTHS[rest % 8]}`;
+}
+
+/** The decimals a contract's tick is written with (0.0000005 is 7, 0.25 is 2); undefined without one. */
+function tickFractionDigits(tick: number | undefined): number | undefined {
+  return tick != null && Number.isFinite(tick) && tick > 0 ? writtenFractionDigits(tick, 10) : undefined;
+}
+
+export function formatMarketPrice(value: number | undefined, options: MarketFormatOptions = {}): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  const basis = resolvePriceBasis(options.priceBasis, options.assetCategory);
+  if (basis === null) return "—";
+  if (basis === "thirty-seconds") return formatThirtySeconds(value);
+  if (basis === "points") return formatMarketPrice(value, { ...options, priceBasis: "per-unit" });
+  if (basis === "percent-of-par") {
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 5);
+    return `${formatMarketPrice(value, { ...options, priceBasis: "per-unit", maxWidth })}% par`;
+  }
+  const kind = resolveAssetDisplayKind(options);
+  const quotedUnitDigits = kind === "equity" || kind === "other" ? quotedUnitFractionDigits(options.quotedUnitDivisor) : 0;
+  const fixedFractionDigits = options.fixedFractionDigits;
+  if (fixedFractionDigits !== undefined) {
+    const reference = positiveMagnitude(options.referencePrice);
+    const maxFractionDigits = kind === "other" && options.priceRange !== undefined
+      ? 6
+      : reference === undefined
+        ? getBasePriceMaxFractionDigits(kind, value, options.currency) + quotedUnitDigits
+        : marketPriceFractionDigitCeiling(reference, options) + quotedUnitDigits;
+    let digits = Math.max(0, Math.min(fixedFractionDigits, maxFractionDigits));
+    const tick = kind === "equity" || kind === "other" ? listingTickDigits(options.listingTickTable, reference ?? value) : tickFractionDigits(options.tick);
+    if (tick !== undefined) digits = Math.max(digits, tick);
+    // A live price keeps its instrument's decimals, but a trade finer than the
+    // session prices showed (a half-yen print after whole-yen closes) is not
+    // rounded to a price that never traded.
+    // A currency pair prints to its precision whatever a print carries (1.1270145 is 1.12701).
+    if (reference !== undefined && kind !== "cash") digits = Math.max(digits, writtenFractionDigits(Math.abs(value), maxFractionDigits));
+    const fitted = formatVariableNumber(value, digits, options.maxWidth, digits);
+    return hasNonZeroDigit(fitted) || Number(Math.abs(value).toFixed(digits)) === 0
+      ? fitted
+      : scientificPrice(value, options.maxWidth);
+  }
+  // A listing whose tick is finer than its currency's minor unit keeps the tick's decimals (an HKEX ETF's 5.325), as a contract does its own.
+  const tick = kind === "equity" || kind === "other" ? listingTickDigits(options.listingTickTable, value) : tickFractionDigits(options.tick);
+  const baseFractionDigits = getBasePriceMaxFractionDigits(kind, value, options.currency);
+  const minimumFractionDigits = Math.max(
+    0,
+    Math.min(options.minimumFractionDigits ?? 0, baseFractionDigits),
+    tick ?? 0,
+    // A currency pair keeps its precision's trailing zeros (6.66800), except on a chart's axis.
+    kind === "cash" && options.priceRange === undefined ? baseFractionDigits : 0,
+  );
+  const maxFractionDigits = Math.max(
+    getPriceMaxFractionDigits(kind, value, options.priceRange, options.precisionOffset ?? 0, quotedUnitDigits, options.currency),
+    minimumFractionDigits,
+  );
+  return formatPriceNumber(value, maxFractionDigits, options.maxWidth, minimumFractionDigits);
+}
+
+export function formatMarketCost(value: number | undefined, options: MarketFormatOptions = {}): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  const basis = resolvePriceBasis(options.priceBasis, options.assetCategory);
+  if (basis === null) return "—";
+  if (basis === "thirty-seconds") return formatThirtySeconds(value);
+  if (basis === "points") return formatMarketCost(value, { ...options, priceBasis: "per-unit" });
+  if (basis === "percent-of-par") {
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 5);
+    return `${formatMarketCost(value, { ...options, priceBasis: "per-unit", maxWidth })}% par`;
+  }
+  const kind = resolveAssetDisplayKind(options);
+  const maxFractionDigits = getCostMaxFractionDigits(kind, options.currency);
+  const minimumFractionDigits = Math.max(0, Math.min(options.minimumFractionDigits ?? 0, maxFractionDigits));
+  return formatVariableNumber(value, maxFractionDigits, options.maxWidth, minimumFractionDigits);
+}
+
+export function formatSignedMarketPrice(value: number | undefined, options: MarketFormatOptions = {}): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  if (resolvePriceBasis(options.priceBasis, options.assetCategory) === null) return "—";
+  if (options.fixedFractionDigits !== undefined) {
+    // A move at the instrument's fixed decimals: the sign always has its column,
+    // and a move that rounds to zero is unsigned (0.00, never +0.00 or -0.00).
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 1);
+    const body = formatMarketPrice(Math.abs(value), { ...options, maxWidth });
+    return hasNonZeroDigit(body) ? `${value > 0 ? "+" : "-"}${body}` : body;
+  }
+  if (value > 0) {
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 1);
+    return `+${formatMarketPrice(value, { ...options, maxWidth })}`;
+  }
+  return formatMarketPrice(value, options);
+}
+
+/** Preserve ordinary monetary change formatting while retaining declared par units.
+ * `referencePrice` is the quote's price: a change below a cent keeps its digits
+ * only when that price is itself quoted past cents and the change survives the
+ * price's precision, so float residue on a flat equity still prints $0.00. */
+export function formatMarketChangeWithCurrency(
+  value: number | undefined,
+  currency: string,
+  options: MarketFormatOptions = {},
+  referencePrice?: number,
+): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (isIndexLevel(options.assetCategory) || resolvePriceBasis(options.priceBasis, options.assetCategory) !== "per-unit") return formatSignedMarketPrice(value, options);
+  if (options.fixedFractionDigits !== undefined) {
+    const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 1);
+    const body = formatMarketPriceWithCurrency(Math.abs(value), currency, { ...options, maxWidth });
+    return hasNonZeroDigit(body) ? `${value > 0 ? "+" : "-"}${body}` : body;
+  }
+  if (resolveAssetDisplayKind(options) === "contract" || quotedUnitFractionDigits(options.quotedUnitDivisor) > 0) {
+    return `${value > 0 ? "+" : ""}${formatMarketPriceWithCurrency(value, currency, {
+      ...options, minimumFractionDigits: Math.max(2, options.minimumFractionDigits ?? 0),
+    })}`;
+  }
+  // A currency pair's move is written at the pair's precision (+$0.00345 on EUR/USD 1.12638), never its float tail.
+  if (resolveAssetDisplayKind(options) === "cash" && referencePrice != null && Number.isFinite(referencePrice) && referencePrice > 0) {
+    const digits = fxRateDigits(currency, referencePrice);
+    const rounded = Math.abs(value) < 0.5 * 10 ** -digits;
+    const body = formatMarketPriceWithCurrency(rounded ? 0 : Math.abs(value), currency, { ...options, fixedFractionDigits: digits });
+    return rounded ? body : `${value > 0 ? "+" : "-"}${body}`;
+  }
+  // A move on a listing whose tick is finer than cents is written to the tick's decimals (+HK$0.030 on an HKEX ETF).
+  const tick = listingTickDigits(options.listingTickTable, referencePrice);
+  if (tick !== undefined && resolveAssetDisplayKind(options) !== "crypto") {
+    const rounded = Math.abs(value) < 0.5 * 10 ** -tick;
+    const body = formatMarketPriceWithCurrency(rounded ? 0 : Math.abs(value), currency, { ...options, minimumFractionDigits: tick });
+    return rounded ? body : `${value > 0 ? "+" : "-"}${body}`;
+  }
+  // Cents hide the whole move of a sub-cent asset (-$0.00 for a SHIB day change).
+  const unitDigits = currencyPriceDigits(currency);
+  const smallestMove = 0.5 / 10 ** unitDigits;
+  if (Math.abs(value) < smallestMove && referencePrice != null && Number.isFinite(referencePrice)) {
+    const priceDigits = marketPriceFractionDigitCeiling(referencePrice, { ...options, currency });
+    if (priceDigits > unitDigits && Math.abs(value) >= 0.5 * 10 ** -priceDigits) {
+      return `${value > 0 ? "+" : ""}${formatMarketPriceWithCurrency(value, currency, options)}`;
+    }
+  }
+  const money = options.currencyCode ? formatCurrencyCode : formatCurrency;
+  // A move that rounds to zero cents is unsigned rather than -$0.00.
+  if (Math.abs(value) < smallestMove) return money(0, currency);
+  return `${value > 0 ? "+" : ""}${money(value, currency)}`;
+}
+
+/** Decimals the currency's minor unit has: two for GBP, none for JPY. */
+// A chart reads every series' price at the crosshair on each pointer move, so
+// building a formatter per call is what the readout spent its time on.
+const currencyMinorDigitsByCode = new Map<string, number>();
+
+export function currencyMinorDigits(currency: string | undefined): number {
+  const code = currency || "USD";
+  const cached = currencyMinorDigitsByCode.get(code);
+  if (cached !== undefined) return cached;
+  let digits = 2;
+  try {
+    digits = new Intl.NumberFormat("en-US", { style: "currency", currency: code }).resolvedOptions().maximumFractionDigits ?? 2;
+  } catch { /* Intentional ignore: A currency code rejected by Intl uses the documented two-decimal fallback. */ }
+  currencyMinorDigitsByCode.set(code, digits);
+  return digits;
+}
+
+/** Decimals a money price is padded to: its minor unit up to two (USD 2, JPY 0), three for the thousandth currencies (OMR, KWD). */
+export function currencyPriceMinDigits(currency: string | undefined): number {
+  return currencyPriceDigits(currency) === 3 ? 3 : Math.min(2, currencyMinorDigits(currency));
+}
+
+/** Pads a money price to its currency's minor unit (two for USD, none for JPY),
+ * so one card or column never mixes $309.9 with $339.75. Par-quoted prices are left as they are. */
+export function withCurrencyMinorDigits(options: MarketFormatOptions, currency: string | undefined): MarketFormatOptions {
+  if (resolvePriceBasis(options.priceBasis, options.assetCategory) !== "per-unit") return options;
+  return {
+    ...options,
+    ...(currency ? { currency } : {}),
+    minimumFractionDigits: Math.max(options.minimumFractionDigits ?? 0, currencyPriceMinDigits(currency)),
+  };
+}
+
+function positiveMagnitude(value: number | null | undefined): number | undefined {
+  return value != null && Number.isFinite(value) && value !== 0 ? Math.abs(value) : undefined;
+}
+
+function hasNonZeroDigit(text: string): boolean {
+  return /[1-9]/.test(text);
+}
+
+/** Decimals a price was written with, ignoring binary noise: 6012.25 is 2, so
+ * is a provider's float32 157.8800048828125, and a change of
+ * 0.00004999999999988347 is 5. */
+function writtenFractionDigits(value: number, cap: number): number {
+  const float32 = Math.fround(value) === value;
+  for (let digits = 0; digits < cap; digits += 1) {
+    const written = Number(value.toFixed(digits));
+    if (Math.abs(written - value) <= 1e-9 * value) return digits;
+    if (float32 && Math.fround(written) === value) return digits;
+  }
+  return cap;
+}
+
+const OPTION_CONTRACT_TYPES = new Set(["OPT", "OPTION", "OPTIONS", "FOP"]);
+
+export interface StablePriceContext extends AssetDisplayContext {
+  /** The price's currency; its minor unit sets an equity's decimals (USD 2, JPY 0). */
+  currency?: string;
+  quotedUnitDivisor?: number;
+  /** A price that holds still for the session, such as the previous close.
+   * Never the live price: a precision read from each tick is what makes the
+   * digits jump. */
+  referencePrice?: number;
+  /** Session-fixed prices as the feed wrote them (previous close, open).
+   * Their decimals can ask for more than the default, such as a half-yen
+   * Tokyo line. */
+  sessionPrices?: readonly (number | null | undefined)[];
+}
+
+/**
+ * The decimals a live price keeps for its instrument, whatever the tick: an
+ * equity above $1 always shows cents (150.10, not 150.1), and a coin, pair or
+ * contract takes its count from the reference price, never from the latest
+ * trade, so crossing $100 or 1.0000 on a tick changes nothing. A floor per kind
+ * is raised to the decimals the reference and session prices were written
+ * with (a half-yen close, a 5-decimal FX feed), up to the kind's ceiling.
+ * Changes, bid, ask and ranges of the same instrument use the same count.
+ */
+export function stablePriceFractionDigits(context: StablePriceContext): number {
+  const reference = positiveMagnitude(context.referencePrice);
+  const kind = resolveAssetDisplayKind(context);
+  const unitDigits = kind === "equity" || kind === "other" ? quotedUnitFractionDigits(context.quotedUnitDivisor) : 0;
+  const ceiling = reference === undefined ? 8 : marketPriceFractionDigitCeiling(reference, context) + unitDigits;
+  const below = (limit: number) => reference !== undefined && reference < limit;
+  // Four significant digits for a sub-unit price.
+  const subUnitDigits = reference === undefined ? 4 : Math.min(8, Math.max(4, 3 - Math.floor(Math.log10(reference))));
+  let digits: number;
+  if (resolvePriceBasis(context.priceBasis, context.assetCategory) === "percent-of-par") {
+    digits = 2;
+  } else if (kind === "equity" || kind === "other") {
+    // A sub-unit price keeps four decimals of the major unit, pence lines
+    // included; above one unit the currency's minor unit (and pence) apply.
+    // A listing whose tick is finer than its currency's minor unit prints to the tick (an HKEX ETF's 5.325 and 0.676).
+    digits = listingTickDigits(context.listingTickTable, reference)
+      ?? (below(1) ? 4 : currencyPriceMinDigits(context.currency) + unitDigits);
+  } else if (kind === "cash") {
+    // A currency pair's precision, never the digits a feed wrote its closes with.
+    return fxRateDigits(context.currency, reference);
+  } else if (kind === "crypto") {
+    digits = below(1) ? subUnitDigits : below(100) ? 4 : 2;
+  } else if (kind === "contract") {
+    const type = normalizeType(context.contractSecType || context.assetCategory);
+    digits = OPTION_CONTRACT_TYPES.has(type) || !CONTRACT_TYPES.has(type) || !below(1) ? 2 : subUnitDigits;
+  } else {
+    digits = 2;
+  }
+  if (kind !== "crypto" && reference !== undefined) digits = Math.max(digits, tinyPriceFractionDigits(reference));
+  for (const price of context.sessionPrices ?? []) {
+    const magnitude = positiveMagnitude(price);
+    if (magnitude !== undefined) digits = Math.max(digits, writtenFractionDigits(magnitude, ceiling));
+  }
+  return digits;
+}
+
+type LiveQuotePrices = Pick<Quote, "price" | "previousClose" | "regularClose" | "open">;
+
+/** The session-fixed price a quote's decimals are chosen from. */
+export function quoteReferencePrice(quote: Partial<LiveQuotePrices> | null | undefined): number | undefined {
+  return positiveMagnitude(quote?.previousClose)
+    ?? positiveMagnitude(quote?.regularClose)
+    ?? positiveMagnitude(quote?.open)
+    ?? positiveMagnitude(quote?.price);
+}
+
+/**
+ * Pins a live price's options to its instrument's decimals (see
+ * stablePriceFractionDigits). `prices` supplies the session-fixed prices, from
+ * the quote when there is one or a stored mark when there is not.
+ */
+export function withStablePriceDigits(
+  options: MarketFormatOptions,
+  currency: string | undefined,
+  prices: Partial<LiveQuotePrices> | null | undefined,
+): MarketFormatOptions {
+  if (resolvePriceBasis(options.priceBasis, options.assetCategory) === null) return options;
+  // Without any session price, the live price can only give the magnitude.
+  const referencePrice = quoteReferencePrice(prices);
+  return {
+    ...options,
+    ...(currency ? { currency } : {}),
+    referencePrice,
+    fixedFractionDigits: stablePriceFractionDigits({
+      ...options,
+      currency,
+      referencePrice,
+      sessionPrices: [prices?.previousClose, prices?.regularClose, prices?.open],
+    }),
+  };
+}
+
+/** Options for a quote's live prices and changes: its instrument's fixed decimals, whatever the tick. */
+export function liveQuoteFormatOptions(
+  quote: (Pick<Quote, "instrumentType" | "priceBasis" | "providerPriceDivisor"> & Partial<LiveQuotePrices>) | null | undefined,
+  currency: string | undefined,
+  fallbackAssetCategory?: string,
+  metadataInstrumentType?: string,
+): MarketFormatOptions {
+  return withStablePriceDigits(quoteFormatOptions(quote, fallbackAssetCategory, metadataInstrumentType), currency, quote);
+}
+
+/**
+ * Where an amount's currency is written: a major currency's symbol before it
+ * ($314.95, CHF314.95), a minor unit's sign after it (314.95¢ for US cents,
+ * 412.50p for pence), as `minorUnitSign` names them. A minor unit is read
+ * before upper-casing, as GBp is pence and GBP pounds.
+ */
+function currencyMarks(currency: string, normalizedCurrency: string, code = false): { prefix: string; suffix: string } {
+  const minor = minorUnitSign(currency);
+  if (minor) return { prefix: "", suffix: minor };
+  return code ? { prefix: "", suffix: ` ${normalizedCurrency}` } : { prefix: getCurrencySymbol(normalizedCurrency), suffix: "" };
+}
+
+/**
+ * A London line shown in pounds and served in the pence it trades in. The
+ * code is compared in its own case: `GBp` (and `GBX`) is a price already in
+ * pence, which says so itself (630.8p) and needs no pence figure beside it.
+ */
+export function isPenceQuotedLine(quote: Pick<Quote, "currency" | "providerPriceDivisor"> | null | undefined): boolean {
+  return quote?.currency?.trim() === "GBP" && quote.providerPriceDivisor === 100;
+}
+
+/**
+ * A London line's price in the pence it trades in, as the exchange and its
+ * announcements write it: `630.8p` for £6.308, with the decimals of a penny
+ * the pounds are shown to (`poundDecimals`) beyond two. Null for a price not
+ * quoted in pence.
+ */
+export function penceFigure(
+  value: number | null | undefined,
+  quote: Pick<Quote, "currency" | "providerPriceDivisor"> | null | undefined,
+  poundDecimals: number,
+): string | null {
+  if (value == null || !Number.isFinite(value) || !isPenceQuotedLine(quote)) return null;
+  const digits = Math.max(0, Math.min(4, poundDecimals - 2));
+  return `${getNumberFormatter(digits, digits, true).format(value * 100)}${minorUnitSign("GBp")}`;
+}
+
+export function formatMarketPriceWithCurrency(
+  value: number | undefined,
+  currency = "USD",
+  options: MarketFormatOptions = {},
+): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  if (isIndexLevel(options.assetCategory) || resolvePriceBasis(options.priceBasis, options.assetCategory) !== "per-unit") return formatMarketPrice(value, options);
+  const normalizedCurrency = currency.trim().toUpperCase() || "USD";
+  const sign = value < 0 ? "-" : "";
+  const { prefix, suffix } = currencyMarks(currency, normalizedCurrency, options.currencyCode);
+  const numericWidth = options.maxWidth == null
+    ? undefined
+    : Math.max(1, options.maxWidth - sign.length - prefix.length - suffix.length);
+  const body = formatMarketPrice(Math.abs(value), { ...options, currency: normalizedCurrency, maxWidth: numericWidth });
+  return `${hasNonZeroDigit(body) ? sign : ""}${prefix}${body}${suffix}`;
+}
+
+export function formatMarketCostWithCurrency(
+  value: number | undefined,
+  currency = "USD",
+  options: MarketFormatOptions = {},
+): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  if (resolvePriceBasis(options.priceBasis, options.assetCategory) !== "per-unit") return formatMarketCost(value, options);
+  const normalizedCurrency = currency.trim().toUpperCase() || "USD";
+  const sign = value < 0 ? "-" : "";
+  const { prefix, suffix } = currencyMarks(currency, normalizedCurrency, options.currencyCode);
+  const numericWidth = options.maxWidth == null
+    ? undefined
+    : Math.max(1, options.maxWidth - sign.length - prefix.length - suffix.length);
+  // A money cost keeps its currency's minor unit: $189.20, not $189.2 (JPY has none).
+  const body = formatMarketCost(Math.abs(value), {
+    minimumFractionDigits: currencyPriceMinDigits(normalizedCurrency),
+    ...options,
+    currency: normalizedCurrency,
+    maxWidth: numericWidth,
+  });
+  return `${sign}${prefix}${body}${suffix}`;
+}
+
+/** @deprecated Slated for removal. Use `formatMarketPriceWithCurrency` with `maxWidth` to fit a column. */
+export function formatCompactMarketPriceWithCurrency(
+  value: number | undefined,
+  currency = "USD",
+  options: MarketFormatOptions = {},
+): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "—";
+  const abs = Math.abs(value);
+
+  if (abs >= 1e6) {
+    return compactScaledPrice(value, 1e6, "M", currency, options.maxWidth);
+  }
+  if (abs >= 1e3 && abs < 1e5) {
+    return compactScaledPrice(value, 1e3, "K", currency, options.maxWidth);
+  }
+
+  return formatMarketPriceWithCurrency(value, currency, options);
+}

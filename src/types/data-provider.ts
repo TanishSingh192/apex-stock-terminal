@@ -1,0 +1,427 @@
+import type { CompanyFrom } from "./company-from";
+import type { ExchangeRateSnapshot } from "./exchange-rate";
+import type {
+  AnalystResearchData,
+  CorporateActionsData,
+  EarningsDateStatus,
+  EarningsEpsBasis,
+  Quote,
+  QuoteMetadata,
+  TickerFinancials,
+  PricePoint,
+  OptionsChain,
+  HolderData,
+} from "./financials";
+import type { TimeRange } from "../time-series/range";
+import type { ChartResolutionSupport, ManualChartResolution } from "../time-series/resolution";
+import type { BrokerContractRef, InstrumentSearchResult } from "./instrument";
+import type { CachePolicyMap } from "./persistence";
+import type { CachedQueryHandle } from "../data/cached-query";
+import type { TickerChanges } from "./ticker-changes";
+import type { IssuerListings } from "./issuer-listings";
+
+export type CachedAssetMethod = "getExchangeRate" | "getHolders" | "getAnalystResearch" | "getCorporateActions"
+  | "getOptionsChain" | "getSecFilings" | "getSecFilingDocuments" | "getSecFilingContent" | "getArticleSummary";
+export type CachedAssetArgs<K extends CachedAssetMethod> = Parameters<NonNullable<AssetDataProvider[K]>>;
+export type CachedAssetValue<K extends CachedAssetMethod> = Awaited<ReturnType<NonNullable<AssetDataProvider[K]>>>;
+
+/** @deprecated Use `NewsArticle`, the article shape news providers return. */
+export interface NewsItem {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: Date;
+  summary?: string;
+}
+
+export interface SecFilingItem {
+  accessionNumber: string;
+  form: string;
+  filingDate: Date;
+  acceptedAt?: Date;
+  /** Unmodified SEC acceptanceDateTime; a missing timezone is not inferred. */
+  acceptedAtRaw?: string;
+  primaryDocument?: string;
+  primaryDocDescription?: string;
+  items?: string;
+  cik: string;
+  companyName?: string;
+  filingUrl: string;
+  primaryDocumentUrl?: string;
+  /**
+   * The SEC file number EDGAR lists the filing under for this company, empty
+   * when it lists none: a 13D/13G about the company carries its 005- number,
+   * one it filed as a holder of another company none. Absent when the source
+   * does not say (an older server).
+   */
+  fileNumber?: string;
+  /**
+   * In a fund's list from a trust that runs several funds: whether EDGAR
+   * lists the filing under the fund's own series. Absent when the source does
+   * not say (another registrant, an older server, a filing older than the
+   * series list reaches).
+   */
+  fundSeries?: boolean;
+  /**
+   * The company's home line the filing was read from, when the listing asked
+   * is a receipt or a foreign line with no filer of its own (HY9H in
+   * Frankfurt reads SK hynix's). Absent on the listing's own filings.
+   */
+  companyFrom?: CompanyFrom;
+  /**
+   * A current report's press release (its EX-99.1), when its index names one:
+   * the page the results or the news are on, not the cover page.
+   */
+  pressReleaseUrl?: string;
+  /**
+   * What a Form 4 did, when Gloom Cloud read it for the list: whose shares,
+   * the main transaction and its shares and average price. A company's list
+   * holds the Form 4s it filed as an owner of other companies' shares, which
+   * only this names. Absent from other forms and from an older server.
+   */
+  form4?: SecForm4Trade;
+}
+
+/** A Form 4's main transaction, the one moving the most shares. */
+export interface SecForm4Trade {
+  /** The first reporting owner, as filed. */
+  ownerName: string;
+  issuerName: string;
+  issuerTicker: string | null;
+  issuerCik: string | null;
+  /** The SEC transaction code: P purchase, S sale, A award, G gift, F tax withholding, M exercise, ... */
+  code: string;
+  side: "buy" | "sell" | "acquired" | "disposed";
+  shares: number;
+  /** Share-weighted average price; null when no line gives one. */
+  price: number | null;
+  /** True when the transaction is in options or other derivatives (a form with no share lines): `shares` counts those. */
+  derivative?: boolean;
+}
+
+export interface SecFilingDocument {
+  sequence?: string;
+  type: string;
+  description?: string;
+  document: string;
+  url: string;
+  size?: string;
+  isPrimary: boolean;
+}
+
+export type EarningsEstimateField =
+  | "epsEstimate" | "epsLow" | "epsHigh" | "epsYearAgo" | "epsGrowth" | "epsAnalysts"
+  | "epsTrend7dAgo" | "epsTrend30dAgo"
+  | "epsRevisionUp7d" | "epsRevisionUp30d" | "epsRevisionDown7d" | "epsRevisionDown30d"
+  | "revenueEstimate" | "revenueLow" | "revenueHigh" | "revenueYearAgo" | "revenueGrowth" | "revenueAnalysts";
+
+export interface EarningsEstimateBasis {
+  source: "earningsTrend" | "calendarEvents";
+  /** Selected provider number before any explicit minor-unit normalization. */
+  sourceValue: number;
+  /** Provider forecast label, not a derived fiscal quarter or announcement date. */
+  period: string | null;
+  periodEndDate: string | null;
+  /** Explicit currency for monetary values only; ratios/counts have none. */
+  currency?: string | null;
+  sourceCurrency?: string | null;
+}
+
+export interface EarningsEvent {
+  symbol: string;
+  name: string;
+  earningsDate: Date;
+  earningsCallDate?: Date | null;
+  isDateEstimate?: boolean | null;
+  /**
+   * The report's status as Gloom Cloud holds it: reported once the report is
+   * out, before the calendar has its actual. Absent from servers that do not
+   * say; `isDateEstimate` and `epsActual` tell the rest.
+   */
+  dateStatus?: EarningsDateStatus | null;
+  estimateBasis?: Partial<Record<EarningsEstimateField, EarningsEstimateBasis>>;
+  epsEstimate: number | null;
+  epsLow?: number | null;
+  epsHigh?: number | null;
+  epsYearAgo?: number | null;
+  epsGrowth?: number | null;
+  epsAnalysts?: number | null;
+  epsTrend7dAgo?: number | null;
+  epsTrend30dAgo?: number | null;
+  epsRevisionUp7d?: number | null;
+  epsRevisionUp30d?: number | null;
+  epsRevisionDown7d?: number | null;
+  epsRevisionDown30d?: number | null;
+  epsActual: number | null;
+  /** "adjusted" when the estimate is the consensus on the adjusted basis the company's reports are on (a REIT's FFO), not a GAAP forecast. */
+  epsBasis?: EarningsEpsBasis | null;
+  revenueEstimate: number | null;
+  revenueLow?: number | null;
+  revenueHigh?: number | null;
+  revenueYearAgo?: number | null;
+  revenueGrowth?: number | null;
+  revenueAnalysts?: number | null;
+  revenueActual: number | null;
+  surprise: number | null;
+  timing: "BMO" | "AMC" | "TNS" | "";
+  /** When the results come out, as the company announced it (Berkshire's Saturday 13:00Z); absent when it named no time. */
+  releaseAt?: string | null;
+}
+
+/** The reads a provider may send in batches (`DataProvider.batchesReads`). */
+export type BatchedReadMethod = "getPriceHistory" | "getOptionsChain";
+
+export interface MarketDataRequestContext {
+  /** An options chain of the contracts adjusted for a corporate action (ETHA1), in place of the standard ones. */
+  adjustedOptions?: boolean;
+  brokerId?: string;
+  brokerInstanceId?: string;
+  instrument?: BrokerContractRef | null;
+  /**
+   * "refresh" always fetches. "current" refetches a stored value past its stale time before answering, and
+   * answers with it only if that fetch fails: for a caller that cannot see a refresh landing in the background.
+   */
+  cacheMode?: "default" | "refresh" | "current";
+  statementHistory?: "extended";
+  /** A validated, same-target detailed retry constrained to one exhausted source. */
+  historyRecovery?: import("../sources/history-retention").HistoryRecoveryCandidate;
+  /** Stable acquisition identity for capture/replay of opaque history responses. */
+  historyRequestKey?: string;
+  /** Intraday history should include pre-market and after-hours bars where the source has them. */
+  historySession?: "extended";
+  /** The listing's company, from its own quote: an SEC lookup for a non-US listing checks the registrant against it. */
+  listingName?: string;
+  /**
+   * The caller asks many reads like this one in the same moment (a board's
+   * rows), having checked `batchesReads`: a provider that batches them may
+   * hold this one a moment to send it with the others.
+   */
+  batch?: boolean;
+  /**
+   * The caller prints what the quote's move is from: a short-lived process
+   * (the CLI) waits briefly for the daily closes that date a previous close
+   * no venue calendar dates. The long-lived app dates every quote anyway.
+   */
+  datesChangeBasis?: boolean;
+}
+
+export interface CachedFinancialsTarget {
+  statementHistory?: "extended";
+  symbol: string;
+  exchange?: string;
+  brokerId?: string;
+  brokerInstanceId?: string;
+  instrument?: BrokerContractRef | null;
+}
+
+export interface SearchRequestContext {
+  preferBroker?: boolean;
+  brokerId?: string;
+  brokerInstanceId?: string;
+  /**
+   * A person is waiting on this result, so a slow source should be abandoned in
+   * well under a second rather than given the batch budget.
+   */
+  interactive?: boolean;
+  /**
+   * Rows to ask a catalogue for. Every listing of a symbol several companies
+   * use (CAR: Avis, Carrefour, CAR Group) takes more than a keystroke's ten.
+   */
+  limit?: number;
+  /**
+   * Called when a later source improves the result the search already returned,
+   * typically a broker adding contract detail to a symbol the cloud found
+   * first. Receives the full merged list, not a delta.
+   */
+  onPartial?: (results: InstrumentSearchResult[]) => void;
+}
+
+export interface QuoteSubscriptionTarget {
+  symbol: string;
+  exchange?: string;
+  context?: MarketDataRequestContext;
+  route?: "auto" | "provider" | "broker";
+  surface?: "portfolio" | "watchlist" | "detail" | "monitor" | "inline" | "options" | "screener" | "unknown";
+  visible?: boolean;
+  selected?: boolean;
+  weight?: number;
+}
+
+export interface QuoteBatchResult {
+  target: QuoteSubscriptionTarget;
+  quote: Quote | null;
+  error?: unknown;
+  /**
+   * Set only with `deferFollowUps`: the batch left this target without a
+   * current quote, and `getQuote` with this cache mode is the read that
+   * settles it. `quote` meanwhile is the dated price the batch had, flagged
+   * stale, or none.
+   */
+  followUp?: "default" | "refresh";
+}
+
+export interface QuoteBatchOptions {
+  forceRefresh?: boolean;
+  /**
+   * Answer from the local cache alone, stale and expired quotes included, and
+   * never reach the network: what a board paints before its refresh lands. A
+   * provider with no cache answers every target with no quote.
+   */
+  cacheOnly?: boolean;
+  /**
+   * Ask the sources even for a target whose cached quote is still fresh; that
+   * copy answers only when they cannot. A command that prints quotes once
+   * shows the service's quote of the moment, so every form of one listing
+   * (BRK.B saved on NYSE, BRK-B, BRK.B:NYSE) prints the same quote, never
+   * each form's own copy from whenever it was last asked for.
+   */
+  revalidate?: boolean;
+  /**
+   * Answer from the cache and the batch read alone: a target they leave
+   * without a current quote comes back with `followUp` instead of being
+   * asked for on its own. A board paints the batch as soon as it answers and
+   * asks for those itself, so a slow one holds only its own row.
+   */
+  deferFollowUps?: boolean;
+  /** The caller stopped waiting; a transport that can abandon the request does. */
+  signal?: AbortSignal;
+  /** The caller prints what each move is from (MarketDataRequestContext.datesChangeBasis). */
+  datesChangeBasis?: boolean;
+}
+
+export interface TickerFinancialsBatchResult {
+  target: CachedFinancialsTarget;
+  financials: TickerFinancials | null;
+  error?: unknown;
+}
+
+export interface AssetDataProvider {
+  readonly id: string;
+  readonly name: string;
+  readonly priority?: number;
+  readonly cachePolicy?: CachePolicyMap;
+
+  /** Optional shared query owner. Consumers observe its age and refreshes instead of caching its values again. */
+  getCachedQuery?<K extends CachedAssetMethod>(method: K, args: CachedAssetArgs<K>): CachedQueryHandle<CachedAssetValue<K>>;
+  /** False in a short-lived process, where callers of getCachedQuery must await a stale entry's refresh. */
+  readonly revalidatesInBackground?: boolean;
+
+  canProvide?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<boolean> | boolean;
+  /**
+   * Name of the source a plain market request reaches first. A router answers
+   * for its highest-priority member; a remote transport asks the process that
+   * owns the router. Absent on a plain provider, whose own name is the answer.
+   */
+  primaryMarketSourceName?(): string | null | Promise<string | null>;
+  getCachedFinancialsForTargets?(targets: CachedFinancialsTarget[], options?: { allowExpired?: boolean; includeStaleQuotes?: boolean }): Map<string, TickerFinancials> | Promise<Map<string, TickerFinancials>>;
+  getQuotesBatch?(targets: QuoteSubscriptionTarget[], options?: QuoteBatchOptions): Promise<QuoteBatchResult[]>;
+  /**
+   * Whether reads of `method` asked with others in one moment (context
+   * `batch`) go out as batch requests (trailing history, dated option
+   * expiries), so a caller that otherwise keeps a few in flight may ask them
+   * all at once. A router answers true only when every source it could ask
+   * for them does; a remote transport asks the process that owns the router.
+   * Absent or false: ask a few at a time, without `batch`.
+   */
+  batchesReads?(method: BatchedReadMethod): boolean | Promise<boolean>;
+  getTickerFinancialsBatch?(targets: CachedFinancialsTarget[], options?: { forceRefresh?: boolean; datesChangeBasis?: boolean }): Promise<TickerFinancialsBatchResult[]>;
+  getTickerFinancials(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<TickerFinancials>;
+  getQuote(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<Quote>;
+  /** Listing facts may outlive the quote price; this method never returns price/session values. */
+  getQuoteMetadata?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<QuoteMetadata | null>;
+  getExchangeRate(fromCurrency: string): Promise<number>;
+  getExchangeRateSnapshot?(fromCurrency: string): Promise<ExchangeRateSnapshot>;
+  search(query: string, context?: SearchRequestContext): Promise<InstrumentSearchResult[]>;
+  getSecFilings?(ticker: string, count?: number, exchange?: string, context?: MarketDataRequestContext): Promise<SecFilingItem[]>;
+  getHolders?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<HolderData>;
+  getAnalystResearch?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<AnalystResearchData>;
+  getCorporateActions?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<CorporateActionsData>;
+  /**
+   * A US symbol's changes: where the issuer that held it trades now (FB is
+   * META), or what its holder was called before. Null when none is on record.
+   */
+  getTickerChanges?(symbol: string, options?: { signal?: AbortSignal }): Promise<TickerChanges | null>;
+  /**
+   * `getTickerChanges` for several symbols in a few requests, by symbol as
+   * asked: null for one with no change on record. A symbol the source could not
+   * answer for is left out; null when the source cannot answer a batch at all.
+   */
+  getTickerChangesBatch?(symbols: string[], options?: { signal?: AbortSignal }): Promise<Map<string, TickerChanges | null> | null>;
+  /**
+   * Every listing of the company a listing belongs to (RCI and RCI.B:TSX are
+   * Rogers). Null when the source does not hold the company.
+   */
+  getIssuerListings?(symbol: string, exchange?: string, options?: { signal?: AbortSignal }): Promise<IssuerListings | null>;
+  /**
+   * Several searches in a few requests, each answered with the rows `search`
+   * gives it from this source (up to `limit`), by query as asked. A query the
+   * source could not search is left out; null when it cannot search a batch at
+   * all, or when another source (a connected broker) adds rows of its own.
+   */
+  searchBatch?(queries: string[], options?: { limit?: number; signal?: AbortSignal }): Promise<Map<string, InstrumentSearchResult[]> | null>;
+  getEarningsCalendar?(symbols: string[], context?: MarketDataRequestContext): Promise<EarningsEvent[]>;
+  getSecFilingDocuments?(filing: SecFilingItem): Promise<SecFilingDocument[]>;
+  getSecFilingContent?(filing: SecFilingItem): Promise<string | null>;
+  /** Fetch article summary/description by URL (lazy-loaded on selection) */
+  getArticleSummary(url: string): Promise<string | null>;
+  /**
+   * Price history for a range. This and the `*WithMetadata` methods are the
+   * canonical history API; the plain resolution and detailed variants below are
+   * compatibility projections of them.
+   */
+  getPriceHistory(ticker: string, exchange: string, range: TimeRange, context?: MarketDataRequestContext): Promise<PricePoint[]>;
+  /** Default history with source-declared cadence, when the provider can retain it. */
+  getPriceHistoryWithMetadata?(
+    ticker: string,
+    exchange: string,
+    range: TimeRange,
+    context?: MarketDataRequestContext,
+  ): Promise<import("./price-history").PriceHistoryResult>;
+  getPriceHistoryForResolutionWithMetadata?(
+    ticker: string,
+    exchange: string,
+    bufferRange: TimeRange,
+    resolution: ManualChartResolution,
+    context?: MarketDataRequestContext,
+  ): Promise<import("./price-history").PriceHistoryResult>;
+  getDetailedPriceHistoryWithMetadata?(
+    ticker: string,
+    exchange: string,
+    startDate: Date,
+    endDate: Date,
+    barSize: string,
+    context?: MarketDataRequestContext,
+  ): Promise<import("./price-history").PriceHistoryResult>;
+  /** @deprecated Call or implement `getPriceHistoryForResolutionWithMetadata` instead. The host still calls this on a provider that has only this one. */
+  getPriceHistoryForResolution?(
+    ticker: string,
+    exchange: string,
+    bufferRange: TimeRange,
+    resolution: ManualChartResolution,
+    context?: MarketDataRequestContext,
+  ): Promise<PricePoint[]>;
+  /**
+   * Fetch higher-resolution price data for a specific date window (e.g. when zoomed in).
+   * @deprecated Call or implement `getDetailedPriceHistoryWithMetadata` instead. The host still calls this on a provider that has only this one.
+   */
+  getDetailedPriceHistory?(ticker: string, exchange: string, startDate: Date, endDate: Date, barSize: string, context?: MarketDataRequestContext): Promise<PricePoint[]>;
+  /** Which chart resolutions the source serves, and how far back each one reaches. */
+  getChartResolutionSupport?(
+    ticker: string,
+    exchange?: string,
+    context?: MarketDataRequestContext,
+  ): Promise<ChartResolutionSupport[]> | ChartResolutionSupport[];
+  /** @deprecated Call or implement `getChartResolutionSupport` instead. The host still calls this on a provider that has only this one. */
+  getChartResolutionCapabilities?(
+    ticker: string,
+    exchange?: string,
+    context?: MarketDataRequestContext,
+  ): Promise<ManualChartResolution[]> | ManualChartResolution[];
+  getOptionsChain?(ticker: string, exchange?: string, expirationDate?: number, context?: MarketDataRequestContext): Promise<OptionsChain>;
+  subscribeQuotes?(
+    targets: QuoteSubscriptionTarget[],
+    onQuote: (target: QuoteSubscriptionTarget, quote: Quote) => void,
+  ): () => void;
+}
+
+export type DataProvider = AssetDataProvider;

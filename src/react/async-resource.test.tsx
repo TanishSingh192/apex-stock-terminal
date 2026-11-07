@@ -1,0 +1,169 @@
+import { expect, test } from "bun:test";
+import { act, useState } from "react";
+import { createOpenTuiTestHarness } from "../renderers/opentui/test-utils";
+import { useAsyncResource } from "./async-resource";
+import { connectionHealth, GLOOM_CLOUD_HTTP_CONNECTION_ID, registerGloomCloudConnectionSources } from "../core/connection-health";
+
+type Loader = ((force: boolean) => Promise<string>) | null;
+const tui = createOpenTuiTestHarness({ width: 20, height: 5 });
+let resource: ReturnType<typeof useAsyncResource<string>>;
+let changeLoader: (next: Loader) => void;
+
+async function mount(
+  loader: Loader,
+  clearOnError: boolean | ((error: unknown) => boolean) = false,
+  keepPreviousData = false,
+) {
+  function Probe() {
+    const [request, setRequest] = useState(() => loader);
+    changeLoader = (next) => setRequest(() => next);
+    resource = useAsyncResource(request, { clearOnError, keepPreviousData });
+    return null;
+  }
+  await tui.render(<Probe />);
+  await act(async () => { await tui.setup().renderOnce(); });
+}
+
+test("only the newest request may publish data or an error", async () => {
+  const first = Promise.withResolvers<string>();
+  const second = Promise.withResolvers<string>();
+  const forces: boolean[] = [];
+  await mount((force) => {
+    forces.push(force);
+    return force ? second.promise : first.promise;
+  });
+  let refresh: Promise<void>;
+  await act(async () => { refresh = resource.reload(); });
+  await act(async () => { second.resolve("new"); await refresh; });
+  await act(async () => { first.reject(new Error("old failure")); });
+  expect(forces).toEqual([false, true]);
+  expect(resource).toMatchObject({ data: "new", loading: false, error: null });
+});
+
+test("changing, disabling, and unmounting a resource invalidate pending work", async () => {
+  const first = Promise.withResolvers<string>();
+  const second = Promise.withResolvers<string>();
+  await mount(() => first.promise);
+  await act(async () => { changeLoader(() => second.promise); });
+  await act(async () => { first.resolve("previous ticker"); });
+  expect(resource.data).toBeNull();
+  await act(async () => { changeLoader(null); });
+  await act(async () => { second.resolve("cleared ticker"); });
+  expect(resource).toMatchObject({ data: null, loading: false, error: null, status: "idle" });
+
+  const third = Promise.withResolvers<string>();
+  await act(async () => { changeLoader(() => third.promise); });
+  const beforeUnmount = resource;
+  await tui.destroy();
+  await act(async () => { third.resolve("unmounted"); });
+  expect(resource).toBe(beforeUnmount);
+});
+
+test.each([false, true])("refresh failure clears data only when configured: %s", async (clearOnError) => {
+  await mount(async (force) => {
+    if (force) throw new Error("");
+    return "cached";
+  }, clearOnError);
+  await act(async () => {
+    await resource.reload();
+  });
+  expect(resource).toMatchObject({
+    data: clearOnError ? null : "cached",
+    loading: false,
+    error: "Request failed",
+    status: "error",
+  });
+});
+
+test("a new security cannot display the previous security's loaded data while pending or failed", async () => {
+  await mount(async () => "AAPL history");
+  expect(resource.data).toBe("AAPL history");
+  const next = Promise.withResolvers<string>();
+  await act(async () => { changeLoader(() => next.promise); });
+  expect(resource).toMatchObject({ data: null, updatedAt: null, loading: true, error: null });
+  await act(async () => { next.reject(new Error("MSFT unavailable")); });
+  expect(resource).toMatchObject({ data: null, updatedAt: null, loading: false, error: "MSFT unavailable" });
+});
+
+test("keepPreviousData leaves the last answer up while a new loader loads and fails, and null still clears", async () => {
+  await mount(async () => "AAPL peers", false, true);
+  const loadedAt = resource.updatedAt;
+  const next = Promise.withResolvers<string>();
+  await act(async () => { changeLoader(() => next.promise); });
+  expect(resource).toMatchObject({ data: "AAPL peers", updatedAt: loadedAt, loading: true, error: null });
+  await act(async () => { next.reject(new Error("MSFT unavailable")); });
+  expect(resource).toMatchObject({ data: "AAPL peers", loading: false, error: "MSFT unavailable" });
+  await act(async () => { changeLoader(null); });
+  expect(resource).toMatchObject({ data: null, loading: false, error: null, status: "idle" });
+});
+
+test("error policy retains the original retrieval time through an outage and clears it with denied data", async () => {
+  let failure: Error | null = null;
+  const seen: unknown[] = [];
+  await mount(async () => {
+    if (failure) throw failure;
+    return "known research";
+  }, (error) => {
+    seen.push(error);
+    return error instanceof Error && error.message === "Access denied";
+  });
+  const retrievedAt = resource.updatedAt;
+  expect(retrievedAt).not.toBeNull();
+  const outage = new Error("Provider timed out");
+  failure = outage;
+  await act(async () => { await resource.reload(); });
+  expect(resource).toMatchObject({ data: "known research", updatedAt: retrievedAt, error: outage.message });
+  const denial = new Error("Access denied");
+  failure = denial;
+  await act(async () => { await resource.reload(); });
+  expect(resource).toMatchObject({ data: null, updatedAt: null, error: denial.message });
+  expect(seen).toEqual([outage, denial]);
+});
+
+test("an inline error predicate neither reloads nor loops across renders", async () => {
+  let calls = 0;
+  let rerender: () => void = () => {};
+  const request = async () => { calls++; return "loaded"; };
+  function Probe() {
+    const [, setTick] = useState(0);
+    rerender = () => setTick((tick) => tick + 1);
+    resource = useAsyncResource(request, { clearOnError: (error) => error instanceof Error });
+    return null;
+  }
+  await tui.render(<Probe />);
+  await act(async () => { await tui.setup().renderOnce(); });
+  await act(async () => { rerender(); await tui.setup().renderOnce(); });
+  await act(async () => { rerender(); await tui.setup().renderOnce(); });
+  expect(calls).toBe(1);
+  expect(resource.data).toBe("loaded");
+});
+
+// A pane whose load failed in an outage kept its failure after the network
+// came back, until the user refreshed it by hand.
+test("a load that failed is asked again once the data service answers after an outage", async () => {
+  const disposeSources = registerGloomCloudConnectionSources(connectionHealth);
+  try {
+    let online = false;
+    let asked = 0;
+    await mount(async () => {
+      asked += 1;
+      if (!online) throw new Error("Gloom couldn't reach its data service");
+      return "board";
+    });
+    expect(resource).toMatchObject({ data: null, error: "Gloom couldn't reach its data service" });
+
+    connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+    online = true;
+    await act(async () => { connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true); });
+    await act(async () => { await tui.setup().renderOnce(); });
+    expect(asked).toBe(2);
+    expect(resource).toMatchObject({ data: "board", error: null });
+
+    // A resource that answered is left alone by the next recovery.
+    connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+    await act(async () => { connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true); });
+    expect(asked).toBe(2);
+  } finally {
+    disposeSources();
+  }
+});

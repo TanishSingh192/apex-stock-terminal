@@ -1,0 +1,309 @@
+import { indexRootSuggestion } from "../../../tickers/index-roots";
+import type { Dispatch } from "react";
+import type { AppAction, AppState } from "../../../state/app/context";
+import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
+import type { PluginRegistry } from "../../../plugins/registry";
+import { isManualPortfolio } from "../../../portfolio/mutations";
+import { findNamedCollection, readWatchlistArgument } from "../../../portfolio/collection-name";
+import type { DataProvider } from "../../../types/data-provider";
+import type { Portfolio, TickerRecord, Watchlist } from "../../../types/ticker";
+import { AmbiguousTickerError, resolveTickerSearch, upsertTickerFromSearchResult } from "../../../tickers/search";
+import { MAX_TICKER_LIST_SIZE, parseTickerListInput } from "../../../tickers/list";
+import { resolveTickerOpenTarget, type TickerOpenTarget } from "../../../tickers/open-target";
+import { settleTypedListingKey } from "../../../tickers/listing-venues";
+import { tickerHasListingSuffix } from "../../../sources/listing-symbols";
+import { isProviderBusy } from "../../../sources/provider-errors";
+import { isSharedExchangeCode, parsePublicTickerKey, publicTickerKey, typedExchangeCode } from "../../../utils/exchanges";
+import { captureAttentionAction } from "../../../telemetry/attention-counts";
+
+export interface SharedWorkflowDeps {
+  dataProvider: DataProvider;
+  tickerRepository: AppTickerRepositoryPort;
+  pluginRegistry: PluginRegistry;
+  dispatch: Dispatch<AppAction>;
+  getState: () => AppState;
+}
+
+export type CollectionKind = "watchlist" | "portfolio";
+export type CollectionMembershipAction = "add" | "remove";
+
+interface CollectionTargetOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface ResolvedTickerInput extends Pick<TickerOpenTarget, "instrument" | "listing"> {
+  symbol: string;
+  ticker: TickerRecord;
+  created: boolean;
+  source: "local" | "provider";
+}
+
+function getTickerSearchContext(state: AppState, collectionId: string | null) {
+  const activePortfolio = state.config.portfolios.find((portfolio) => portfolio.id === collectionId);
+  return {
+    preferBroker: true,
+    interactive: true,
+    brokerId: activePortfolio?.brokerId,
+    brokerInstanceId: activePortfolio?.brokerInstanceId,
+  };
+}
+
+/** Saves a provider listing as a ticker record, as the command bar does before a collection command. */
+export async function materializeResolvedTicker(
+  resolvedTicker: NonNullable<Awaited<ReturnType<typeof resolveTickerSearch>>>,
+  deps: SharedWorkflowDeps,
+): Promise<ResolvedTickerInput> {
+  if (resolvedTicker.kind === "local") {
+    return {
+      symbol: resolvedTicker.ticker.metadata.ticker,
+      ticker: resolvedTicker.ticker,
+      created: false,
+      source: "local",
+    };
+  }
+
+  const { ticker, created } = await upsertTickerFromSearchResult(
+    deps.tickerRepository,
+    resolvedTicker.result,
+  );
+  deps.dispatch({ type: "UPDATE_TICKER", ticker });
+  if (created) {
+    deps.pluginRegistry.events.emit("ticker:added", {
+      symbol: ticker.metadata.ticker,
+      ticker,
+    });
+  }
+
+  return {
+    symbol: ticker.metadata.ticker,
+    ticker,
+    created,
+    source: "provider",
+  };
+}
+
+function getCollectionOptions(
+  state: AppState,
+  kind: CollectionKind,
+): Array<Portfolio | Watchlist> {
+  if (kind === "watchlist") {
+    return state.config.watchlists;
+  }
+  return state.config.portfolios.filter(isManualPortfolio);
+}
+
+export function getCollectionTargetOptions(
+  state: AppState,
+  kind: CollectionKind,
+  action: CollectionMembershipAction,
+  ticker: TickerRecord | null,
+): CollectionTargetOption[] {
+  const collections = getCollectionOptions(state, kind);
+  const membershipIds = ticker
+    ? new Set(kind === "watchlist" ? ticker.metadata.watchlists : ticker.metadata.portfolios)
+    : new Set<string>();
+
+  return collections
+    .filter((collection) => {
+      if (!ticker) return true;
+      const isMember = membershipIds.has(collection.id);
+      return action === "add" ? !isMember : isMember;
+    })
+    .map((collection) => ({
+      id: collection.id,
+      label: collection.name,
+      description: action === "add"
+        ? `Add to "${collection.name}"`
+        : `Remove from "${collection.name}"`,
+    }));
+}
+
+export function resolvePreferredCollectionTarget(
+  state: AppState,
+  kind: CollectionKind,
+  activeCollectionId: string | null,
+  action: CollectionMembershipAction,
+  ticker: TickerRecord | null,
+): string | null {
+  if (!activeCollectionId) return null;
+  const options = getCollectionTargetOptions(state, kind, action, ticker);
+  return options.some((option) => option.id === activeCollectionId) ? activeCollectionId : null;
+}
+
+export function resolveSoleCollectionTarget(
+  state: AppState,
+  kind: CollectionKind,
+  action: CollectionMembershipAction,
+  ticker: TickerRecord | null,
+): string | null {
+  const options = getCollectionTargetOptions(state, kind, action, ticker);
+  return options.length === 1 ? options[0]!.id : null;
+}
+
+export async function resolveTickerInput(
+  rawInput: string | undefined,
+  activeTicker: string | null,
+  collectionId: string | null,
+  deps: SharedWorkflowDeps,
+  options: { throwUnresolved?: boolean; preserveListingKey?: boolean } = {},
+): Promise<ResolvedTickerInput | null> {
+  const state = deps.getState();
+  let resolvedTicker;
+  try {
+    let query = rawInput?.trim() || activeTicker || "";
+    if (options.preserveListingKey) {
+      // 7203:TSE is the venue its symbol trades on among those TSE names, kept as 7203:JPX would be.
+      query = await settleTypedListingKey(query, {
+        store: { loadTicker: (key) => deps.tickerRepository.loadTicker(key), loadAllTickers: async () => [...state.tickers.values()] },
+        dataProvider: deps.dataProvider,
+      });
+    }
+    const namedVenue = !!parsePublicTickerKey(query).exchange && !isSharedExchangeCode(typedExchangeCode(query));
+    if (options.preserveListingKey && (namedVenue || tickerHasListingSuffix(query.toUpperCase()))) {
+      // Commands and incoming layouts must preserve the same validated listing
+      // key, including when the repository already stores a bare-symbol holding.
+      const target = await resolveTickerOpenTarget({
+        query: publicTickerKey(query),
+        tickers: state.tickers,
+        dataProvider: deps.dataProvider,
+        tickerRepository: deps.tickerRepository,
+        searchContext: getTickerSearchContext(state, collectionId),
+      });
+      if (!target) return null;
+      const source = state.tickers.has(target.symbol) ? "local" : "provider";
+      deps.dispatch({ type: "UPDATE_TICKER", ticker: target.ticker });
+      if (target.created) {
+        deps.pluginRegistry.events.emit("ticker:added", { symbol: target.symbol, ticker: target.ticker });
+      }
+      return { ...target, source };
+    }
+    resolvedTicker = await resolveTickerSearch({
+      query: rawInput,
+      activeTicker,
+      tickers: state.tickers,
+      dataProvider: deps.dataProvider,
+      searchContext: getTickerSearchContext(state, collectionId),
+    });
+  } catch (error) {
+    // Interactive callers already open ticker search for unresolved input: it
+    // offers the listings, and says so when search is too busy to answer.
+    if ((error instanceof AmbiguousTickerError || isProviderBusy(error)) && !options.throwUnresolved) return null;
+    throw error;
+  }
+  if (!resolvedTicker) return null;
+  return materializeResolvedTicker(resolvedTicker, deps);
+}
+
+export async function resolveTickerInputOrThrow(
+  rawInput: string | undefined,
+  activeTicker: string | null,
+  collectionId: string | null,
+  deps: SharedWorkflowDeps,
+  options: { preserveListingKey?: boolean } = {},
+): Promise<ResolvedTickerInput> {
+  const resolved = await resolveTickerInput(rawInput, activeTicker, collectionId, deps, { ...options, throwUnresolved: true });
+  if (!resolved) {
+    const typed = rawInput ?? activeTicker ?? "";
+    // A bare index root (VIX) is quoted as ^VIX, which the message offers.
+    const suggestion = indexRootSuggestion(typed.trim());
+    throw new Error(`No ticker match found for "${typed}".${suggestion ? ` ${suggestion}` : ""}`);
+  }
+  return resolved;
+}
+
+/** The ticker with the collection added to or removed from it; `changed` is false when it already was as asked. */
+export function withCollectionMembership(
+  ticker: TickerRecord,
+  kind: CollectionKind,
+  action: CollectionMembershipAction,
+  collectionId: string,
+): { changed: boolean; ticker: TickerRecord } {
+  const field = kind === "watchlist" ? "watchlists" : "portfolios";
+  const currentValues = ticker.metadata[field];
+  const nextValues = action === "add"
+    ? (currentValues.includes(collectionId) ? currentValues : [...currentValues, collectionId])
+    : currentValues.filter((entry) => entry !== collectionId);
+
+  if (nextValues.length === currentValues.length && nextValues.every((entry, index) => entry === currentValues[index])) {
+    return { changed: false, ticker };
+  }
+
+  return {
+    changed: true,
+    ticker: {
+      ...ticker,
+      metadata: {
+        ...ticker.metadata,
+        [field]: nextValues,
+      },
+    },
+  };
+}
+
+export async function applyCollectionMembershipChange(
+  ticker: TickerRecord,
+  kind: CollectionKind,
+  action: CollectionMembershipAction,
+  collectionId: string,
+  deps: SharedWorkflowDeps,
+): Promise<{ changed: boolean; ticker: TickerRecord }> {
+  const recordAttention = captureAttentionAction();
+  const result = withCollectionMembership(ticker, kind, action, collectionId);
+  if (!result.changed) return result;
+
+  await deps.tickerRepository.saveTicker(result.ticker);
+  deps.dispatch({ type: "UPDATE_TICKER", ticker: result.ticker });
+  if (kind === "watchlist" && action === "add") {
+    recordAttention(publicTickerKey(result.ticker.metadata.ticker, result.ticker.metadata.exchange), "watchlist_add");
+  }
+  return result;
+}
+
+/** How a function reads a list argument that names a watchlist: at most `maximum` symbols, its note pushed to `notes`. */
+export interface TickerListReading {
+  maximum?: number;
+  notes?: string[];
+}
+
+export async function resolveTickerListInput(
+  rawInput: string,
+  collectionId: string | null,
+  deps: SharedWorkflowDeps,
+  keepToken?: (token: string) => boolean,
+  reading?: TickerListReading,
+): Promise<string[]> {
+  // A watchlist's name stands for its symbols, as `fn` reads it (`SIW HY3`), with the note saying so.
+  const state = deps.getState();
+  const watchlist = /[,;\n]/.test(rawInput) ? null : findNamedCollection(state.config.watchlists, rawInput);
+  const members = watchlist
+    ? [...state.tickers.values()].filter((ticker) => ticker.metadata.watchlists.includes(watchlist.id)).map((ticker) => ticker.metadata.ticker)
+    : [];
+  if (watchlist && members.length > 0) {
+    const read = readWatchlistArgument(rawInput, watchlist, members, reading?.maximum);
+    reading?.notes?.push(read.note);
+    return read.symbols;
+  }
+
+  // A function that takes more than ten (QQ) reads its own cap, as `fn` does.
+  const tokens = parseTickerListInput(rawInput, reading?.maximum ?? MAX_TICKER_LIST_SIZE);
+  const symbols: string[] = [];
+  const seen = new Set<string>();
+
+  for (const token of tokens) {
+    if (keepToken?.(token)) {
+      if (!seen.has(token)) symbols.push(token);
+      seen.add(token);
+      continue;
+    }
+    const resolvedTicker = await resolveTickerInputOrThrow(token, null, collectionId, deps, { preserveListingKey: true });
+    const symbol = resolvedTicker.symbol;
+
+    if (seen.has(symbol)) continue;
+    seen.add(symbol);
+    symbols.push(symbol);
+  }
+
+  return symbols;
+}

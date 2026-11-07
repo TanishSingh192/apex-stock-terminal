@@ -1,0 +1,220 @@
+import { useMemo } from "react";
+import {
+  DataTableView,
+  StaticChartSurface,
+  type DataTableCell,
+  type DataTableColumn,
+  type StatItem,
+} from "../../../components";
+import type { ProjectedChartPoint } from "../../../components/chart/core/data";
+import { resolveChartPalette } from "../../../components/chart/core/palette";
+import type { StaticChartXMarker } from "../../../components/chart/static";
+import { colors, priceColor } from "../../../theme/colors";
+import { Box } from "../../../ui";
+import { displayWidth, formatCurrency, formatNumber, MISSING_VALUE } from "../../../utils/format";
+import type { KellySizingResult, SensitivityGrid } from "./types";
+import type { KellyHistoryInputs } from "./history";
+import type { KellyCount } from "./units";
+import { formatPct, formatSignedPct } from "./view";
+
+/** The longest result label ("Full growth"), which sets the band's label column. */
+const RESULT_LABEL_CHARS = 11;
+
+/** The inputs History reads off the ticker's monthly returns, ahead of the sizes. */
+export function buildKellyHistoryItems(inputs: KellyHistoryInputs): StatItem[] {
+  const payoff = inputs.downsideReturn < 0 ? inputs.upsideReturn / -inputs.downsideReturn : null;
+  return [
+    // The dates take a row of their own so a narrow pane never cuts them.
+    { id: "window", label: "Window", value: `${inputs.start} to ${inputs.end}`, detail: `${inputs.periods} monthly returns`, wide: true },
+    { id: "winRate", label: "Win rate", value: formatPct(inputs.winProbability, 1), detail: `${inputs.wins}/${inputs.periods}` },
+    { id: "avgGain", label: "Avg gain", value: formatSignedPct(inputs.upsideReturn), color: priceColor(inputs.upsideReturn) },
+    { id: "avgLoss", label: "Avg loss", value: formatSignedPct(inputs.downsideReturn), color: priceColor(inputs.downsideReturn) },
+    { id: "payoff", label: "Payoff", value: payoff == null ? "—" : `${formatNumber(payoff, 2)}x` },
+  ];
+}
+
+/** What the first money figure says while there is no bankroll to size in. */
+const BANKROLL_HINT = "Set a bankroll";
+const COUNT_LABEL: Record<KellyCount, string> = { shares: "Shares", units: "Units", contracts: "Contracts" };
+
+/**
+ * The sizing result as one band under the inputs, laid out in the FieldGrid's
+ * columns: the Kelly fractions, then the move in money, then risk, then log
+ * growth at full Kelly, at the current size and at the target. Money figures
+ * read a dash until there is a bankroll; the fractions and growth never wait
+ * for one.
+ */
+export function buildKellyResultItems({
+  result,
+  count = "units",
+  baseCurrency,
+  currentGrowth,
+  targetGrowth,
+  width,
+  columns,
+}: {
+  result: KellySizingResult;
+  /** What the add or trim is counted in: a future's contracts, a coin's units, a stock's shares. */
+  count?: KellyCount;
+  baseCurrency: string;
+  /** Null when the holding is not a share of any bankroll. */
+  currentGrowth: number | null;
+  targetGrowth: number;
+  width: number;
+  columns: number;
+}): StatItem[] {
+  const addTrim = result.addTrimValue == null ? MISSING_VALUE : formatCurrency(result.addTrimValue, baseCurrency);
+  const units = result.estimatedUnits == null ? null : `${formatNumber(result.estimatedUnits, 1)} ${count}`;
+  // The units ride beside the amount when the column has room for label,
+  // amount and units (plus the cell inset and gaps); otherwise they take a
+  // cell of their own rather than being cut off at the column edge.
+  const unitsInline = units != null
+    && Math.floor(width / Math.max(1, columns)) >= RESULT_LABEL_CHARS + displayWidth(addTrim) + displayWidth(units) + 6;
+  return [
+    { id: "full", label: "Full Kelly", value: formatPct(result.fullKellyFraction, 1) },
+    { id: "fractional", label: "Fractional", value: formatPct(result.fractionalKellyFraction, 1) },
+    {
+      id: "clipped",
+      label: "Clipped",
+      value: formatPct(result.clippedFraction, 2),
+      tone: result.clipReasons.length > 0 ? "positive" : undefined,
+    },
+    { id: "current", label: "Current %", value: result.currentFraction == null ? MISSING_VALUE : formatPct(result.currentFraction, 1) },
+    result.targetValue == null
+      ? { id: "target", label: "Target val", value: MISSING_VALUE, detail: BANKROLL_HINT }
+      : { id: "target", label: "Target val", value: formatCurrency(result.targetValue, baseCurrency) },
+    {
+      id: "addTrim",
+      label: "Add / trim",
+      value: addTrim,
+      detail: unitsInline ? units ?? undefined : undefined,
+      color: result.addTrimValue == null ? undefined : priceColor(result.addTrimValue),
+    },
+    ...(units != null && !unitsInline
+      ? [{ id: "units", label: COUNT_LABEL[count], value: formatNumber(result.estimatedUnits!, 1) }]
+      : []),
+    {
+      id: "risk",
+      label: "Risk",
+      value: result.riskValue == null ? MISSING_VALUE : formatCurrency(result.riskValue, baseCurrency),
+      detail: formatPct(result.riskFraction, 2),
+      // Nothing at risk is not a loss.
+      tone: result.riskValue != null && result.riskValue > 0 ? "negative" : undefined,
+    },
+    { id: "worstLoss", label: "Worst loss", value: formatPct(result.downsideLossFraction, 1) },
+    {
+      id: "expReturn",
+      label: "Exp return",
+      value: formatSignedPct(result.expectedReturn),
+      color: priceColor(result.expectedReturn),
+    },
+    { id: "fullGrowth", label: "Full growth", value: formatSignedPct(result.expectedLogGrowth) },
+    { id: "growthNow", label: "Growth now", value: currentGrowth == null ? MISSING_VALUE : formatSignedPct(currentGrowth) },
+    { id: "growthTarget", label: "Growth tgt", value: formatSignedPct(targetGrowth) },
+  ];
+}
+
+export function KellyCurveSection({
+  width,
+  height,
+  points,
+  xAxisLabels,
+  curveMaxFraction,
+  markers,
+  focused = false,
+}: {
+  width: number;
+  height: number;
+  points: ProjectedChartPoint[];
+  xAxisLabels: string[];
+  curveMaxFraction: number;
+  markers: StaticChartXMarker[];
+  focused?: boolean;
+}) {
+  // The curve takes the rest of the pane; the box absorbs any rounding so the
+  // chart never pushes past the footer.
+  return (
+    <Box paddingX={1} flexGrow={1} flexBasis={0} minHeight={0} overflow="hidden">
+      <StaticChartSurface
+        points={points}
+        width={Math.max(10, width - 2)}
+        height={height}
+        mode="line"
+        colors={resolveChartPalette(colors, "positive")}
+        yAxisLabel="Expected log growth"
+        yAxisColor={colors.textDim}
+        formatYAxisValue={(value) => formatSignedPct(value)}
+        xAxisLabels={xAxisLabels}
+        xAxisColor={colors.textDim}
+        formatXAxisCursorValue={(ratio) => formatPct(curveMaxFraction * ratio, 1)}
+        xMarkers={markers}
+        focused={focused}
+      />
+    </Box>
+  );
+}
+
+interface SensitivityRow {
+  /** Row position: clamped probabilities can repeat a label (99.0% twice). */
+  id: string;
+  label: string;
+  cells: SensitivityGrid["cells"][number];
+}
+
+const ROW_AXIS_COLUMN = "row";
+const FILL_COLUMN = "fill";
+
+/**
+ * The target size over a small grid of the two main inputs: rows vary the
+ * first (win or estimated probability), columns the second (upside, price).
+ */
+export function KellySensitivitySection({
+  width,
+  height,
+  focused,
+  sensitivity,
+}: {
+  width: number;
+  height: number;
+  focused: boolean;
+  sensitivity: SensitivityGrid;
+}) {
+  const columns = useMemo<DataTableColumn[]>(() => [
+    { id: ROW_AXIS_COLUMN, label: sensitivity.rowLabel, width: 10, align: "left" },
+    ...sensitivity.columns.map((column, index) => ({
+      id: String(index),
+      label: `${sensitivity.columnLabel} ${column}`,
+      width: Math.max(10, sensitivity.columnLabel.length + column.length + 1),
+      align: "right" as const,
+    })),
+    // A small matrix reads best packed beside its row axis; the empty column
+    // takes the rest of the width so the header band still spans the pane.
+    { id: FILL_COLUMN, label: "", width: 1, flexGrow: 1, align: "left" },
+  ], [sensitivity.columnLabel, sensitivity.columns, sensitivity.rowLabel]);
+  const rows = useMemo<SensitivityRow[]>(
+    () => sensitivity.rows.map((label, index) => ({ id: String(index), label, cells: sensitivity.cells[index] ?? [] })),
+    [sensitivity.cells, sensitivity.rows],
+  );
+  const renderCell = (row: SensitivityRow, column: DataTableColumn): DataTableCell => {
+    if (column.id === ROW_AXIS_COLUMN) return { text: row.label, color: colors.textDim };
+    if (column.id === FILL_COLUMN) return { text: "" };
+    return { text: row.cells[Number(column.id)]?.text ?? "—" };
+  };
+
+  return (
+    <DataTableView<SensitivityRow>
+      columns={columns}
+      items={rows}
+      getItemKey={(row) => row.id}
+      selection={{ kind: "none" }}
+      focused={focused}
+      keyboardNavigation={false}
+      sortColumnId={null}
+      sortDirection="asc"
+      renderCell={renderCell}
+      rootWidth={width}
+      rootHeight={Math.max(2, height)}
+      emptyStateTitle="No sensitivity grid"
+    />
+  );
+}

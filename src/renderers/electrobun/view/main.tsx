@@ -1,0 +1,326 @@
+/** @jsxImportSource react */
+import { setCurrentPluginTarget } from "../../../plugins/current-target";
+import { createRoot } from "react-dom/client";
+import { App } from "../../../app";
+import { applyLanguageFromConfig } from "../../../i18n";
+import { debugLog } from "../../../utils/debug-log";
+import { capturePaneImage } from "../../../utils/dom-screenshot";
+import { setStallSink } from "../../../utils/main-thread-stall";
+import { measurePerfAsync } from "../../../utils/perf-marks";
+import {
+  backendRequest,
+  initElectrobunBackend,
+  onBackendMessage,
+  replaceElectrobunCapabilityManifests,
+  sendElectrobunStall,
+  setElectrobunRemoteRequestHandler,
+} from "./backend-rpc";
+import { installElectrobunCapabilityStreamClient } from "./capability-stream-client";
+import { installFocusScopeRelease } from "../../dom/host/focus-scope";
+import { installElectrobunBrokerRemoteClient } from "./broker-remote-client";
+import { installElectrobunConfigStoreHost } from "./config-host";
+import {
+  installElectrobunCloudApiFetchTransport,
+  installElectrobunHttpFetchTransport,
+} from "./http-fetch";
+import { installElectrobunAppBadgeHost } from "./app-badge-host";
+import { installElectrobunUpdateHost } from "./update-host";
+import { installScreenshotWatermark } from "./screenshot-watermark";
+import { installElectrobunWindowFullscreenTracking } from "./window-fullscreen";
+import { installDomMarketDataFrames } from "../../dom/data-frames";
+import { releaseBootFrameWhenDrawn, startBootFrameRecorder } from "../../dom/boot-frame";
+import { DomErrorBoundary, DomHostProviders } from "../../dom/dom-host-providers";
+import { DesktopFatalScreen } from "./fatal-screen";
+import { resolveRendererWindowError } from "./renderer-window-error";
+import { createWebUiHost, webRendererHost } from "./ui-host";
+import {
+  initializeDesktopResearchActivity,
+  observeDesktopDeepLinks,
+} from "../../../api-client/research-activity";
+import { createDesktopWindowBridge } from "./desktop/window/bridge";
+import { setDesktopWindows } from "../../../state/desktop-windows";
+import type { DesktopApplicationMenuBridge } from "../../../types/desktop-menu";
+import { prepareDetachedSnapshot } from "./desktop/window/snapshot";
+import { createElectrobunAppServices } from "./app-services";
+import { getRendererPlugins } from "../../../plugins/catalog-ui";
+import { loadDesktopExternalPlugin, loadDesktopExternalPlugins } from "./external-plugins";
+import { activateUpdatedPlugins } from "../../../plugins/marketplace/activation";
+import { getMarketplaceHost, setPluginManager, type PluginManager } from "../../../plugins/marketplace/store";
+import { remoteNotesFilesIO, setNotesFilesIO } from "../../../plugins/builtin/notes/files";
+import { NOTES_FILES_CAPABILITY_ID } from "../../../capabilities";
+import { loadOfficialPluginIds } from "../../../plugins/marketplace/feed";
+import { publishPluginSeedProgress } from "../../../plugins/seed-progress";
+import { crashReportsEnabled, installCrashReporter, reportCrash } from "../../../telemetry/crash-reports";
+import { browserDoNotTrack, installWindowCrashListeners } from "../../../telemetry/crash-reports-dom";
+import { forwardAttendedStalls } from "../../../telemetry/stall-reports-dom";
+import { currentTelemetryConfig } from "../../../telemetry/live-config";
+import { installAttentionCounter } from "../../../telemetry/attention-counts";
+import { installUsageCounter, usageCountsEnabled } from "../../../telemetry/usage-counts";
+import { installWindowUsageFlush } from "../../../telemetry/usage-counts-dom";
+import { cloudSyncController } from "../../../sync/controller";
+import { createViewIdMirror, restoreViewIds, viewIdStorage } from "./view-ids";
+import { logFailure } from "../../../utils/log-failure";
+
+// Declared here rather than sniffed: the desktop view and the hosted browser
+// app are both browser contexts but differ in what plugins may do.
+setCurrentPluginTarget("desktop");
+// Errors are held until the Bun process has answered `init` with the install
+// id and the off switch; the reports themselves go out over the same RPC
+// transport as every other Cloud call.
+installWindowCrashListeners();
+installWindowUsageFlush();
+
+const rootElement = document.getElementById("root");
+if (!rootElement) {
+  throw new Error("Missing root element");
+}
+const appRootElement = rootElement;
+
+const root = createRoot(appRootElement);
+const bootLog = debugLog.createLogger("electrobun-web-boot");
+let appMounted = false;
+
+appRootElement.tabIndex = -1;
+// The page drew the layout this window last drew, or the bare shell, before
+// this script loaded (dom/boot-frame.ts); it stays until the app has drawn its own.
+const releaseBootFrame = releaseBootFrameWhenDrawn(document, appRootElement);
+/** How long after the app mounts the launch frame stays at most. */
+const BOOT_FRAME_RELEASE_FALLBACK_MS = 4_000;
+
+function renderFatalError(error: unknown, details?: string, title = "Apex Stock Terminal failed to start"): void {
+  releaseBootFrame();
+  root.render(
+    <DesktopFatalScreen
+      title={title}
+      error={error}
+      details={details}
+      source="renderer-fatal"
+    />,
+  );
+}
+
+window.__gloomRenderFatalError = (error, details, source) => {
+  if (resolveRendererWindowError({
+    error,
+    details,
+    source,
+    appMounted,
+  }) === "ignore") {
+    return;
+  }
+  renderFatalError(error, details, "Apex Stock Terminal crashed");
+};
+
+function focusWebSurface(): void {
+  window.focus();
+  appRootElement.focus({ preventScroll: true });
+}
+
+function requestStartupFocus(): void {
+  focusWebSurface();
+  requestAnimationFrame(() => {
+    void backendRequest("host.focusWindow")
+      .catch(logFailure("electrobun-web-boot", "Could not focus the window at startup", null))
+      .then(() => focusWebSurface());
+  });
+}
+
+async function boot() {
+  bootLog.info("boot started");
+  // Both asked for at once: the Bun process compiles the plugins while it
+  // answers `init`, rather than after this view asks a second time.
+  const backendInitPromise = initElectrobunBackend();
+  const externalBundlesPromise = backendRequest("plugins.listExternal");
+  // Avoid a premature global unhandled-rejection render while UI chunks load.
+  void backendInitPromise.catch(() => {
+    // Intentional ignore: boot awaits this promise below and shows its failure; this only stops an early unhandled rejection.
+  });
+  void externalBundlesPromise.catch(() => {
+    // Intentional ignore: the plugin load below awaits this promise, asks again and logs its failure.
+  });
+
+  installElectrobunConfigStoreHost();
+  installElectrobunBrokerRemoteClient();
+  installElectrobunHttpFetchTransport();
+  installElectrobunCloudApiFetchTransport();
+  installElectrobunUpdateHost();
+  // Notes are files only the Bun process can reach, so the notes plugin's
+  // file operations run there.
+  setNotesFilesIO((dataDir) => remoteNotesFilesIO(dataDir, (operationId, payload) => (
+    backendRequest("capability.invoke", { capabilityId: NOTES_FILES_CAPABILITY_ID, operationId, payload })
+  )));
+  const init = await measurePerfAsync("startup.electrobun.backend-init", () => backendInitPromise);
+  // The main window does the app-wide work (account sync, the Dock badge,
+  // remote control, the boot frame); every other window draws its tabs.
+  const primaryWindow = init.windowKind === "main" && (init.windowId ?? "main") === "main";
+  // The environment's opt-out comes from the Bun process; the config
+  // switches are read live, so the command bar toggles apply at once.
+  installCrashReporter({
+    surface: "desktop",
+    os: init.telemetry.os,
+    homeDir: init.telemetry.homeDir,
+    isEnabled: () => !init.telemetry.optedOut && crashReportsEnabled(currentTelemetryConfig(init.config)),
+    getInstallId: () => init.telemetry.installId,
+  });
+  installUsageCounter({
+    surface: "desktop",
+    os: init.telemetry.os,
+    isEnabled: () => !init.telemetry.optedOut && usageCountsEnabled(currentTelemetryConfig(init.config)),
+    getInstallId: () => init.telemetry.installId,
+    officialPluginIds: loadOfficialPluginIds,
+  });
+  installAttentionCounter({
+    allowed: () => !init.telemetry.optedOut && !browserDoNotTrack(),
+    launchConfig: () => init.config,
+    // Only the main window syncs, and sends the other windows the settings it pulled.
+    ...(!primaryWindow ? { accountSettingsPulled: () => true } : {}),
+  });
+  // Desktop has no Debug Log: this window's freezes go to the Bun process, which keeps the stall log.
+  setStallSink(forwardAttendedStalls(sendElectrobunStall).sink);
+  installElectrobunCapabilityStreamClient();
+  installFocusScopeRelease();
+  installElectrobunWindowFullscreenTracking();
+  if (primaryWindow) installElectrobunAppBadgeHost();
+  installDomMarketDataFrames((listener) => onBackendMessage("desktop.windowVisibility", ({ visible }) => listener(visible)));
+  installScreenshotWatermark();
+  const desktopSnapshot = init.windowKind === "detached" && init.paneId && init.desktopSnapshot
+    ? prepareDetachedSnapshot(init.desktopSnapshot, init.paneId)
+    : init.desktopSnapshot;
+  const config = desktopSnapshot?.config ?? init.config;
+  applyLanguageFromConfig(config);
+  // The plugins the launch is restoring, which the app brings in as they
+  // land, as the terminal does; later changes come as messages.
+  if (init.pluginSeed) publishPluginSeedProgress(init.pluginSeed);
+  const desktopWindowBridge = createDesktopWindowBridge(init.windowKind, init.paneId);
+  // Menus and the command bar offer the other windows from here.
+  setDesktopWindows(desktopWindowBridge.windows ?? null);
+  const desktopApplicationMenuBridge: DesktopApplicationMenuBridge = {
+    subscribe: (listener) => onBackendMessage("application-menu.select", ({ command }) => listener(command)),
+  };
+  // Before anything reads them: ids this view's storage lacks come back from
+  // the copy on disk, and the main window keeps that copy up to date. The sync
+  // id is made at the first push, and a gloom.sh link can bring a visitor id.
+  const viewStorage = viewIdStorage();
+  if (viewStorage) restoreViewIds(viewStorage, init.viewIds);
+  const mirrorViewIds = viewStorage && primaryWindow
+    ? createViewIdMirror(viewStorage, init.viewIds, (ids) => backendRequest("host.saveViewIds", { ids }))
+    : () => {};
+  mirrorViewIds();
+  cloudSyncController.subscribe(mirrorViewIds);
+  initializeDesktopResearchActivity();
+  const observedDeepLinks = observeDesktopDeepLinks({
+    subscribe: (listener) => onBackendMessage("desktop.deepLink", listener),
+  });
+  const desktopDeepLinkBridge: typeof observedDeepLinks = {
+    subscribe: (listener) => observedDeepLinks.subscribe((deeplink) => {
+      listener(deeplink);
+      mirrorViewIds();
+    }),
+  };
+  const webUiHost = createWebUiHost(init.desktopPlatform);
+  // Compiled by the Bun process, which owns the filesystem. A failure here must
+  // not stop the app from starting: the marketplace reports broken plugins, and
+  // the built-in catalog is enough to run on.
+  const externalPlugins = await measurePerfAsync(
+    "startup.electrobun.load-external-plugins",
+    async () => {
+      try {
+        // Asked once more if the early request failed: it waits for the
+        // whole launch, which a first run's plugin downloads can stretch past
+        // the request's time limit.
+        const bundles = await externalBundlesPromise.catch(() => backendRequest("plugins.listExternal"));
+        return await loadDesktopExternalPlugins(bundles);
+      } catch (error) {
+        debugLog.createLogger("desktop-plugins").error(`External plugin load failed: ${error}`);
+        return [];
+      }
+    },
+  );
+
+  // The view cannot run git or bun; every operation is the Bun process doing
+  // it, and `load` is that process compiling the result for this renderer.
+  // `activate` registers the plugin over there too, where its capabilities and
+  // brokers actually run, and adopts the manifests that come back.
+  const pluginManager: PluginManager = {
+    install: (repo, pin) => backendRequest("plugins.install", { ref: repo, ...(pin ? { pin } : {}) }),
+    update: (directory, pin) => backendRequest("plugins.update", { directory, ...(pin ? { pin } : {}) }),
+    remove: (directory) => backendRequest("plugins.remove", { directory }),
+    remoteHeads: (directories) => backendRequest("plugins.remoteHeads", { directories: [...directories] }),
+    load: async (directory) => {
+      const bundle = await backendRequest("plugins.bundle", { directory });
+      return bundle ? loadDesktopExternalPlugin(bundle) : null;
+    },
+    activate: async (directory) => {
+      const result = await backendRequest("plugins.activate", { directory });
+      if (!result.ok) return result;
+      replaceElectrobunCapabilityManifests(result.capabilityManifests);
+      return { ok: true };
+    },
+    deactivate: async (pluginId) => {
+      const result = await backendRequest("plugins.deactivate", { pluginId });
+      replaceElectrobunCapabilityManifests(result.capabilityManifests);
+    },
+  };
+  setPluginManager(pluginManager);
+  // Official plugins the Bun process updated in the background, brought into
+  // this session the way the Plugins pane does after an update.
+  onBackendMessage("plugins.updated", ({ directories }) => {
+    const marketplace = getMarketplaceHost();
+    if (marketplace) void activateUpdatedPlugins(directories, marketplace, pluginManager);
+  });
+
+  const remoteControlAdapter = primaryWindow
+    ? {
+      registerHandler: setElectrobunRemoteRequestHandler,
+      terminalDevice: { kind: "desktop" as const, name: init.hostName?.trim() || "Apex Stock Terminal desktop" },
+      capturePane: capturePaneImage,
+    }
+    : undefined;
+  measurePerfAsync("startup.electrobun.root-render", async () => {
+    root.render(
+      <DomErrorBoundary
+        label="[desktop-recovery] renderer error boundary"
+        fallback={(error, details) => (
+          <DesktopFatalScreen error={error} details={details} source="react-error-boundary" />
+        )}
+      >
+        <DomHostProviders ui={webUiHost} renderer={webRendererHost}>
+          <App
+            config={config}
+            servicesFactory={createElectrobunAppServices}
+            externalPlugins={externalPlugins}
+            plugins={getRendererPlugins(externalPlugins)}
+            desktopWindowBridge={desktopWindowBridge}
+            desktopApplicationMenuBridge={desktopApplicationMenuBridge}
+            desktopDeepLinkBridge={desktopDeepLinkBridge}
+            desktopSnapshot={desktopSnapshot}
+            desktopThemePreview={init.desktopThemePreview}
+            remoteControlAdapter={remoteControlAdapter}
+          />
+        </DomHostProviders>
+      </DomErrorBoundary>,
+    );
+    appMounted = true;
+  });
+  // A layout with neither panes nor a status bar has nothing to wait for.
+  window.setTimeout(releaseBootFrame, BOOT_FRAME_RELEASE_FALLBACK_MS);
+  if (primaryWindow) {
+    startBootFrameRecorder({
+      doc: document,
+      root: appRootElement,
+      save: (frame) => { void backendRequest("host.saveBootFrame", { frame }).catch(logFailure("electrobun-web-boot", "Could not save the boot frame")); },
+    });
+  }
+  requestStartupFocus();
+  bootLog.info("root render scheduled", {
+    layoutPanes: config.layout.instances.length,
+    floatingPanes: config.layout.floating.length,
+    detachedPanes: config.layout.detached.length,
+    brokerInstances: config.brokerInstances.length,
+  });
+}
+
+boot().catch((error) => {
+  reportCrash(error, { kind: "uncaught" });
+  renderFatalError(error);
+});

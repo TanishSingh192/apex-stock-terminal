@@ -1,0 +1,20 @@
+{
+  "hosts": [
+    "api.crypto.com",
+    "api.elections.kalshi.com",
+    "api.fda.gov",
+    "api.gemini.com",
+    "api.limitless.exchange",
+    "api.votehub.com",
+    "clinicaltrials.gov",
+    "data.pascal.trade",
+    "efts.sec.gov",
+    "forms13f.com",
+    "gateway.polymarket.us",
+    "markets.newyorkfed.org",
+    "nasdaqtrader.com",
+    "production.dataviz.cnn.io",
+    "services-dynarep.ddwa.finra.org",
+    "www.treasurydirect.gov"
+  ]
+}

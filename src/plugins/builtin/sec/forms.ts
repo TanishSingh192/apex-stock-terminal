@@ -1,0 +1,94 @@
+import type { SecFilingItem } from "../../../types/data-provider";
+import { loadLatestFilings, SEC_FILING_FETCH_LIMIT, type HiddenFilings } from "../../../utils/sec-filings";
+
+/**
+ * Registered fund forms: registration statements and their post-effective
+ * amendments, prospectus supplements, shareholder reports, the annual census
+ * and monthly portfolio reports. An amendment (`N-CSR/A`) matches its form.
+ */
+export const ETF_FILING_FORMS = [
+  "N-1A",
+  "N-2",
+  "485APOS",
+  "485BPOS",
+  "485BXT",
+  "497",
+  "497J",
+  "497K",
+  "N-CSR",
+  "N-CSRS",
+  "N-30D",
+  "N-CEN",
+  "NPORT-P",
+  "NPORT-EX",
+  "24F-2NT",
+] as const;
+
+export const ETF_FORMS_SETTING = ETF_FILING_FORMS.join(",");
+
+/** How many filings the SEC pane asks for: every filing the service lists for the issuer. */
+export { SEC_FILING_FETCH_LIMIT } from "../../../utils/sec-filings";
+
+function normalizeFilingForm(form: string): string {
+  return form.trim().toUpperCase();
+}
+
+/** Empty means no form filter. The unfiltered SEC template relies on that. */
+export function parseFormsSetting(value: string | undefined): string[] | null {
+  const forms = (value ?? "")
+    .split(",")
+    .map((part) => normalizeFilingForm(part))
+    .filter(Boolean);
+  return forms.length > 0 ? forms : null;
+}
+
+export function filterFilingsByForms(filings: readonly SecFilingItem[], forms: readonly string[]): SecFilingItem[] {
+  const accepted = new Set(forms.map(normalizeFilingForm));
+  return filings.filter((filing) => {
+    const form = normalizeFilingForm(filing.form);
+    return accepted.has(form) || (form.endsWith("/A") && accepted.has(form.slice(0, -2)));
+  });
+}
+
+/**
+ * A fund's own filings out of its trust's (ProShares Trust files for 166
+ * funds): the ones the service marks as filed for the fund's series. A list
+ * the service could not mark, a fund whose registrant runs no other series,
+ * or a list in which nothing is marked as the fund's own (a series list that
+ * came back empty) stays whole.
+ */
+export function fundSeriesFilings(filings: readonly SecFilingItem[]): readonly SecFilingItem[] {
+  return filings.some((filing) => filing.fundSeries === true)
+    ? filings.filter((filing) => filing.fundSeries === true)
+    : filings;
+}
+
+/** A form as typed or filed, without punctuation or the `SC`/`SCHEDULE` prefix of ownership schedules. */
+function compactFilingForm(form: string): string {
+  return form.toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^(?:SCHEDULE|SC)(?=\d)/, "");
+}
+
+/** `13D` matches SC 13D, SCHEDULE 13D and their amendments; `10-K` matches 10-K and 10-K/A. */
+export function filingFormMatches(form: string, wanted: string): boolean {
+  const target = compactFilingForm(wanted);
+  const actual = compactFilingForm(form);
+  return !!target && (actual === target || actual === `${target}A`);
+}
+
+/**
+ * The filings a list of an issuer's filings shows, `fn SEC` and `filings`
+ * alike. With `form`, the latest `limit` of that form and its amendments from
+ * every filing listed for the issuer, supplements included when it names
+ * them. With `all`, the latest `limit` as filed. Otherwise the latest `limit`
+ * without what `loadLatestFilings` leaves out (a bank's pricing supplements,
+ * a fund trust's filings for its other funds), with how many it left out.
+ */
+export async function loadShownSecFilings(
+  load: (count: number) => Promise<SecFilingItem[]>,
+  limit: number,
+  { form = null, all = false }: { form?: string | null; all?: boolean } = {},
+): Promise<{ filings: SecFilingItem[]; hidden: HiddenFilings | null }> {
+  if (form) return { filings: (await load(SEC_FILING_FETCH_LIMIT)).filter((filing) => filingFormMatches(filing.form, form)).slice(0, limit), hidden: null };
+  if (all) return { filings: (await load(limit)).slice(0, limit), hidden: null };
+  return loadLatestFilings(load, limit);
+}

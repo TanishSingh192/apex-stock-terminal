@@ -1,0 +1,517 @@
+import { memo } from "react";
+import { Box, Text, useUiCapabilities } from "../../../ui";
+import type { CompositeChartXMarker } from "./types";
+import type { EventCaptionPlacement } from "./event-captions";
+
+export interface StaticChartXAxisLabel {
+  label: string;
+  ratio: number;
+  /** An axis's name rather than a value: kept whole, and the ticks that would run into it give way. */
+  pinned?: boolean;
+  /** Cells the label covers in the fixed-width axis text, end inclusive. */
+  start?: number;
+  end?: number;
+}
+
+function clampRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function markerColumn(xRatio: number, width: number): number {
+  return Math.round(clampRatio(xRatio) * Math.max(0, width - 1));
+}
+
+function alignAxisLabel(label: string, width: number, index: number, count: number): string {
+  const clipped = label.length > width ? label.slice(0, width) : label;
+  const padding = Math.max(0, width - clipped.length);
+  if (index === 0) return clipped.padEnd(width);
+  if (index === count - 1) return clipped.padStart(width);
+  const left = Math.floor(padding / 2);
+  return `${" ".repeat(left)}${clipped}${" ".repeat(padding - left)}`;
+}
+
+interface LabelPlacement {
+  start: number;
+  end: number;
+  pinned?: boolean;
+}
+
+/**
+ * Space kept between neighbouring tick labels, in cells. The terminal prints
+ * labels on whole cells, where one is a blank cell. The desktop and the web
+ * place a label at its exact fraction of the plot, in a font a little
+ * narrower than the cell it is counted in, so half a cell is already a gap.
+ */
+const TERMINAL_LABEL_GAP = 1;
+const DESKTOP_LABEL_GAP = 0.5;
+
+/**
+ * Neighbouring ticks that land within `gap` cells of each other would print as
+ * one word ("930D", "1020"). Keep the first tick, then each one clear of the
+ * last kept, holding room for the final tick. A pinned label (an axis's name)
+ * always stays: the ticks that would run into it are dropped first.
+ */
+function dropCollidingLabels<T extends LabelPlacement>(placements: readonly T[], gap: number): T[] {
+  const pinned = placements.filter((placement) => placement.pinned);
+  const clear = (placement: T) => pinned.every((pin) => placement.start >= pin.end + 1 + gap || placement.end + 1 + gap <= pin.start);
+  const sorted = placements.filter((placement) => !placement.pinned && clear(placement)).sort((left, right) => left.start - right.start);
+  return [...keepApart(sorted, gap), ...pinned].sort((left, right) => left.start - right.start);
+}
+
+function keepApart<T extends LabelPlacement>(sorted: readonly T[], gap: number): T[] {
+  const final = sorted[sorted.length - 1];
+  const kept: T[] = [];
+  let lastEnd = Number.NEGATIVE_INFINITY;
+  for (const placement of sorted) {
+    if (placement.start < lastEnd + 1 + gap) continue;
+    if (placement !== final && kept.length > 0 && final && final.start < placement.end + 1 + gap) continue;
+    kept.push(placement);
+    lastEnd = placement.end;
+  }
+  return kept;
+}
+
+/**
+ * The cursor and anchor badges print over the flow text, so every label they
+ * touch, with a blank cell either side, is blanked whole rather than leaving
+ * its ends around the badge. A single fixed-width axis text is split by its
+ * tick spans; evenly spread labels each count as one.
+ */
+function blankLabelsUnderBadges(
+  segments: readonly string[],
+  ticks: readonly StaticChartXAxisLabel[],
+  clearOfBadges: (start: number, end: number) => boolean,
+): string[] {
+  const cells = segments.join("").split("");
+  const spans: LabelPlacement[] = [];
+  const tickSpans = ticks.filter((tick) => Number.isFinite(tick.start) && Number.isFinite(tick.end));
+  if (segments.length === 1 && tickSpans.length > 0) {
+    for (const tick of tickSpans) spans.push({ start: tick.start!, end: tick.end! });
+  } else {
+    let offset = 0;
+    for (const segment of segments) {
+      const first = segment.search(/\S/);
+      if (first >= 0) spans.push({ start: offset + first, end: offset + segment.trimEnd().length - 1 });
+      offset += segment.length;
+    }
+  }
+  for (const { start, end } of spans) {
+    if (clearOfBadges(start, end + 1)) continue;
+    for (let cell = Math.max(0, start); cell <= end && cell < cells.length; cell += 1) cells[cell] = " ";
+  }
+  let offset = 0;
+  return segments.map((segment) => {
+    const text = cells.slice(offset, offset + segment.length).join("");
+    offset += segment.length;
+    return text;
+  });
+}
+
+export interface StaticXAxisMarker {
+  ratio: number;
+  label: string;
+  color: string;
+}
+
+/** A time label at its place on the axis, which holds still while the cursor moves past. */
+const PositionedTimeLabel = memo(function PositionedTimeLabel({ label, color, left, right, transform }: {
+  label: string;
+  color: string | undefined;
+  left: number | string | undefined;
+  right: number | string | undefined;
+  transform: number | string | undefined;
+}) {
+  return (
+    <Text
+      fg={color}
+      selectable={false}
+      // The label against the right edge, which a floating pane's resize grip may cover.
+      data-gloom-edge={right !== undefined ? "end" : undefined}
+      style={{
+        position: "absolute",
+        top: 0,
+        whiteSpace: "pre",
+        pointerEvents: "none",
+        ...(left !== undefined ? { left } : {}),
+        ...(right !== undefined ? { right } : {}),
+        ...(transform !== undefined ? { transform } : {}),
+      }}
+    >
+      {label}
+    </Text>
+  );
+});
+
+/** A stretch of the axis text in the terminal, which renders only when its text does. */
+const TimeLabelSegment = memo(function TimeLabelSegment({ width, text, color, end }: {
+  width: number;
+  text: string;
+  color: string | undefined;
+  end: boolean;
+}) {
+  return (
+    <Box width={width} overflow="hidden" data-gloom-edge={end ? "end-segment" : undefined}>
+      <Text fg={color}>{text}</Text>
+    </Box>
+  );
+});
+
+export function StaticXAxisLabels({
+  labels,
+  positionedLabels,
+  width,
+  color,
+  cursorColumn,
+  cursorPixelX,
+  cursorLabel,
+  cursorColor,
+  cursorBackgroundColor,
+  extraMarkers,
+}: {
+  labels: string[];
+  positionedLabels?: readonly StaticChartXAxisLabel[];
+  width: number;
+  color?: string;
+  cursorColumn?: number | null;
+  cursorPixelX?: number | null;
+  cursorLabel?: string | null;
+  cursorColor?: string;
+  cursorBackgroundColor?: string;
+  /** Anchors that stay put while the cursor moves, such as a measure start. */
+  extraMarkers?: readonly StaticXAxisMarker[];
+}) {
+  const { cellWidthPx = 8, fractionalViewport = false, nativePaneChrome } = useUiCapabilities();
+  const visibleLabels = labels.filter(Boolean);
+  const visiblePositionedLabels = positionedLabels?.filter((entry) => (
+    entry.label.length > 0 && Number.isFinite(entry.ratio)
+  )) ?? [];
+  if (visibleLabels.length === 0 && visiblePositionedLabels.length === 0) return null;
+  if (width <= 0) return null;
+  const segmentCount = Math.max(visibleLabels.length, 1);
+  const baseWidth = Math.floor(width / segmentCount);
+  const remainder = width - baseWidth * segmentCount;
+  const clippedCursorLabel = cursorLabel ? cursorLabel.slice(0, width) : null;
+  const cursorLabelWidth = clippedCursorLabel?.length ?? 0;
+  const usePixelOverlay = fractionalViewport
+    && clippedCursorLabel !== null
+    && cursorPixelX !== null
+    && cursorPixelX !== undefined
+    && Number.isFinite(cursorPixelX)
+    && cursorLabelWidth > 0;
+  const pixelWidth = Math.max(width * cellWidthPx, 1);
+  const halfCursorLabelWidthPx = Math.min((cursorLabelWidth * cellWidthPx) / 2, (pixelWidth - 1) / 2);
+  const cursorLeftPercent = usePixelOverlay
+    ? (
+      Math.max(
+        halfCursorLabelWidthPx,
+        Math.min(cursorPixelX!, Math.max(pixelWidth - halfCursorLabelWidthPx, halfCursorLabelWidthPx)),
+      ) / Math.max(pixelWidth - 1, 1)
+    ) * 100
+    : null;
+  const cursorLeft = cursorColumn !== null
+    && cursorColumn !== undefined
+    && Number.isFinite(cursorColumn)
+    && cursorLabelWidth > 0
+    ? Math.max(0, Math.min(Math.max(0, width - cursorLabelWidth), Math.round(cursorColumn) - Math.floor(cursorLabelWidth / 2)))
+    : null;
+  const isDesktop = nativePaneChrome === true;
+  const extraMarkerLeft = (label: string, ratio: number) => (
+    Math.max(0, Math.min(width - label.length, Math.round(ratio * (width - 1)) - Math.floor(label.length / 2)))
+  );
+  // Where the cursor and anchor badges sit, in cells. A tick label under one
+  // steps aside instead of showing its ends around the badge.
+  const badgeSpans: Array<readonly [number, number]> = [];
+  if (clippedCursorLabel && cursorLeftPercent !== null) {
+    const center = (cursorLeftPercent / 100) * width;
+    badgeSpans.push([center - cursorLabelWidth / 2, center + cursorLabelWidth / 2]);
+  } else if (clippedCursorLabel && cursorLeft !== null) {
+    badgeSpans.push([cursorLeft, cursorLeft + cursorLabelWidth]);
+  }
+  for (const marker of extraMarkers ?? []) {
+    const label = marker.label.slice(0, width);
+    if (label.length === 0) continue;
+    const ratio = clampRatio(marker.ratio);
+    const left = fractionalViewport ? ratio * width - label.length / 2 : extraMarkerLeft(label, ratio);
+    badgeSpans.push([left, left + label.length]);
+  }
+  const clearOfBadges = (start: number, end: number) => badgeSpans.every(([badgeStart, badgeEnd]) => (
+    end + 1 <= badgeStart || start >= badgeEnd + 1
+  ));
+  const placedPositionedLabels = visiblePositionedLabels.flatMap((entry, index) => {
+    const ratio = clampRatio(entry.ratio);
+    const labelWidth = entry.label.length;
+    const halfLabel = labelWidth / 2;
+    let start: number;
+    let edgeStyle: Record<string, number | string>;
+    if (!isDesktop) {
+      start = Math.max(0, Math.min(width - labelWidth, markerColumn(ratio, width) - Math.floor(labelWidth / 2)));
+      edgeStyle = { left: start };
+    } else if (ratio * width <= halfLabel + 1) {
+      // A centered label that would reach the left border sits one cell in,
+      // on the same inset as the legend above the plot.
+      start = 1;
+      edgeStyle = { left: "var(--cell-w)" };
+    } else if (ratio * width >= width - halfLabel) {
+      start = width - labelWidth;
+      edgeStyle = { right: 0 };
+    } else {
+      start = ratio * width - halfLabel;
+      edgeStyle = { left: `${ratio * 100}%`, transform: "translateX(-50%)" };
+    }
+    if (!clearOfBadges(start, start + labelWidth)) return [];
+    return [{ entry, index, edgeStyle, start, end: start + labelWidth - 1, pinned: entry.pinned }];
+  });
+  const positionedPlacements = dropCollidingLabels(placedPositionedLabels, isDesktop ? DESKTOP_LABEL_GAP : TERMINAL_LABEL_GAP);
+  const segmentWidths = visibleLabels.map((_, index) => baseWidth + (index < remainder ? 1 : 0));
+  const flowText = blankLabelsUnderBadges(
+    visibleLabels.map((label, index) => alignAxisLabel(label, segmentWidths[index]!, index, visibleLabels.length)),
+    visibleLabels.length === 1 ? visiblePositionedLabels : [],
+    clearOfBadges,
+  );
+
+  return (
+    <Box
+      width={width}
+      height={1}
+      flexDirection="row"
+      position="relative"
+      overflow="hidden"
+      // Desktop: the width the gutters beside it leave, so labels placed in
+      // percentages follow a resize that draws the chart at a new size
+      // between renders.
+      style={isDesktop ? { flex: "1 1 0px", width: "auto", minWidth: 0 } : undefined}
+      data-gloom-role="chart-time-axis"
+      // The time under the crosshair, for checks that move it.
+      data-gloom-cursor={clippedCursorLabel || undefined}
+      data-gloom-label={(visiblePositionedLabels.length > 0
+        ? visiblePositionedLabels.map((entry) => entry.label)
+        : visibleLabels).join(" ")}
+    >
+      {visiblePositionedLabels.length > 0 && (isDesktop || visibleLabels.length === 0) ? (
+        <Box position="absolute" left={0} top={0} width={width} height={1} style={isDesktop ? { width: "100%" } : undefined}>
+          {positionedPlacements.map(({ entry, index, edgeStyle }) => (
+            <PositionedTimeLabel
+              key={`${entry.label}:${entry.ratio}:${index}`}
+              label={entry.label}
+              color={color}
+              left={edgeStyle.left}
+              right={edgeStyle.right}
+              transform={edgeStyle.transform}
+            />
+          ))}
+        </Box>
+      ) : (
+        <Box width={width} height={1} flexDirection="row">
+          {visibleLabels.map((label, index) => (
+            <TimeLabelSegment
+              key={`${label}:${index}`}
+              width={segmentWidths[index]!}
+              text={flowText[index]!}
+              color={color}
+              end={index === visibleLabels.length - 1 && visibleLabels.length > 1}
+            />
+          ))}
+        </Box>
+      )}
+      {extraMarkers?.map((marker) => {
+        const label = marker.label.slice(0, width);
+        const ratio = clampRatio(marker.ratio);
+        if (label.length === 0) return null;
+        return (
+          <Text
+            key={`${marker.label}:${marker.ratio}`}
+            fg={marker.color}
+            bg={cursorBackgroundColor}
+            selectable={false}
+            style={fractionalViewport
+              ? {
+                position: "absolute",
+                left: `${ratio * 100}%`,
+                top: 0,
+                transform: "translateX(-50%)",
+                whiteSpace: "pre",
+                pointerEvents: "none",
+                zIndex: 2,
+              }
+              : {
+                position: "absolute",
+                left: extraMarkerLeft(label, ratio),
+                top: 0,
+                whiteSpace: "pre",
+                pointerEvents: "none",
+                zIndex: 2,
+              }}
+          >
+            {label}
+          </Text>
+        );
+      })}
+      {clippedCursorLabel && (cursorLeftPercent !== null || cursorLeft !== null) ? (
+        <Text
+          fg={cursorColor}
+          bg={cursorBackgroundColor}
+          selectable={false}
+          style={cursorLeftPercent !== null
+            ? {
+              position: "absolute",
+              left: `${cursorLeftPercent}%`,
+              top: 0,
+              transform: "translateX(-50%)",
+              whiteSpace: "pre",
+              pointerEvents: "none",
+              zIndex: 3,
+            }
+            : {
+              position: "absolute",
+              left: cursorLeft ?? 0,
+              top: 0,
+              whiteSpace: "pre",
+              pointerEvents: "none",
+              zIndex: 3,
+            }}
+        >
+          {clippedCursorLabel}
+        </Text>
+      ) : null}
+    </Box>
+  );
+}
+
+export function StaticXMarkerOverlay({
+  markers,
+  width,
+  height,
+  fallbackColor,
+}: {
+  markers: readonly CompositeChartXMarker[];
+  width: number;
+  height: number;
+  fallbackColor?: string;
+}) {
+  const { nativePaneChrome } = useUiCapabilities();
+  const visibleMarkers = markers.filter((marker) => Number.isFinite(marker.xRatio));
+  if (visibleMarkers.length === 0 || width <= 0 || height <= 0) return null;
+
+  if (nativePaneChrome) {
+    return (
+      <Box position="absolute" left={0} top={0} width={width} height={height} style={{ width: "100%", height: "100%" }}>
+        {visibleMarkers.map((marker) => (
+          <Box
+            key={marker.id}
+            position="absolute"
+            left={`${clampRatio(marker.xRatio) * 100}%`}
+            top={0}
+            bottom={0}
+            width={0}
+            zIndex={2}
+            style={{
+              width: 1,
+              transform: "translateX(-0.5px)",
+              backgroundColor: marker.color ?? fallbackColor ?? "currentColor",
+              opacity: 0.85,
+              pointerEvents: "none",
+            }}
+          />
+        ))}
+      </Box>
+    );
+  }
+
+  return (
+    <Box position="absolute" left={0} top={0} width={width} height={height}>
+      {visibleMarkers.map((marker) => {
+        const left = markerColumn(marker.xRatio, width);
+        return (
+          <Box
+            key={marker.id}
+            position="absolute"
+            left={left}
+            top={0}
+            width={1}
+            height={height}
+            flexDirection="column"
+            zIndex={2}
+          >
+            {Array.from({ length: height }, (_, row) => (
+              <Text key={row} fg={marker.color}>
+                {marker.lineChar ?? "│"}
+              </Text>
+            ))}
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+export function StaticXMarkerLabels({
+  markers,
+  width,
+  fallbackColor,
+}: {
+  markers: readonly CompositeChartXMarker[];
+  width: number;
+  fallbackColor?: string;
+}) {
+  const visibleMarkers = markers
+    .filter((marker) => marker.label && Number.isFinite(marker.xRatio))
+    .sort((left, right) => markerColumn(left.xRatio, width) - markerColumn(right.xRatio, width));
+  if (visibleMarkers.length === 0 || width <= 0) return null;
+
+  let nextAvailableLeft = 0;
+  const placements = visibleMarkers.map((marker) => {
+    const label = marker.label ?? "";
+    const labelWidth = Math.min(label.length, width);
+    const centeredLeft = markerColumn(marker.xRatio, width) - Math.floor(labelWidth / 2);
+    let left = Math.max(0, Math.min(Math.max(0, width - labelWidth), centeredLeft));
+    left = Math.max(left, nextAvailableLeft);
+    if (left + labelWidth > width) {
+      left = Math.max(nextAvailableLeft, width - labelWidth);
+    }
+    nextAvailableLeft = Math.min(width, left + labelWidth + 1);
+    return { marker, label, labelWidth, left };
+  }).filter((placement) => placement.labelWidth > 0 && placement.left < width);
+
+  return (
+    <Box position="relative" width={width} height={1}>
+      {placements.map(({ marker, label, labelWidth, left }) => {
+        return (
+          <Box
+            key={marker.id}
+            position="absolute"
+            left={left}
+            top={0}
+            width={labelWidth}
+            height={1}
+            overflow="hidden"
+            zIndex={2}
+          >
+            <Text fg={marker.color ?? fallbackColor}>{label.slice(0, labelWidth)}</Text>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+/** Events' captions in the row under the axis, laid out by `layoutEventCaptions`. */
+export function EventCaptions({
+  captions,
+  width,
+  color,
+}: {
+  captions: readonly EventCaptionPlacement[];
+  width: number;
+  color?: string;
+}) {
+  return (
+    <Box position="relative" width={width} height={1}>
+      {captions.map(({ id, left, text }) => (
+        <Box key={id} position="absolute" left={left} top={0} width={text.length} height={1} overflow="hidden" zIndex={2}>
+          <Text fg={color}>{text}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}

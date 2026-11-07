@@ -1,0 +1,286 @@
+import type { ReactNode } from "react";
+import { t } from "../../i18n";
+import { blendHex, hoverBg } from "../../theme/colors";
+import { blendForContrast, higherContrast } from "../../theme/color-utils";
+import { useThemeColors } from "../../theme/theme-context";
+import { Box, Text, TextAttributes, useUiCapabilities } from "../../ui";
+import { truncateToDisplayWidth } from "../../utils/format";
+import { CountryFlagLead } from "./country-flag";
+import { usePaneLinkMenuEntry } from "./external-link";
+import { ICON_GLYPHS, Icon, type IconName } from "./icon";
+import { titleCase } from "./header-case";
+import { statToneColor, type StatTone } from "./stat-grid";
+
+export { BulletList, FigureList, Prose, READING_WIDTH } from "./prose";
+export type { BulletListProps, FigureListItem, FigureListProps, ProseProps } from "./prose";
+
+export interface SectionHeadingProps {
+  title: string;
+  marginTop?: number;
+  width?: number;
+  wrap?: boolean;
+}
+
+export function SectionHeading({ title, marginTop = 0, width, wrap = false }: SectionHeadingProps) {
+  const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
+  // English reads in title case; a translation keeps its own casing.
+  const translated = t(title);
+  const text = translated === title ? titleCase(title) : translated;
+  return (
+    <Box height={wrap ? undefined : 1} marginTop={marginTop} width={width} overflow="hidden" data-gloom-ui="section-heading">
+      {nativePaneChrome && !wrap ? (
+        // The desktop cuts a long heading where its box ends, not at a count of columns.
+        <Text fg={colors.textBright} attributes={TextAttributes.BOLD} style={{ ...NATIVE_CLIP_STYLE, flex: "1 1 auto" }}>{text}</Text>
+      ) : (
+        <Text fg={colors.textBright} attributes={TextAttributes.BOLD} wrapText={wrap}>
+          {wrap || width === undefined ? text : truncateToDisplayWidth(text, width)}
+        </Text>
+      )}
+    </Box>
+  );
+}
+
+export interface SectionProps extends SectionHeadingProps {
+  children: ReactNode;
+}
+
+export function Section({ title, children, width, marginTop = 1, wrap }: SectionProps) {
+  return (
+    <Box flexDirection="column" width={width} marginTop={marginTop} data-gloom-ui="section">
+      <SectionHeading title={title} width={width} wrap={wrap} />
+      {children}
+    </Box>
+  );
+}
+
+export interface KeyValueRowProps {
+  label: string;
+  value: string;
+  detail?: string;
+  /** The value's tone, as on a StatGrid figure. */
+  tone?: StatTone;
+  /** A domain colour for the value. Wins over `tone`. */
+  color?: string;
+  width?: number;
+  labelWidth?: number;
+  emphasis?: boolean;
+  align?: "left" | "right";
+  /**
+   * Opens what the value names (a security's DES, a function): the whole row is the target, and inside a
+   * `PaneLinkMenu` the pane menu lists it as `link.label`, so the keyboard reaches what a click opens.
+   */
+  link?: { label: string; onOpen: () => void };
+  /** The country the value names (a code or a name): the desktop and the web lead the value with its flag. */
+  country?: string | null;
+}
+
+/**
+ * One line of text that ends in an ellipsis where its box ends, in CSS, on the
+ * desktop and the web: the browser clips it at the width it is laid out to,
+ * which a count of columns cannot match (a cell is wider than a glyph).
+ */
+export const NATIVE_CLIP_STYLE = { display: "block", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "pre" } as const;
+
+export interface ClippedTextProps {
+  text: string;
+  /** The terminal's room for the text, in cells. */
+  width: number;
+  fg?: string;
+  attributes?: number;
+  /** How the text sits in a row on the desktop: by default it gives way to its siblings. */
+  flex?: string;
+  /** Kept whole before the text in both renderers (an indent, a separator). */
+  lead?: string;
+  /** How the terminal cuts it; the caller's own cut keeps its frames as they were. */
+  cut?: (text: string, width: number) => string;
+  /** The desktop wraps it onto more lines instead (a message, a description); the terminal still cuts it. */
+  wrap?: boolean;
+}
+
+/**
+ * One line of text cut where its room ends: in the terminal at `width` cells,
+ * on the desktop and the web by CSS at its box's edge, or wrapped there with
+ * `wrap`. Its box (or its row, with the siblings that keep their room) has to
+ * bound it there.
+ */
+export function ClippedText({ text, width, fg, attributes, flex = "0 1 auto", lead = "", cut = truncateToDisplayWidth, wrap = false }: ClippedTextProps) {
+  const { nativePaneChrome } = useUiCapabilities();
+  const ink = { ...(fg === undefined ? {} : { fg }), ...(attributes === undefined ? {} : { attributes }) };
+  if (!nativePaneChrome) return <Text {...ink}>{`${lead}${cut(text, width)}`}</Text>;
+  return wrap
+    ? <Text {...ink} wrapText style={{ minWidth: 0, flex }}>{`${lead}${text}`}</Text>
+    : <Text {...ink} style={{ ...NATIVE_CLIP_STYLE, flex }}>{`${lead}${text}`}</Text>;
+}
+
+/** Aligned labels and values; a bounded row reserves room for an optional detail. */
+export function KeyValueRow(props: KeyValueRowProps) {
+  const { nativePaneChrome } = useUiCapabilities();
+  return nativePaneChrome ? <NativeKeyValueRow {...props} /> : <TerminalKeyValueRow {...props} />;
+}
+
+/**
+ * The desktop and the web: the label column at least as wide as the label
+ * width in characters, the value and detail taking the rest of the row and
+ * clipped in CSS where they run out of it.
+ */
+function NativeKeyValueRow({ label, value, detail, tone, color, width, labelWidth, emphasis = true, align = "left", link, country }: KeyValueRowProps) {
+  const colors = useThemeColors();
+  usePaneLinkMenuEntry(link ? `key-value:${label}:${value}` : null, link?.label ?? "", () => link?.onOpen());
+  const target = link ? {
+    cursor: "pointer" as const,
+    hoverBackgroundColor: hoverBg(colors),
+    onMouseDown: (event?: { button?: number }) => { if ((event?.button ?? 0) === 0) link.onOpen(); },
+    "data-gloom-interactive": "true",
+    "data-gloom-label": link.label,
+  } : {};
+  const rowWidth = width === undefined ? undefined : Math.max(0, Math.floor(width));
+  const labelChars = Math.max(0, labelWidth ?? (rowWidth === undefined ? 14 : Math.min(12, Math.max(8, Math.floor(rowWidth * 0.32)))));
+  // A bounded row fills its parent's width. Rows side by side (a pair of metrics) each give way to an equal
+  // share of their row, so the second is not pushed past the pane edge; never shorter than its line, so a
+  // column with less room than its rows still overflows and scrolls instead of squeezing them.
+  const bounded = width === undefined ? {} : { width: "100%", flexShrink: 1, minHeight: "min-content" };
+  return (
+    <Box {...bounded} flexDirection="row" overflow="hidden" data-gloom-ui="key-value-row" {...target}>
+      {/* At least the label width, in characters; a longer label keeps every character and moves its value along. */}
+      <Text fg={colors.textDim} style={{ ...NATIVE_CLIP_STYLE, flex: "0 0 auto", minWidth: `${labelChars}ch`, paddingRight: "1ch", boxSizing: "border-box" }}>{t(label)}</Text>
+      {country ? <CountryFlagLead value={country} /> : null}
+      <Text
+        fg={color ?? statToneColor(tone, colors) ?? colors.text}
+        attributes={emphasis ? TextAttributes.BOLD : undefined}
+        style={{ ...NATIVE_CLIP_STYLE, flex: detail ? "0 1 auto" : "1 1 auto", textAlign: align }}
+      >
+        {value}
+      </Text>
+      {detail ? <Text fg={colors.textDim} style={{ ...NATIVE_CLIP_STYLE, flex: "1 1 0", paddingLeft: "2ch" }}>{detail}</Text> : null}
+    </Box>
+  );
+}
+
+function TerminalKeyValueRow({ label, value, detail, tone, color, width, labelWidth, emphasis = true, align = "left", link }: KeyValueRowProps) {
+  const colors = useThemeColors();
+  usePaneLinkMenuEntry(link ? `key-value:${label}:${value}` : null, link?.label ?? "", () => link?.onOpen());
+  const target = link ? {
+    cursor: "pointer" as const,
+    hoverBackgroundColor: hoverBg(colors),
+    onMouseDown: (event?: { button?: number }) => { if ((event?.button ?? 0) === 0) link.onOpen(); },
+    "data-gloom-interactive": "true",
+    "data-gloom-label": link.label,
+  } : {};
+  const rowWidth = width === undefined ? undefined : Math.max(0, Math.floor(width));
+  const preferredLabelWidth = Math.max(0, labelWidth ?? (rowWidth === undefined ? 14 : Math.min(12, Math.max(8, Math.floor(rowWidth * 0.32)))));
+  const labelColumns = rowWidth === undefined ? preferredLabelWidth : Math.min(preferredLabelWidth, Math.max(0, rowWidth - 1));
+  const availableWidth = rowWidth === undefined ? undefined : rowWidth - labelColumns;
+  const valueWidth = availableWidth === undefined ? undefined : detail
+    ? Math.min(availableWidth, Math.max(8, Math.floor(rowWidth! * 0.42)))
+    : availableWidth;
+  const detailWidth = availableWidth === undefined ? undefined : availableWidth - valueWidth!;
+  return (
+    <Box height={1} width={rowWidth} flexDirection="row" overflow="hidden" data-gloom-ui="key-value-row" {...target}>
+      <Box width={labelColumns} flexShrink={0} overflow="hidden">
+        <Text fg={colors.textDim}>{t(label)}</Text>
+      </Box>
+      <Box width={valueWidth} flexShrink={0} overflow="hidden" alignItems={align === "right" ? "flex-end" : undefined}>
+        <Text fg={color ?? statToneColor(tone, colors) ?? colors.text} attributes={emphasis ? TextAttributes.BOLD : undefined}>
+          {valueWidth === undefined ? value : truncateToDisplayWidth(value, valueWidth)}
+        </Text>
+      </Box>
+      {detail && (detailWidth === undefined || detailWidth > 0) && (
+        <Text fg={colors.textDim}>
+          {detailWidth === undefined ? `  ${detail}` : truncateToDisplayWidth(detail, detailWidth)}
+        </Text>
+      )}
+    </Box>
+  );
+}
+
+export interface BadgeProps {
+  label: string;
+  tone?: "neutral" | "accent" | "positive" | "negative" | "warning";
+  /** For a domain scale, such as a sentiment score or chart series. */
+  color?: string;
+  variant?: "subtle" | "solid";
+  /** A mark before the label, in its colour: an SVG on the desktop, its glyph in the terminal. */
+  icon?: IconName;
+  /** False for a label that is not English to translate, such as a username. */
+  translate?: boolean;
+}
+
+/**
+ * The one chip on the desktop: 16px in its 18px row (a chip as tall as its
+ * row runs into the one below in a column of chips), the small-mark radius,
+ * regular weight. Ticker chips keep bold (ticker/badge).
+ */
+export const NATIVE_BADGE_STYLE = { height: "calc(100% - 2px)", borderRadius: "var(--gloom-radius-sm)" };
+/** How far a subtle chip's fill is tinted toward its tone. */
+export const BADGE_TINT = 0.28;
+const NATIVE_ICON_BADGE_STYLE = { ...NATIVE_BADGE_STYLE, gap: "var(--gloom-space-xs)" };
+const NATIVE_BADGE_TEXT_STYLE = { fontWeight: "var(--gloom-weight-regular)" };
+/**
+ * A label with lowercase letters has them in the middle of the chip,
+ * wherever the font puts them in its line: the line is cut to x-height and
+ * baseline, and that is what the chip centres. Centred whole, SF Mono's
+ * lowercase sit a pixel and a half low. An icon centres in the chip, so it
+ * reads on the letters' line. A label in capitals and digits keeps the
+ * whole line, as ticker chips do; a browser without `text-box` keeps it too.
+ */
+const NATIVE_LOWERCASE_BADGE_TEXT_STYLE = { ...NATIVE_BADGE_TEXT_STYLE, textBox: "trim-both ex alphabetic" };
+const LOWERCASE = /\p{Ll}/u;
+
+export function Badge({ label, tone = "neutral", color, variant = "subtle", icon, translate = true }: BadgeProps) {
+  const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
+  const accent = color ?? (tone === "neutral" ? colors.textDim : tone === "accent" ? colors.borderFocused : colors[tone]);
+  const solid = variant === "solid";
+  const neutral = solid && tone === "neutral" && !color;
+  const background = neutral ? colors.selected : solid ? accent : blendHex(colors.bg, accent, BADGE_TINT);
+  const baseForeground = neutral ? colors.selectedText : solid ? colors.bg : accent;
+  const foreground = blendForContrast(baseForeground, background, higherContrast("#000000", "#ffffff", background), 4.5);
+  const text = translate ? t(label) : label;
+  const nativeIcon = nativePaneChrome && icon;
+  // The terminal draws the icon's glyph as text in front of the label.
+  const shown = icon && !nativePaneChrome ? [ICON_GLYPHS[icon], text].filter(Boolean).join(" ") : text;
+  const chip = (
+    <Box height={nativePaneChrome ? undefined : 1} paddingX={1} backgroundColor={background}
+      data-gloom-ui="badge" {...(nativeIcon ? { flexDirection: "row", alignItems: "center" } as const : {})}
+      justifyContent={nativePaneChrome && !nativeIcon ? "center" : undefined}
+      style={nativePaneChrome ? nativeIcon ? NATIVE_ICON_BADGE_STYLE : NATIVE_BADGE_STYLE : undefined}>
+      {nativeIcon ? <Icon name={nativeIcon} color={foreground} fullHeight /> : null}
+      {shown || !nativeIcon ? (
+        <Text fg={foreground} attributes={TextAttributes.BOLD}
+          style={nativePaneChrome ? LOWERCASE.test(text) ? NATIVE_LOWERCASE_BADGE_TEXT_STYLE : NATIVE_BADGE_TEXT_STYLE : undefined}>{shown}</Text>
+      ) : null}
+    </Box>
+  );
+  return nativePaneChrome ? <Box height={1} flexShrink={0} justifyContent="center">{chip}</Box> : chip;
+}
+
+export interface DividerProps {
+  width?: number | `${number}%`;
+  height?: number | `${number}%`;
+  orientation?: "horizontal" | "vertical";
+}
+
+/** Host borders draw terminal rules and real CSS borders without text glyphs in the DOM. */
+export function Divider({ width, height, orientation = "horizontal" }: DividerProps) {
+  const colors = useThemeColors();
+  const vertical = orientation === "vertical";
+  return (
+    <Box
+      width={width ?? (vertical ? 1 : "100%")}
+      height={height ?? (vertical ? "100%" : 1)}
+      flexShrink={0}
+      border={vertical ? ["left"] : ["top"]}
+      borderColor={colors.border}
+      style={{
+        border: 0,
+        // The one hairline on the desktop; the terminal draws borderColor.
+        [vertical ? "borderLeft" : "borderTop"]: "1px solid var(--gloom-hairline)",
+        // A vertical rule given no height runs the height of the row it stands in.
+        ...(vertical && height === undefined ? { height: "auto", alignSelf: "stretch" } : {}),
+      }}
+      role="separator"
+      data-gloom-ui="divider"
+    />
+  );
+}

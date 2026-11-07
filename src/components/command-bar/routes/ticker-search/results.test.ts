@@ -1,0 +1,253 @@
+import { expect, test } from "bun:test";
+import type { ResultItem } from "../../list/model";
+import { DID_YOU_MEAN_CATEGORY, formatInstrumentBadge, mergePlainRootTickerResults, mergeTickerSearchResultItems, readRootTickerQuery, venueDropdownResults } from "./results";
+
+function resultItem(id: string, label: string, right: string, kind: ResultItem["kind"] = "ticker"): ResultItem {
+  return {
+    id,
+    label,
+    detail: "Apple Inc.",
+    category: kind === "info" ? "Search" : "Saved",
+    kind,
+    right,
+    action: () => {},
+  };
+}
+
+test("keeps completed ticker-search results authoritative over provisional rows", () => {
+  const authoritative = [
+    resultItem("ranked:AAPL", "AAPL", "Equity NASDAQ"),
+    resultItem("ranked:APC", "APC", "Equity XETRA"),
+  ];
+  const provisional = [
+    resultItem("local:APC", "APC", "Equity XETRA"),
+    resultItem("local:AAPL", "AAPL", "Equity NASDAQ"),
+  ];
+
+  expect(mergeTickerSearchResultItems("Apple", authoritative, provisional).map((item) => item.id)).toEqual([
+    "ranked:AAPL",
+    "ranked:APC",
+  ]);
+
+  const noResults = resultItem("no-results", "No matches for Apple", "", "info");
+  expect(mergeTickerSearchResultItems("Apple", [noResults], [])).toEqual([noResults]);
+});
+
+test("exact-match categories preserve a requested listing's venue", () => {
+  const items = mergeTickerSearchResultItems("VOD.L", [
+    { ...resultItem("london", "VOD", "LSE", "search"), category: "Other Listings" },
+    { ...resultItem("cboe", "VODL", "CBOE", "search"), category: "Other Listings" },
+  ], []);
+  expect(items[0]?.category).toBe("Exact Match");
+  expect(items[1]?.category).not.toBe("Exact Match");
+});
+
+test("exact-match promotion never treats a futures or FX spelling as an equity", () => {
+  for (const [query, lookalike] of [["ES=F", "ESF"], ["EUR/USD", "EURUSD"], ["JPY=X", "JPYX"]]) {
+    const rows = mergeTickerSearchResultItems(query!, [
+      { ...resultItem("equity", lookalike!, "MTA", "search"), category: "Other Listings" },
+      { ...resultItem("market", query!, "", "search"), category: "Other Listings" },
+    ], []);
+    expect(rows[0]?.category).not.toBe("Exact Match");
+    expect(rows[1]?.category).toBe("Exact Match");
+    expect(mergePlainRootTickerResults(query!, rows, [resultItem("pane", "Research", "", "action")])[0]?.id)
+      .toBe("market");
+  }
+});
+
+test("crypto punctuation aliases never outrank the verified exact symbol in command results", () => {
+  const rows = mergeTickerSearchResultItems("SHIB-USD", [
+    { ...resultItem("alias", "SHIB/USD", "COINBASE PRO", "search"), category: "Other Listings", instrumentType: "Digital Currency" },
+    { ...resultItem("exact", "SHIB-USD", "CCC", "search"), category: "Other Listings", instrumentType: "CRYPTOCURRENCY" },
+  ], []);
+  expect(rows[0]?.category).not.toBe("Exact Match");
+  expect(rows[1]?.category).toBe("Exact Match");
+  expect(mergePlainRootTickerResults("SHIB-USD", rows, [resultItem("pane", "Research", "", "action")])[0]?.id).toBe("exact");
+});
+
+test("an index typed by its code is the exact match; the fund named for it and a name search are not", () => {
+  const rows = (query: string) => mergeTickerSearchResultItems(query, [
+    { ...resultItem("index", "^BVSP", "B3", "search"), detail: "Ibovespa", category: "Primary Listing", instrumentType: "INDEX", searchAliases: ["^BVSP", "IBOV", "IBOV Index"] },
+    { ...resultItem("fund", "IBOV11", "B3", "search"), detail: "IBOV11 Fund", category: "Other Listings", instrumentType: "Common Stock", searchAliases: ["IBOV11"] },
+  ], []);
+  for (const query of ["IBOV", "ibov", "IBOV Index"]) {
+    expect(rows(query).map((item) => [item.id, item.category]), query).toEqual([["index", "Exact Match"], ["fund", "Other Listings"]]);
+  }
+  expect(rows("ibovespa")[0]?.category).toBe("Primary Listing");
+  const pane: ResultItem = { id: "pane:news", label: "News", detail: "", category: "Panes", kind: "action", action: () => {} };
+  expect(mergePlainRootTickerResults("IBOV", rows("IBOV"), [pane]).map((item) => [item.id, item.category])).toEqual([
+    ["index", "Exact Match"],
+    ["pane:news", "Panes"],
+    ["fund", "Instruments"],
+  ]);
+});
+
+test("a commodity typed by its name is the exact match with its benchmark future first; a name search is not", () => {
+  const rows = (query: string) => mergeTickerSearchResultItems(query, [
+    { ...resultItem("future", "GC=F", "CMX", "search"), detail: "Gold", category: "Funds & Derivatives", instrumentType: "FUTURE", searchAliases: ["GC=F", "Gold"] },
+    { ...resultItem("company", "GOLD", "NYSE", "search"), detail: "Gold.com, Inc.", category: "Primary Listing", instrumentType: "Common Stock", searchAliases: ["GOLD"] },
+  ], []);
+  for (const query of ["gold", "Gold", "GOLD"]) {
+    expect(rows(query).map((item) => [item.id, item.category]), query).toEqual([["future", "Exact Match"], ["company", "Exact Match"]]);
+  }
+  expect(rows("gold futures").map((item) => [item.id, item.category])).toEqual([["future", "Exact Match"], ["company", "Primary Listing"]]);
+  expect(rows("gold miners").map((item) => item.category)).toEqual(["Funds & Derivatives", "Primary Listing"]);
+  const pane: ResultItem = { id: "pane:news", label: "News", detail: "", category: "Panes", kind: "action", action: () => {} };
+  expect(mergePlainRootTickerResults("gold", rows("gold"), [pane]).map((item) => item.id)).toEqual(["future", "company", "pane:news"]);
+});
+
+test("folds a plain query's symbol hits into one capped Instruments section behind the local rows", () => {
+  const pane: ResultItem = {
+    id: "pane:news",
+    label: "News",
+    detail: "",
+    category: "Panes",
+    kind: "action",
+    action: () => {},
+  };
+  const providerItems = [
+    resultItem("search:NVDA", "NVDA", "NASDAQ", "search"),
+    // The saved row for the same symbol carries a different badge; one row per symbol.
+    resultItem("goto:NVDA", "NVDA", "NASDAQ"),
+    resultItem("search:NVDA.MX", "NVDA.MX", "Equity BMV", "search"),
+    resultItem("search:NVD.DE", "NVD.DE", "Equity XETRA", "search"),
+    resultItem("search:NVDL", "NVDL", "Fund NASDAQ", "search"),
+    resultItem("search:NVDS", "NVDS", "Fund NASDAQ", "search"),
+    resultItem("search:NVDX", "NVDX", "Fund NASDAQ", "search"),
+    resultItem("search-error", "Search failed", "", "info"),
+  ];
+
+  const merged = mergePlainRootTickerResults("nvda", providerItems, [pane]);
+
+  expect(merged.map((item) => [item.id, item.category])).toEqual([
+    ["search:NVDA", "Exact Match"],
+    ["pane:news", "Panes"],
+    ["search:NVDA.MX", "Instruments"],
+    ["search:NVD.DE", "Instruments"],
+    ["search:NVDL", "Instruments"],
+    ["search:NVDS", "Instruments"],
+  ]);
+  expect(merged.find((item) => item.id === "search:NVDA.MX")?.right).toBe("Equity BMV");
+});
+
+/**
+ * The class tag is what the eye sorts instruments by, so the mapping from a
+ * provider's type strings has to stay put: an exchange-traded fund is not a
+ * mutual fund, and an unclassified instrument gets no tag rather than a stand-in.
+ */
+test("names the instrument class for the badge column", () => {
+  const search = (type: string) => ({ providerId: "gloom", symbol: "X", name: "X", exchange: "NYQ", type });
+  expect(formatInstrumentBadge({ instrumentClass: "equity" })).toBe("EQ");
+  expect(formatInstrumentBadge({ instrumentClass: "fund", result: search("ETF") })).toBe("ETF");
+  expect(formatInstrumentBadge({ instrumentClass: "fund", result: search("ETN") })).toBe("ETF");
+  expect(formatInstrumentBadge({ instrumentClass: "fund", result: search("MUTUALFUND") })).toBe("FUND");
+  expect(formatInstrumentBadge({ instrumentClass: "fund", result: search("Closed-end Fund") })).toBe("FUND");
+  expect(formatInstrumentBadge({ instrumentClass: "other", result: search("MONEY_MARKET") })).toBe("FUND");
+  expect(formatInstrumentBadge({
+    instrumentClass: "fund",
+    ticker: { metadata: { ticker: "VTI", assetCategory: "ETF" } } as never,
+  })).toBe("ETF");
+  expect(formatInstrumentBadge({ instrumentClass: "derivative", result: search("Warrant") })).toBe("DERIV");
+  // The class codes a query can end with (ES FUT) are the badges of the rows they keep.
+  expect(formatInstrumentBadge({ instrumentClass: "derivative", result: search("FUTURE") })).toBe("FUT");
+  expect(formatInstrumentBadge({ instrumentClass: "other", result: search("INDEX") })).toBe("IDX");
+  expect(formatInstrumentBadge({ instrumentClass: "other", result: search("CRYPTOCURRENCY") })).toBe("CRYP");
+  expect(formatInstrumentBadge({ instrumentClass: "other", result: search("Unit") })).toBeUndefined();
+});
+
+
+test("a colon dropdown is one exact venue per row, narrowed by the exchange prefix", () => {
+  const items = [
+    resultItem("lse", "NET", "LSE", "search"),
+    resultItem("nyse", "NET", "NYSE", "search"),
+    resultItem("lookalike", "NETE", "NASDAQ", "search"),
+    resultItem("command", "NET", "DES", "command"),
+  ];
+  expect(venueDropdownResults("NET", items, "").map((item) => [item.id, item.category])).toEqual([
+    ["lse", "Exact Match"],
+    ["nyse", "Exact Match"],
+  ]);
+  expect(venueDropdownResults("NET", items, "N").map((item) => item.right)).toEqual(["NYSE"]);
+  expect(venueDropdownResults("NET", items, "X").map((item) => item.right)).toEqual(["LSE", "NYSE"]);
+  expect(venueDropdownResults("NET", items, "LON").map((item) => item.right)).toEqual(["LSE"]);
+  // EURUSD:FX and EURUSD:CCY pick the pair search lists on the currency venue.
+  const pairs = [resultItem("eurusd", "EURUSD=X", "CCY", "search"), resultItem("fund", "EURUSD", "LSE", "search")];
+  for (const suffix of ["FX", "CCY", ""]) {
+    expect(venueDropdownResults("EURUSD", pairs, suffix).map((item) => item.id), suffix).toEqual(suffix ? ["eurusd"] : ["eurusd", "fund"]);
+  }
+  expect(venueDropdownResults("USDJPY", [resultItem("jpy", "JPY=X", "CCY", "search")], "FX").map((item) => item.id)).toEqual(["jpy"]);
+});
+
+test("plain exact-symbol search retains venue choices while deduplicating the same listing", () => {
+  const items = [resultItem("gld:tsv", "GLD", "TSXV", "search"),
+    resultItem("gld:nyse", "GLD", "NYSE", "search"), resultItem("gld:byma", "GLD", "BYMA", "search"),
+    resultItem("gld:duplicate", "GLD", "XNYS", "search")];
+  expect(mergePlainRootTickerResults("GLD", items, []).map((item) => item.id))
+    .toEqual(["gld:tsv", "gld:nyse", "gld:byma"]);
+});
+
+test("an exact symbol keeps a row for each security before more exchanges of one, then looser hits", () => {
+  const listing = (id: string, label: string, right: string, detail: string): ResultItem => ({
+    ...resultItem(id, label, right, "search"), detail, badge: "EQ",
+  });
+  // Cloud's answer for SAP: SAP SE on nine venues, Saputo on Toronto last.
+  const sapSe = ["NYSE", "XETRA", "XSTU", "FWB2", "VIE", "SWX", "MUNICH", "HANOVER", "BUD"]
+    .map((venue) => listing(`sap:${venue}`, "SAP", venue, "SAP SE | Common Stock"));
+  const providerItems = [
+    ...sapSe,
+    listing("sap:TSX", "SAP", "TSX", "Saputo Inc. | EQUITY"),
+    listing("sapr", "SAPR", "IDX", "Saraswati Persada | Common Stock"),
+  ];
+
+  expect(mergePlainRootTickerResults("SAP", providerItems, []).map((item) => [item.id, item.category])).toEqual([
+    ["sap:NYSE", "Exact Match"],
+    ["sap:XETRA", "Exact Match"],
+    ["sap:XSTU", "Exact Match"],
+    ["sap:FWB2", "Exact Match"],
+    ["sap:TSX", "Exact Match"],
+  ]);
+  // Fewer exact rows than the cap leave the rest to looser hits, as before.
+  expect(mergePlainRootTickerResults("SAP", [sapSe[0]!, sapSe[1]!, providerItems.at(-1)!], [])
+    .map((item) => item.id)).toEqual(["sap:NYSE", "sap:XETRA", "sapr"]);
+});
+
+test("one exchange is one exact row however the listing is spelled", () => {
+  const items = [
+    resultItem("saved:SAP", "SAP", "NYSE"),
+    resultItem("saved:SAP:XETR", "SAP:XETR", "XETRA"),
+    resultItem("search:XETRA", "SAP", "XETRA", "search"),
+    resultItem("search:FWB2", "SAP", "FWB2", "search"),
+  ];
+  expect(mergePlainRootTickerResults("SAP", items, []).map((item) => item.id))
+    .toEqual(["saved:SAP", "saved:SAP:XETR", "search:FWB2"]);
+  // Cloud answers BRK.B and its BRK-B spelling with a row each for NYSE.
+  const berkshire = [
+    resultItem("dot:NYSE", "BRK.B", "NYSE", "search"),
+    resultItem("dot:IEX", "BRK.B", "IEX", "search"),
+    resultItem("dash:NYSE", "BRK-B", "NYSE", "search"),
+    resultItem("compact:BMV", "BRKB", "BMV", "search"),
+  ];
+  expect(mergePlainRootTickerResults("BRK.B", berkshire, []).map((item) => item.id))
+    .toEqual(["dot:NYSE", "dot:IEX", "compact:BMV"]);
+});
+
+test("a Bloomberg code's listing is the exact match; an unknown market code or a near miss offers the row it was read from above Ask AI", () => {
+  const search = (id: string, label: string, right: string): ResultItem => ({ ...resultItem(id, label, right, "search"), category: "Other Listings" });
+  const ask: ResultItem = { id: "ask", label: "Ask AI", detail: "", category: "Ask AI", kind: "action", action: () => {} };
+  const merged = (query: string, rows: ResultItem[]) => mergePlainRootTickerResults(readRootTickerQuery(query)!.search, rows, [ask], readRootTickerQuery(query))
+    .map((item) => [item.id, item.category]);
+  const vod = [search("adr", "VOD", "NASDAQ"), search("lse", "VOD", "LSE"), search("xetra", "VODI", "XETRA")];
+  expect(merged("VOD LN", vod)).toEqual([["lse", "Exact Match"], ["ask", "Ask AI"], ["adr", "Instruments"], ["xetra", "Instruments"]]);
+  expect(merged("VOD US Equity", vod)[0]).toEqual(["adr", "Exact Match"]);
+  // Search lists Volvo's B shares as VOLV.B, the code glues the class on.
+  expect(merged("VOLVB SS", [search("prague", "VOLVB", "PSE"), search("sto", "VOLV.B", "SFB")])[0]).toEqual(["sto", "Exact Match"]);
+  const apple = [search("aapl", "AAPL", "NASDAQ"), search("other", "AAPLUSTRAD", "BSE")];
+  for (const query of ["AAPL GY", "AAPL GP"]) {
+    expect(merged(query, apple), query).toEqual([["aapl", DID_YOU_MEAN_CATEGORY], ["ask", "Ask AI"], ["other", "Instruments"]]);
+  }
+  expect(merged("700.HK", [search("tencent", "0700", "HKEX")])[0]).toEqual(["tencent", DID_YOU_MEAN_CATEGORY]);
+  expect(merged("6758.JP", [search("sony", "6758", "JPX")])[0]).toEqual(["sony", DID_YOU_MEAN_CATEGORY]);
+  expect(merged("BRK/B", [search("brk", "BRK.B", "NYSE")])[0]).toEqual(["brk", DID_YOU_MEAN_CATEGORY]);
+  // A name before a legal form is searched as typed, so search finds the company: SE is also SIX Swiss's code.
+  for (const query of ["AAPL", "apple", "VOD.L", "AAPL MSFT", "vod ln", "SAP SE", "SIEMENS AG", "P/E"]) expect(readRootTickerQuery(query), query).toBeNull();
+});

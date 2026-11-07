@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "bun install --frozen-lockfile",
+  "buildCommand": "bun build scripts/vercel-middleware.ts --target=browser --outfile=middleware.js && bun run web:build",
+  "outputDirectory": "dist/web",
+  "rewrites": [
+    {
+      "source": "/s/:id",
+      "destination": "/share.html"
+    },
+    {
+      "source": "/l/:id",
+      "destination": "/share.html"
+    },
+    {
+      "source": "/((?!api/|http-proxy|health|assets/|favicon|manifest\\.webmanifest|app-icon-|share\\.html).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

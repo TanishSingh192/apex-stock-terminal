@@ -1,0 +1,210 @@
+import { Box, Text, useUiCapabilities, type BoxRenderable } from "../../ui";
+import type { ReactNode, RefObject } from "react";
+import { colors, floatingPaneBg } from "../../theme/colors";
+import { useThemeColors } from "../../theme/theme-context";
+import { PaneBodyFrame, getPaneWindowAttributes } from "./pane/frame";
+import { PaneHeader, type PaneHeaderQuickSetting, type PaneHeaderStack } from "./pane/header";
+import { PaneHeaderTabsProvider, usePaneHeaderTabsHost } from "./pane/header-tabs";
+import { hasPaneFooterContent, PaneFooterBar, type CombinedPaneFooter } from "./pane/footer";
+import { resolvePaneBodyFrame, shouldReservePaneFooter } from "./pane/sizing";
+
+interface FloatingPaneWrapperProps {
+  paneId?: string;
+  title: string;
+  /**
+   * Desktop and web: the ticker the title shows, drawn as a control that opens ticker search for
+   * the pane (`onTitleTickerPress`).
+   */
+  titleTicker?: string | null;
+  onTitleTickerPress?: () => void;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  zIndex: number;
+  /** Fully covered by windows above it: skip drawing, keep the tree mounted. */
+  hidden?: boolean;
+  focused: boolean;
+  windowModeSelected?: boolean;
+  locked?: boolean;
+  showActions?: boolean;
+  quickSettings?: PaneHeaderQuickSetting[];
+  onMouseDown?: (event: any) => void;
+  onMouseDownCapture?: (event: any) => void;
+  onHeaderMouseMove?: (event: any) => void;
+  onHeaderMouseDown?: (event: any) => void;
+  onHeaderMouseDrag?: (event: any) => void;
+  onHeaderMouseDragEnd?: (event: any) => void;
+  onHeaderContextMenu?: (event: any) => void;
+  onActionMouseDown?: (event: any) => void;
+  onHelpMouseDown?: (event: any) => void;
+  /** Ask Gloom about the pane, from the button beside the `?`. */
+  onAskMouseDown?: (event: any) => void;
+  onCloseMouseDown?: (event: any) => void;
+  onRestoreMouseDown?: (event: any) => void;
+  fullscreen?: boolean;
+  onResizeMouseDown?: (event: any) => void;
+  onResizeMouseDrag?: (event: any) => void;
+  onResizeMouseDragEnd?: (event: any) => void;
+  footer?: CombinedPaneFooter | null;
+  /** The pane's frame, which a desktop resize sizes outside React; its header, body and footer stretch with it. */
+  frameRef?: RefObject<BoxRenderable | null>;
+  /** Windows stacked as tabs here: their tabs replace the title. */
+  stack?: PaneHeaderStack | null;
+  children: ReactNode;
+}
+
+function TerminalFloatingPaneBorder({ width, height }: { width: number; height: number }) {
+  const borderWidth = Math.max(0, Math.floor(width));
+  const borderHeight = Math.max(0, Math.floor(height));
+  const bodyHeight = Math.max(0, borderHeight - 2);
+  if (borderWidth < 2 || bodyHeight <= 0) return null;
+
+  return (
+    <>
+      <Box position="absolute" top={1} left={0} width={1} height={bodyHeight}>
+        <Text fg={colors.border} selectable={false}>{"│".repeat(bodyHeight)}</Text>
+      </Box>
+      <Box position="absolute" top={1} left={borderWidth - 1} width={1} height={bodyHeight}>
+        <Text fg={colors.border} selectable={false}>{"│".repeat(bodyHeight)}</Text>
+      </Box>
+    </>
+  );
+}
+
+/** Pure visual wrapper; Shell owns the interaction state and supplies handlers. */
+export function FloatingPaneWrapper({
+  paneId,
+  title,
+  titleTicker = null,
+  onTitleTickerPress,
+  x,
+  y,
+  width,
+  height,
+  zIndex,
+  hidden = false,
+  focused,
+  windowModeSelected = false,
+  locked = false,
+  showActions = false,
+  quickSettings,
+  onMouseDown,
+  onMouseDownCapture,
+  onHeaderMouseMove,
+  onHeaderMouseDown,
+  onHeaderMouseDrag,
+  onHeaderMouseDragEnd,
+  onHeaderContextMenu,
+  onActionMouseDown,
+  onHelpMouseDown,
+  onAskMouseDown,
+  onCloseMouseDown,
+  onRestoreMouseDown,
+  fullscreen = false,
+  onResizeMouseDown,
+  onResizeMouseDrag,
+  onResizeMouseDragEnd,
+  footer,
+  frameRef,
+  stack = null,
+  children,
+}: FloatingPaneWrapperProps) {
+  const { nativePaneChrome } = useUiCapabilities();
+  const { headerTabs, contextValue: headerTabsContext } = usePaneHeaderTabsHost(nativePaneChrome === true);
+  const palette = useThemeColors();
+  const bg = floatingPaneBg(focused, palette);
+  const showFooter = hasPaneFooterContent(footer);
+  const reserveFooter = shouldReservePaneFooter(nativePaneChrome, showFooter);
+  const renderFooter = reserveFooter || showFooter;
+  const bodyFrame = resolvePaneBodyFrame({ height, nativePaneChrome, footerVisible: renderFooter, reserveFooter });
+
+  return (
+    <Box
+      ref={frameRef}
+      position="absolute"
+      top={y}
+      left={x}
+      width={width}
+      height={height}
+      zIndex={zIndex}
+      visible={!hidden}
+      backgroundColor={bg}
+      flexDirection="column"
+      overflow="hidden"
+      {...getPaneWindowAttributes({
+        enabled: nativePaneChrome,
+        role: "pane-window",
+        paneId,
+        floating: true,
+        focused,
+        windowModeSelected,
+        showBorderColor: true,
+      })}
+      onMouseDown={onMouseDown}
+      onMouseDownCapture={onMouseDownCapture}
+    >
+      <PaneHeader
+        title={title}
+        titleTicker={titleTicker}
+        onTitleTickerPress={onTitleTickerPress}
+        width={width}
+        focused={focused}
+        windowModeSelected={windowModeSelected}
+        floating
+        locked={locked}
+        showActions={showActions}
+        quickSettings={quickSettings}
+        tabs={headerTabs}
+        stack={stack}
+        bodyBackground={bg}
+        topRule
+        onHeaderMouseMove={onHeaderMouseMove}
+        onHeaderMouseDown={onHeaderMouseDown}
+        onHeaderMouseDrag={onHeaderMouseDrag}
+        onHeaderMouseDragEnd={onHeaderMouseDragEnd}
+        onHeaderContextMenu={onHeaderContextMenu}
+        onActionMouseDown={onActionMouseDown}
+        onHelpMouseDown={onHelpMouseDown}
+        onAskMouseDown={onAskMouseDown}
+        onCloseMouseDown={onCloseMouseDown}
+        onRestoreMouseDown={onRestoreMouseDown}
+        fullscreen={fullscreen}
+      />
+
+      <PaneBodyFrame layoutProps={bodyFrame.layoutProps} backgroundColor={bg}>
+        <PaneHeaderTabsProvider value={headerTabsContext}>{children}</PaneHeaderTabsProvider>
+      </PaneBodyFrame>
+
+      {renderFooter && (
+        <PaneFooterBar
+          footer={footer}
+          focused={focused}
+          width={width}
+          reserveRight={2}
+          showBorder={!nativePaneChrome && !focused}
+        />
+      )}
+
+      {!nativePaneChrome && !focused && <TerminalFloatingPaneBorder width={width} height={height} />}
+
+      {nativePaneChrome ? (
+        <Box
+          position="absolute"
+          bottom={0}
+          right={0}
+          width={2}
+          height={1}
+          data-gloom-role="resize-handle"
+          onMouseDown={onResizeMouseDown}
+          onMouseDrag={onResizeMouseDrag}
+          onMouseDragEnd={onResizeMouseDragEnd}
+        />
+      ) : (
+        <Box position="absolute" bottom={0} right={0} width={2} height={1}>
+          <Text fg={focused ? colors.borderFocused : colors.border} selectable={false}>{"─◢"}</Text>
+        </Box>
+      )}
+    </Box>
+  );
+}

@@ -1,0 +1,238 @@
+import { existsSync } from "fs";
+import { makePrivateDirSync } from "../../../../utils/private-files";
+import { homedir, hostname } from "os";
+import { getGloomberbDirs } from "../../../../data/config/home";
+import type { AppServices } from "../../../../core/app-services";
+import { prepareExtractedPluginSeed } from "../../../../cli/restore-plugins";
+import { getPluginSeedProgress, type PluginSeedRecord } from "../../../../plugins/seed-progress";
+import { logFailure } from "../../../../utils/log-failure";
+import {
+  getDataDir,
+  initDataDir,
+} from "../../../../data/config/store";
+import type { AppConfig } from "../../../../types/config";
+import { listPersistedBrokerAccountRecords } from "../../../../brokers/account-cache";
+import type { CachedResourceRecord } from "../../../../data/resource-store";
+import {
+  loadDesktopPluginState,
+} from "./plugin-state";
+import { createDesktopWorkspace } from "./workspace";
+import {
+  MAIN_WINDOW_RPC_KEY,
+  paneIdFromDetachedRpcKey,
+} from "../window/focus";
+import type { DesktopBackendRequestPayload, ElectrobunBackendInit } from "../../shared/protocol";
+import type { CapabilityRegistry } from "../../../../capabilities";
+import { telemetryOptedOut } from "../../../../telemetry/crash-reports";
+import { describeNodeOs, readOrCreateInstallId } from "../../../../telemetry/crash-reports-node";
+import type { DesktopBackend, DesktopRpc } from "./backend";
+import { readDesktopViewIds } from "./view-ids";
+import { markStartupComplete } from "../../../../utils/main-thread-stall";
+
+interface DesktopWindowTarget {
+  kind: "main" | "detached";
+  paneId?: string;
+  /** A full window's id: the main window's, or an extra window's. */
+  windowId?: string;
+}
+
+function normalizeInitWindowTarget(
+  rpcKey: string | undefined,
+  payload: DesktopBackendRequestPayload<"init">,
+): DesktopWindowTarget {
+  if (rpcKey === MAIN_WINDOW_RPC_KEY) return { kind: "main", windowId: MAIN_WINDOW_RPC_KEY };
+
+  const detachedPaneId = paneIdFromDetachedRpcKey(rpcKey);
+  if (detachedPaneId) {
+    return {
+      kind: "detached",
+      paneId: detachedPaneId,
+    };
+  }
+  // Every other window the backend opens is a full window with its own tabs.
+  if (rpcKey) return { kind: "main", windowId: rpcKey };
+
+  const kind = payload.kind === "detached" ? "detached" : "main";
+  return {
+    kind,
+    paneId: kind === "detached" && typeof payload.paneId === "string" && payload.paneId.length > 0
+      ? payload.paneId
+      : undefined,
+  };
+}
+
+export function desktopRendererCapabilityManifests(registry: CapabilityRegistry) {
+  return registry.manifests({ rendererOnly: true, includeDisabled: true });
+}
+
+/** The view's resource store lives in memory; it starts from the account snapshots saved here. */
+function loadSavedResources(services: AppServices, config: AppConfig): CachedResourceRecord[] {
+  try {
+    return listPersistedBrokerAccountRecords(services.persistence.resources, config.brokerInstances);
+  } catch (error) {
+    console.warn("saved broker accounts could not be read", error);
+    return [];
+  }
+}
+
+function buildInitializationPayload(
+  backend: DesktopBackend,
+  config: AppConfig,
+  services: AppServices,
+  windowTarget: DesktopWindowTarget,
+  windowKey: string | undefined,
+): ElectrobunBackendInit {
+  const mainWindow = windowTarget.windowId === MAIN_WINDOW_RPC_KEY;
+  // The main window brings in the plugins the launch restores as they land,
+  // and says what it could not install; later changes follow as messages.
+  const pluginSeed = mainWindow ? getPluginSeedProgress() : null;
+  // Each full window draws its own tabs; a popped-out pane's draws the main
+  // window's. Numbered like every state sent, so the window's first sync is
+  // merged against it.
+  const projected = backend.workspace?.getWindowSnapshot(windowTarget.windowId ?? MAIN_WINDOW_RPC_KEY) ?? null;
+  const desktopSnapshot = projected ? backend.stateBroadcaster.stamp(projected) : null;
+  if (desktopSnapshot && windowKey) backend.workspace?.noteDelivered(windowKey, desktopSnapshot.stateSeq!, desktopSnapshot);
+  return {
+    config: desktopSnapshot?.config ?? config,
+    sessionSnapshot: backend.getSessionSnapshot(),
+    desktopSnapshot,
+    desktopThemePreview: backend.stateBroadcaster.currentThemePreview,
+    pluginState: loadDesktopPluginState(services.pluginRegistry),
+    savedResources: loadSavedResources(services, config),
+    capabilityManifests: desktopRendererCapabilityManifests(services.pluginRegistry.capabilities),
+    desktopPlatform: process.platform,
+    hostName: hostname(),
+    windowKind: windowTarget.kind,
+    paneId: windowTarget.paneId,
+    ...(windowTarget.windowId ? { windowId: windowTarget.windowId, windows: backend.windowInfos() } : {}),
+    ...(mainWindow ? { otherWindowTabs: backend.otherWindowTabsForInit() } : {}),
+    ...(pluginSeed ? { pluginSeed } : {}),
+    telemetry: {
+      installId: readOrCreateInstallId(config.dataDir),
+      os: describeNodeOs(),
+      homeDir: homedir(),
+      optedOut: telemetryOptedOut(process.env),
+    },
+    viewIds: readDesktopViewIds(config.dataDir),
+  };
+}
+
+async function resolveDesktopDataDir(): Promise<string> {
+  const dataDir = await getDataDir() ?? getGloomberbDirs().data;
+  if (!existsSync(dataDir)) {
+    makePrivateDirSync(dataDir);
+  }
+  return dataDir;
+}
+
+/** The launch work, in order. Injected so a test can watch the order without a data folder. */
+export interface DesktopLaunchSteps {
+  readConfig(): Promise<AppConfig>;
+  /**
+   * Plans the restore of plugins that moved into their own repositories:
+   * the record to merge into the config, and the installs to start once the
+   * services are up. Reads the disk only.
+   */
+  planPluginRestore(): Promise<{ record: PluginSeedRecord; start: (() => Promise<unknown>) | null } | null>;
+  startServices(config: AppConfig): Promise<unknown>;
+  /** Starts compiling the plugins for the view; not awaited. */
+  prefetchPluginBundles(): void;
+}
+
+function desktopLaunchSteps(backend: DesktopBackend): DesktopLaunchSteps {
+  return {
+    readConfig: async () => initDataDir(await resolveDesktopDataDir()),
+    // Restore plugins that moved into their own repositories, the same as the
+    // terminal does at startup. Without it a desktop-only user silently loses
+    // a feature the day it is extracted, since nothing else installs it for
+    // them.
+    planPluginRestore: () => prepareExtractedPluginSeed(),
+    startServices: (config) => backend.startServices(config),
+    prefetchPluginBundles: () => backend.prefetchExternalPluginBundles(),
+  };
+}
+
+const launches = new WeakMap<object, Promise<void>>();
+
+/**
+ * Opens the data folder and starts the services every window shares: the
+ * config, restored plugins, and every plugin registered. That takes most of
+ * a second, and it used to wait for the view to load its bundle and ask for
+ * `init`. Started when the process starts, it runs while the window opens
+ * and the view loads, and `init` finds it done or nearly so. The plugins the
+ * view runs then start compiling, still before the view asks for them, and
+ * after the services imported them, so two loads never link one plugin at once.
+ *
+ * Callers share a run in flight. With the services up it does nothing; after
+ * they were torn down (all data reset) or a run failed, it starts over.
+ */
+export function startDesktopBackend(
+  backend: DesktopBackend,
+  steps: DesktopLaunchSteps = desktopLaunchSteps(backend),
+): Promise<void> {
+  const running = launches.get(backend);
+  if (running) return running;
+  if (backend.config && backend.services) return Promise.resolve();
+  const launch = (async () => {
+    const initialConfig = await steps.readConfig();
+    const seed = await steps.planPluginRestore();
+    await steps.startServices(seed ? { ...initialConfig, ...seed.record } : initialConfig);
+    steps.prefetchPluginBundles();
+    // In the background: the window draws without them, and the main window
+    // brings each in as it lands. Never awaited by a launch, so a clone that
+    // hangs holds nothing up.
+    void seed?.start?.().catch(logFailure("plugin-seed", "Plugin restore failed"));
+  })();
+  launches.set(backend, launch);
+  const settled = () => {
+    if (launches.get(backend) === launch) launches.delete(backend);
+  };
+  // The caller that awaits the launch reports a failure; this only lets the next one start over.
+  launch.then(settled, settled);
+  return launch;
+}
+
+/**
+ * Waits for a launch in flight, and starts none: for a request that wants
+ * what the launch makes but must not start the services itself. Only `init`
+ * (and the process start) launches, so services torn down by a config import
+ * or a reset are not brought up twice. Settles either way; a failed launch
+ * is for `init` to report.
+ */
+export function joinDesktopBackendLaunch(backend: DesktopBackend): Promise<void> {
+  const running = launches.get(backend);
+  return running ? running.then(() => {}, () => {
+    // Intentional ignore: a failed launch is for init to report; this only waits for it to settle.
+  }) : Promise.resolve();
+}
+
+export async function initializeDesktopBackend(
+  backend: DesktopBackend,
+  rpc: DesktopRpc,
+  payload: DesktopBackendRequestPayload<"init">,
+): Promise<ElectrobunBackendInit> {
+  const windowKey = backend.rpcs.getRpcWindowKey(rpc);
+  const windowTarget = normalizeInitWindowTarget(windowKey, payload);
+  backend.rpcs.markWindowRpcReady(rpc);
+  backend.stateBroadcaster.forgetWindowState(rpc);
+  // Its page loaded and runs: the next window waiting to open may.
+  if (windowKey) backend.windowHost?.windowDrawn(windowKey);
+
+  await startDesktopBackend(backend);
+  const config = backend.requireConfig();
+  const services = backend.requireServices();
+  if (!backend.workspace) {
+    backend.workspace = createDesktopWorkspace(config, backend.getSessionSnapshot(), backend.windowController?.screenSetup.windows);
+    backend.reconcileWindows();
+  }
+  // A window that loads again starts from this state: nothing sent before counts.
+  if (windowKey) backend.workspace.forgetWindow(windowKey);
+  const init = buildInitializationPayload(backend, config, services, windowTarget, windowKey);
+  // The main window has what it needs to draw: this process is up, and the
+  // popped-out panes and extra windows open next.
+  if (windowTarget.windowId === MAIN_WINDOW_RPC_KEY) {
+    markStartupComplete();
+    backend.openWindowsAfterMainWindow();
+  }
+  return init;
+}

@@ -1,0 +1,200 @@
+import { Box, Text, useUiHost } from "../../ui";
+import { TextAttributes } from "../../ui";
+import { type ComponentType, type ReactNode } from "react";
+import type { ThemeColors } from "../../theme/colors";
+import { useThemeColors } from "../../theme/theme-context";
+import { t } from "../../i18n";
+import { displayWidth } from "../../utils/format";
+import { useRemoteUiNode, useRemoteUiScope } from "../../remote/semantic-tree";
+import { useScopedButtonAction } from "./action-scope";
+
+/**
+ * `ghost` is the quiet button in a row of buttons: it keeps the border so it
+ * still reads as a control next to a primary one. `plain` is text that happens
+ * to be clickable: no border, no fill. Anything shaped like a row, a table
+ * cell, a status bar chip or a link is `plain` — a box drawn around it reads as
+ * a control nested in the surface instead of part of it. Use `quiet` for text
+ * actions that also need a filled selection/focus state without a frame.
+ */
+export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "plain" | "quiet";
+
+export interface ButtonProps {
+  label: string;
+  /** Short text or an icon; `label` remains the accessible action name. */
+  displayLabel?: string;
+  children?: ReactNode;
+  expanded?: boolean;
+  onPress?: () => void;
+  variant?: ButtonVariant;
+  /** Semantic fill for a primary action, retained while keyboard focused. */
+  tone?: "positive" | "negative" | "neutral" | "warning";
+  disabled?: boolean;
+  /**
+   * The action it started is still running (a retry waiting for its answer).
+   * It reads as disabled and ignores presses, but keeps its key, so it does not
+   * change size and the key does not fall through to something else.
+   */
+  pending?: boolean;
+  /** What it says while pending, such as "Retrying...". Without it the label stays. */
+  pendingLabel?: string;
+  active?: boolean;
+  shortcut?: string;
+  /**
+   * The key that presses it, as a keycap on the desktop and the web only: for
+   * a dialog button whose key the terminal names in the footer line instead.
+   */
+  desktopShortcut?: string;
+  /** Tooltip, when it should say more than the label. */
+  title?: string;
+  width?: number;
+  height?: number | string;
+  compact?: boolean;
+  /**
+   * Drop the control inset so the label starts flush with the plain text
+   * around it. For `plain` buttons that stand in for a row or a line of copy,
+   * where a few pixels of button padding would break the column they sit in.
+   */
+  flush?: boolean;
+  /** Keep an action inside a row from also activating that row. */
+  stopPropagation?: boolean;
+}
+
+/**
+ * The colour of a button's key: its label's on a filled button, whose fill the
+ * page's dim text does not read on (Alt+Enter on Connect was 2.07:1 in
+ * colorblind-light), and the quieter dim or muted text beside an unfilled one.
+ */
+export function buttonShortcutColor(palette: { bg?: string; fg: string }, inert: boolean, colors: ThemeColors): string {
+  const filled = palette.bg !== undefined && palette.bg !== colors.bg && palette.bg !== colors.panel;
+  if (filled) return palette.fg;
+  return inert ? colors.textMuted : colors.textDim;
+}
+
+export function resolveButtonColors(variant: ButtonVariant, active: boolean, disabled: boolean, colors: ThemeColors, tone?: ButtonProps["tone"]): { bg?: string; fg: string } {
+  if (variant === "quiet") return { bg: active ? colors.selected : undefined, fg: disabled ? colors.textMuted : active ? colors.textBright : colors.textDim };
+  if (variant === "plain") {
+    return { fg: disabled ? colors.textMuted : active ? colors.textBright : colors.textDim };
+  }
+  if (disabled) {
+    return { bg: colors.panel, fg: colors.textMuted };
+  }
+  if (tone && variant === "primary") return { bg: colors[tone], fg: colors.bg };
+  if (active) {
+    return { bg: colors.selected, fg: colors.selectedText };
+  }
+
+  switch (variant) {
+    case "primary":
+      return { bg: colors.borderFocused, fg: colors.bg };
+    case "danger":
+      return { bg: colors.negative, fg: colors.bg };
+    case "ghost":
+      return { bg: colors.bg, fg: colors.textDim };
+    case "secondary":
+    default:
+      return { bg: colors.panel, fg: colors.text };
+  }
+}
+
+/**
+ * Terminal cells a button takes: the padded label, then its key. For a row that
+ * has to know whether its buttons fit before it lays them out.
+ */
+export function terminalButtonColumns({ label, displayLabel, shortcut, compact = false }: Pick<ButtonProps, "label" | "displayLabel" | "shortcut" | "compact">): number {
+  const text = displayLabel ?? t(label);
+  return displayWidth(compact ? text : ` ${text} `) + (shortcut ? 1 + displayWidth(shortcut) : 0);
+}
+
+export function Button({
+  label: rawLabel,
+  displayLabel,
+  children,
+  expanded,
+  onPress: pressAction,
+  variant = "secondary",
+  tone,
+  disabled = false,
+  pending = false,
+  pendingLabel,
+  active = false,
+  shortcut,
+  desktopShortcut,
+  width,
+  height,
+  compact = false,
+  flush = false,
+  stopPropagation = false,
+  title,
+}: ButtonProps) {
+  const colors = useThemeColors();
+  const label = t(pending && pendingLabel ? pendingLabel : rawLabel);
+  if (pending && pendingLabel) displayLabel = undefined;
+  // A pending press is ignored, but the button stays its scope's primary action.
+  const onPress = pressAction && pending ? () => {} : pressAction;
+  const scopedShortcut = useScopedButtonAction(label, onPress, disabled);
+  shortcut = shortcut ?? scopedShortcut;
+  const inert = disabled || pending;
+  const remoteScope = useRemoteUiScope();
+  useRemoteUiNode({
+    role: "button",
+    label,
+    disabled: inert,
+    actions: {
+      press: () => {
+        if (!inert) onPress?.();
+      },
+    },
+    metadata: { variant, active, shortcut, expanded, ...(remoteScope ? { scope: remoteScope } : {}) },
+  });
+  const HostButton = useUiHost().Button as ComponentType<ButtonProps> | undefined;
+  if (HostButton) {
+    return (
+      <HostButton
+        label={label}
+        displayLabel={displayLabel}
+        expanded={expanded}
+        onPress={onPress}
+        variant={variant}
+        tone={tone}
+        disabled={inert}
+        pending={pending}
+        active={active}
+        shortcut={shortcut ?? desktopShortcut}
+        title={title}
+        width={width}
+        height={height}
+        compact={compact}
+        flush={flush}
+        stopPropagation={stopPropagation}
+      >{children}</HostButton>
+    );
+  }
+
+  const palette = resolveButtonColors(variant, active, inert, colors, tone);
+
+  return (
+    <Box
+      width={width}
+      height={height ?? 1}
+      flexDirection="row"
+      backgroundColor={palette.bg}
+      cursor={inert ? "default" : "pointer"}
+      onMouseDown={(event: { preventDefault?: () => void; stopPropagation?: () => void }) => {
+        if (stopPropagation) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+        }
+        if (!inert) onPress?.();
+      }}
+    >
+      {children ?? <Text fg={palette.fg} attributes={active ? TextAttributes.BOLD : 0}>
+        {compact ? displayLabel ?? label : ` ${displayLabel ?? label} `}
+      </Text>}
+      {shortcut && (
+        <Text fg={buttonShortcutColor(palette, inert, colors)}>
+          {` ${shortcut}`}
+        </Text>
+      )}
+    </Box>
+  );
+}

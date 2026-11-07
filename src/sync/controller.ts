@@ -1,0 +1,686 @@
+import type { Dispatch } from "react";
+import type { AppAction, AppState } from "../core/state/app/state";
+import type { AppTickerRepositoryPort } from "../core/app-service-ports";
+import { stableStringify } from "../utils/hash";
+import { VERSION } from "../version";
+import {
+  SYNC_SNAPSHOT_SCHEMA_VERSION,
+  SyncHistoryUnavailableError,
+  SyncRevisionConflictError,
+  type RegisteredSyncContributor,
+  type RegisteredSyncTransport,
+  type SyncBaselineStore,
+  type SyncContributor,
+  type SyncSnapshot,
+  type SyncTransport,
+} from "./types";
+import type { LocalMarketDataLookup } from "./local-only";
+import { logFailure } from "../utils/log-failure";
+
+type CloudSyncPhase = "idle" | "disabled" | "syncing" | "synced" | "error";
+
+export interface CloudSyncStatus {
+  phase: CloudSyncPhase;
+  transportId: string | null;
+  lastSyncAt: string | null;
+  lastPullAt: string | null;
+  revision: number | null;
+  error: string | null;
+}
+
+interface SyncRuntime {
+  getState: () => AppState;
+  dispatch: Dispatch<AppAction>;
+  tickerRepository: AppTickerRepositoryPort;
+  getContributors: () => RegisteredSyncContributor[];
+  getTransport: () => RegisteredSyncTransport | null;
+  baselineStore?: SyncBaselineStore;
+  /** Retires pending operations when the Cloud session changes; transports decide availability. */
+  getSessionIdentity?: () => object | null;
+  /** Confirmed Cloud account, used to keep persisted merge history scoped across restarts. */
+  getAccountId?: () => string | null;
+  /** Sources whose quotes and bars never leave this device (`BrokerAdapter.localMarketData`); none when absent. */
+  isLocalMarketData?: LocalMarketDataLookup;
+}
+
+/** Kept in the view's storage; the desktop app also keeps a copy on disk (electrobun/view/view-ids.ts). */
+export const SYNC_CLIENT_ID_STORAGE_KEY = "gloomberb.sync.clientId";
+const PUSH_DEBOUNCE_MS = 2500;
+/** How soon after a change contributors date it, so an edit made just before quitting still is. */
+const OBSERVE_DEBOUNCE_MS = 250;
+/** Pushes refused because another device wrote first, each followed by a fresh pull, before giving up until the next sync. */
+const MAX_CONFLICT_RETRIES = 3;
+const SYNC_HISTORY_UNREADABLE = "This device's sync history could not be read, so sync is paused and local data is kept.";
+const SYNC_HISTORY_UNSAVED = "This device's sync history could not be saved, so sync is paused until it can be.";
+
+/** Merge history storage refused to write; kept here to write again, and read instead of the older stored copy. */
+interface UnsavedHistory {
+  baseline?: Record<string, unknown>;
+  memos?: Record<string, unknown>;
+  accountId?: string;
+}
+
+/** What one pull left behind: the stored revision it merged with (0 for none) and that copy's content. */
+interface PullResult {
+  revision: number | null;
+  signature: string | null;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function resolveClientId(): string {
+  const storage = globalThis.localStorage;
+  const existing = storage?.getItem(SYNC_CLIENT_ID_STORAGE_KEY);
+  if (existing) return existing;
+  const id = `client_${crypto.randomUUID()}`;
+  storage?.setItem(SYNC_CLIENT_ID_STORAGE_KEY, id);
+  return id;
+}
+
+/**
+ * The content of a snapshot as it reads once stored, so one assembled here
+ * (with fields left undefined) compares equal to the same one pulled back.
+ */
+function snapshotContentSignature(snapshot: SyncSnapshot): string {
+  return stableStringify(JSON.parse(JSON.stringify(Object.fromEntries(
+    Object.entries(snapshot.contributors).map(([id, contributor]) => [
+      id,
+      { schemaVersion: contributor.schemaVersion, payload: contributor.payload },
+    ]),
+  ))));
+}
+
+export class CloudSyncController {
+  private runtime: SyncRuntime | null = null;
+  private contributors = new Map<string, RegisteredSyncContributor>();
+  private transports = new Map<string, RegisteredSyncTransport>();
+  private listeners = new Set<() => void>();
+  private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  private observeTimer: ReturnType<typeof setTimeout> | null = null;
+  private observedSinceStart = false;
+  private memos: Record<string, unknown> | null = null;
+  private memosLoaded = false;
+  private inFlight: Promise<void> | null = null;
+  private syncQueued = false;
+  private generation = 0;
+  private clientId: string | null = null;
+  private accountId: string | null = null;
+  private accountRead = false;
+  private unsaved: UnsavedHistory | null = null;
+  /** The store this device's merge history lives in; `unsaved` belongs to it. */
+  private historyStore: SyncBaselineStore | undefined = undefined;
+  /** Bumped when the merge history in use stops being the one a sync merged with: another account or store. */
+  private historyEpoch = 0;
+  private lastSignature: string | null = null;
+  /**
+   * The content signature of the cloud's copy, with the revision and the
+   * write it belongs to. Each 15 s poll pulls the same copy again until a
+   * device writes; working its signature out every time was a third of an
+   * idle sync on a large workspace.
+   */
+  private cloudSignature: { transportId: string; revision: number; clientId: string; createdAt: string; signature: string } | null = null;
+  private baseline: Record<string, unknown> | null = null;
+  private baselineLoaded = false;
+  private pulledContributors: SyncSnapshot["contributors"] = {};
+  private appliedRevision: number | null = null;
+  private status: CloudSyncStatus = {
+    phase: "idle",
+    transportId: null,
+    lastSyncAt: null,
+    lastPullAt: null,
+    revision: null,
+    error: null,
+  };
+
+  registerContributor(pluginId: string, contributor: SyncContributor): () => void {
+    this.contributors.set(contributor.id, { pluginId, contributor });
+    this.emit();
+    return () => {
+      const current = this.contributors.get(contributor.id);
+      if (current?.contributor === contributor) {
+        this.contributors.delete(contributor.id);
+        this.emit();
+      }
+    };
+  }
+
+  registerTransport(pluginId: string, transport: SyncTransport): () => void {
+    this.transports.set(transport.id, { pluginId, transport });
+    this.emit();
+    return () => {
+      const current = this.transports.get(transport.id);
+      if (current?.transport === transport) {
+        this.transports.delete(transport.id);
+        this.emit();
+      }
+    };
+  }
+
+  getRegisteredContributors(): RegisteredSyncContributor[] {
+    return [...this.contributors.values()];
+  }
+
+  getRegisteredTransports(): RegisteredSyncTransport[] {
+    return [...this.transports.values()];
+  }
+
+  setRuntime(runtime: SyncRuntime): () => void {
+    if (this.runtime !== runtime) {
+      this.resetOperations();
+      this.runtime = runtime;
+      if (runtime.baselineStore !== this.historyStore) {
+        // History another store refused to write is that store's device's, never this one's to write.
+        this.historyStore = runtime.baselineStore;
+        this.historyEpoch += 1;
+        this.unsaved = null;
+      }
+      this.accountId = null;
+      this.accountRead = false;
+      // An account storage refuses to read now is read again by the next sync, which waits for it.
+      this.historyReadable(() => this.readAccount(runtime));
+      this.updateAvailability();
+    }
+    return () => this.clearRuntime(runtime);
+  }
+
+  clearRuntime(runtime?: SyncRuntime): void {
+    if (runtime && this.runtime !== runtime) return;
+    this.runtime = null;
+    this.resetOperations();
+    this.setStatus({ phase: "disabled", transportId: null, error: null });
+  }
+
+  /** Retires pending session work without losing unsynced edits for the same account. */
+  retireSession(): void {
+    this.generation += 1;
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    this.pushTimer = null;
+    this.inFlight = null;
+    this.syncQueued = false;
+    this.updateAvailability();
+  }
+
+  /** Account revisions, merge baselines and edit provenance never carry into another account. */
+  resetAccount(accountId?: string): void {
+    this.resetOperations();
+    this.historyEpoch += 1;
+    this.accountId = accountId ?? null;
+    this.accountRead = true;
+    this.baseline = {};
+    this.baselineLoaded = true;
+    this.memos = {};
+    this.memosLoaded = true;
+    // The previous account's history is dropped even if it was never stored.
+    this.unsaved = null;
+    if (this.runtime) this.writeHistory(this.runtime, { baseline: {}, memos: {}, ...(accountId ? { accountId } : {}) });
+    this.setStatus({ phase: "idle", transportId: null, lastSyncAt: null, lastPullAt: null, revision: null, error: null });
+    this.updateAvailability();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getStatus(): CloudSyncStatus {
+    return this.status;
+  }
+
+  schedulePush(reason: string): void {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    this.scheduleObserve(runtime);
+    const registration = runtime.getTransport();
+    if (!registration?.transport.isAvailable()) {
+      this.setStatus({
+        phase: "disabled",
+        transportId: registration?.transport.id ?? null,
+        error: null,
+      });
+      return;
+    }
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      void this.requestSync({ reason });
+    }, PUSH_DEBOUNCE_MS);
+  }
+
+  async requestSync(options: { reason?: string; force?: boolean } = {}): Promise<void> {
+    if (this.inFlight) {
+      this.syncQueued = true;
+      return this.inFlight;
+    }
+    const run = this.syncOnce(options).finally(async () => {
+      if (this.inFlight !== run) return;
+      this.inFlight = null;
+      if (!this.syncQueued) return;
+      this.syncQueued = false;
+      await this.requestSync({ reason: "queued-state-change" });
+    });
+    this.inFlight = run;
+    return run;
+  }
+
+  private async syncOnce(options: { reason?: string; force?: boolean }): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    // Sync pauses while storage refuses this device's merge history, and tries again every time. A history it
+    // cannot read is unknown, not empty: merging as if this device never synced would hand the cloud its offline
+    // and CLI edits. One it could not write leaves an older stored copy, which must not decide a later merge.
+    const readable = this.readMergeHistory(runtime);
+    if (readable) {
+      const accountId = runtime.getAccountId?.();
+      if (accountId && accountId !== this.accountId) {
+        if (this.accountId !== null) this.resetAccount(accountId);
+        else {
+          // Legacy stores have no owner; retain their offline edits on first validation.
+          this.accountId = accountId;
+          this.writeHistory(runtime, { accountId });
+        }
+      }
+    }
+    const historyProblem = !readable ? SYNC_HISTORY_UNREADABLE : this.flushHistory(runtime) ? null : SYNC_HISTORY_UNSAVED;
+    const generation = this.generation;
+    const sessionIdentity = runtime.getSessionIdentity?.();
+    this.observe(runtime);
+    const registration = runtime.getTransport();
+    if (!registration?.transport.isAvailable()) {
+      this.setStatus({
+        phase: "disabled",
+        transportId: registration?.transport.id ?? null,
+        error: null,
+      });
+      return;
+    }
+    const transport = registration.transport;
+    if (historyProblem) {
+      this.setStatus({ phase: "error", transportId: transport.id, error: historyProblem });
+      return;
+    }
+
+    for (let attempt = 0; ; attempt += 1) {
+      // Always pull before push. Another device (TUI, browser, phone) may have
+      // written since this process last synced, and contributors already merge
+      // so local-only edits survive the apply.
+      const pulled = await this.runPull(runtime, transport, generation, sessionIdentity);
+      if (!pulled || !this.isCurrent(runtime, transport, generation, sessionIdentity)) return;
+
+      const snapshot = await this.assembleSnapshot(runtime, generation, sessionIdentity);
+      if (!snapshot || !this.isCurrent(runtime, transport, generation, sessionIdentity)) return;
+      const signature = snapshotContentSignature(snapshot);
+      if (!options.force && signature === this.lastSignature) return;
+      if (!options.force && signature === pulled.signature) {
+        // The cloud already holds exactly this: pushing it back would only
+        // bump the revision under another device's next push.
+        this.lastSignature = signature;
+        if (!this.saveBaseline(runtime, snapshot)) {
+          this.setStatus({ phase: "error", transportId: transport.id, error: SYNC_HISTORY_UNSAVED });
+        }
+        return;
+      }
+
+      this.setStatus({ phase: "syncing", transportId: transport.id, error: null });
+      const historyEpoch = this.historyEpoch;
+      try {
+        // The revision this snapshot was merged with. The cloud refuses the
+        // write if another device wrote since, instead of losing that write.
+        const result = await transport.pushSnapshot(snapshot, { baseRevision: pulled.revision });
+        if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) {
+          // The cloud holds this push even though the sync was retired (a sign-out, a new runtime). While the history
+          // it merged with is still in use, record it, or the next merge reads this push as another device's edit.
+          if (this.historyEpoch === historyEpoch) this.saveBaseline(runtime, snapshot);
+          return;
+        }
+        this.lastSignature = signature;
+        this.appliedRevision = result.revision;
+        const saved = this.saveBaseline(runtime, snapshot);
+        this.setStatus({
+          phase: saved ? "synced" : "error",
+          transportId: transport.id,
+          revision: result.revision,
+          lastSyncAt: result.updatedAt,
+          error: saved ? null : SYNC_HISTORY_UNSAVED,
+        });
+        return;
+      } catch (error) {
+        if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return;
+        if (error instanceof SyncRevisionConflictError && attempt < MAX_CONFLICT_RETRIES) {
+          // Pull whatever the other device wrote, even an older revision than
+          // this process last saw, such as a restored snapshot.
+          this.appliedRevision = null;
+          continue;
+        }
+        this.setStatus({
+          phase: "error",
+          transportId: transport.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
+  }
+
+  private async runPull(runtime: SyncRuntime, transport: SyncTransport, generation: number, sessionIdentity: object | null | undefined): Promise<PullResult | null> {
+    const baselineState = runtime.getState();
+    this.setStatus({ phase: "syncing", transportId: transport.id, error: null });
+    try {
+      const response = await transport.pullSnapshot();
+      if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return null;
+
+      if (response.snapshot && this.shouldApplyPulledRevision(response.revision)) {
+        this.assertSnapshotCompatible(response.snapshot, runtime.getContributors());
+        this.pulledContributors = response.snapshot.contributors;
+        for (const entry of runtime.getContributors()) {
+          if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return null;
+          const contributorPayload = response.snapshot.contributors[entry.contributor.id];
+          if (!contributorPayload || !entry.contributor.apply) continue;
+          await entry.contributor.apply(contributorPayload.payload, {
+            snapshot: response.snapshot,
+            baselineState,
+            baselinePayload: this.loadBaseline(runtime)?.[entry.contributor.id] ?? null,
+            state: runtime.getState(),
+            getState: runtime.getState,
+            isCurrent: () => this.isCurrent(runtime, transport, generation, sessionIdentity),
+            dispatch: runtime.dispatch,
+            tickerRepository: runtime.tickerRepository,
+            memo: this.memoFor(runtime, entry.contributor.id),
+          });
+          if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return null;
+        }
+        if (response.revision != null) this.appliedRevision = response.revision;
+      }
+
+      if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return null;
+      this.setStatus({
+        phase: response.snapshot ? "synced" : "idle",
+        transportId: transport.id,
+        revision: this.newerRevision(response.revision),
+        lastPullAt: response.updatedAt ?? nowIso(),
+        lastSyncAt: response.updatedAt ?? this.status.lastSyncAt,
+        error: null,
+      });
+      return {
+        revision: response.snapshot ? response.revision : 0,
+        signature: response.snapshot ? this.pulledSignature(transport, response.revision, response.snapshot) : null,
+      };
+    } catch (error) {
+      if (!this.isCurrent(runtime, transport, generation, sessionIdentity)) return null;
+      this.setStatus({
+        phase: "error",
+        transportId: transport.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private assertSnapshotCompatible(
+    snapshot: SyncSnapshot,
+    contributors: RegisteredSyncContributor[],
+  ): void {
+    if (snapshot.appId !== "gloomberb") {
+      throw new Error(`Unsupported sync snapshot app: ${String(snapshot.appId)}`);
+    }
+    if (snapshot.schemaVersion !== SYNC_SNAPSHOT_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported sync snapshot schema version ${String(snapshot.schemaVersion)}; expected ${SYNC_SNAPSHOT_SCHEMA_VERSION}`,
+      );
+    }
+    for (const entry of contributors) {
+      const payload = snapshot.contributors[entry.contributor.id];
+      if (!payload || !entry.contributor.apply) continue;
+      if (payload.schemaVersion !== entry.contributor.schemaVersion) {
+        throw new Error(
+          `Unsupported sync contributor schema for ${entry.contributor.id}: ${payload.schemaVersion}; expected ${entry.contributor.schemaVersion}`,
+        );
+      }
+    }
+  }
+
+  private async assembleSnapshot(runtime: SyncRuntime, generation: number, sessionIdentity: object | null | undefined): Promise<SyncSnapshot | null> {
+    const contributors = runtime.getContributors();
+    const createdAt = nowIso();
+    // The snapshot replaces the stored one wholesale, so data owned by a
+    // contributor this client does not run (disabled plugin, older build) is
+    // carried over instead of being deleted for every other device.
+    const payloads: SyncSnapshot["contributors"] = { ...this.pulledContributors };
+    for (const entry of contributors) {
+      if (this.runtime !== runtime || this.generation !== generation || runtime.getSessionIdentity?.() !== sessionIdentity) return null;
+      let payload: unknown;
+      try {
+        payload = await entry.contributor.collect({
+          state: runtime.getState(),
+          baselinePayload: this.loadBaseline(runtime)?.[entry.contributor.id] ?? null,
+          memo: this.memoFor(runtime, entry.contributor.id),
+          isLocalMarketData: runtime.isLocalMarketData,
+        });
+      } catch (error) {
+        // Only a sync a reset already retired reads stored history here; what it collected is never pushed.
+        if (error instanceof SyncHistoryUnavailableError) return null;
+        throw error;
+      }
+      payloads[entry.contributor.id] = {
+        schemaVersion: entry.contributor.schemaVersion,
+        updatedAt: createdAt,
+        payload,
+      };
+    }
+    return {
+      schemaVersion: SYNC_SNAPSHOT_SCHEMA_VERSION,
+      appId: "gloomberb",
+      clientId: this.clientId ??= resolveClientId(),
+      createdAt,
+      appVersion: VERSION,
+      contributors: payloads,
+    };
+  }
+
+  private loadBaseline(runtime: SyncRuntime): Record<string, unknown> | null {
+    if (!this.baselineLoaded) {
+      // History storage refused to write is newer than its stored copy. Marked loaded only once read: a refused
+      // read is asked again, never taken for "never synced".
+      this.baseline = this.unsaved?.baseline ?? runtime.baselineStore?.load() ?? null;
+      this.baselineLoaded = true;
+    }
+    return this.baseline;
+  }
+
+  private readAccount(runtime: SyncRuntime): void {
+    if (this.accountRead) return;
+    this.accountId = this.unsaved?.accountId ?? runtime.baselineStore?.loadAccountId?.() ?? null;
+    this.accountRead = true;
+  }
+
+  /** Reads this device's account, last pushed payloads and contributor memos; false while storage refuses a read. */
+  private readMergeHistory(runtime: SyncRuntime): boolean {
+    return this.historyReadable(() => {
+      this.readAccount(runtime);
+      this.loadBaseline(runtime);
+      this.loadMemos(runtime);
+    });
+  }
+
+  private historyReadable(read: () => void): boolean {
+    try {
+      read();
+      return true;
+    } catch (error) {
+      // The store has already logged the refused read.
+      if (error instanceof SyncHistoryUnavailableError) return false;
+      throw error;
+    }
+  }
+
+  /** Stores merge history, keeping what storage refuses until a later write succeeds; false while any is unsaved. */
+  private writeHistory(runtime: SyncRuntime, history: UnsavedHistory): boolean {
+    this.unsaved = { ...this.unsaved, ...history };
+    return this.flushHistory(runtime);
+  }
+
+  private flushHistory(runtime: SyncRuntime): boolean {
+    const unsaved = this.unsaved;
+    if (!unsaved) return true;
+    const store = runtime.baselineStore;
+    try {
+      // The owning account last, so a stored account never vouches for another account's payloads.
+      if (unsaved.baseline) store?.save(unsaved.baseline);
+      if (unsaved.memos) store?.saveMemos?.(unsaved.memos);
+      if (unsaved.accountId !== undefined) store?.saveAccountId?.(unsaved.accountId);
+    } catch (error) {
+      // The store has already logged the refused write; the unsaved history stays to be written again.
+      if (error instanceof SyncHistoryUnavailableError) return false;
+      throw error;
+    }
+    this.unsaved = null;
+    return true;
+  }
+
+  private scheduleObserve(runtime: SyncRuntime): void {
+    if (this.observeTimer) clearTimeout(this.observeTimer);
+    this.observeTimer = setTimeout(() => {
+      this.observeTimer = null;
+      if (this.runtime === runtime) this.observe(runtime);
+    }, OBSERVE_DEBOUNCE_MS);
+  }
+
+  /** Lets contributors date local edits as they happen, whether or not the cloud is reachable. */
+  private observe(runtime: SyncRuntime): void {
+    // Edits are dated against the history this device last pushed; while it cannot be read, they wait.
+    if (!this.readMergeHistory(runtime)) return;
+    const launch = !this.observedSinceStart;
+    this.observedSinceStart = true;
+    for (const entry of runtime.getContributors()) {
+      if (!entry.contributor.observe) continue;
+      try {
+        entry.contributor.observe({
+          state: runtime.getState(),
+          baselinePayload: this.loadBaseline(runtime)?.[entry.contributor.id] ?? null,
+          memo: this.memoFor(runtime, entry.contributor.id),
+          launch,
+        });
+      } catch (error) {
+        // A contributor that cannot date an edit leaves it undated, which only
+        // makes it lose a conflict it might have won.
+        logFailure("sync.controller", "Observe sync contributor edit failed")(error);
+      }
+    }
+  }
+
+  private memoFor(runtime: SyncRuntime, contributorId: string) {
+    const generation = this.generation;
+    const sessionIdentity = runtime.getSessionIdentity?.();
+    return {
+      get: () => this.loadMemos(runtime)[contributorId] ?? null,
+      set: (value: unknown) => {
+        if (this.runtime !== runtime || this.generation !== generation || runtime.getSessionIdentity?.() !== sessionIdentity) return;
+        const memos = { ...this.loadMemos(runtime), [contributorId]: value };
+        this.memos = memos;
+        this.writeHistory(runtime, { memos });
+      },
+    };
+  }
+
+  private loadMemos(runtime: SyncRuntime): Record<string, unknown> {
+    if (!this.memosLoaded) {
+      // Read once per reset, so a sync that has read them never reads storage again mid-merge.
+      this.memos = this.unsaved?.memos ?? runtime.baselineStore?.loadMemos?.() ?? null;
+      this.memosLoaded = true;
+    }
+    return this.memos ?? {};
+  }
+
+  /** False when storage refused the write: the stored baseline is then older than this one. */
+  private saveBaseline(runtime: SyncRuntime, snapshot: SyncSnapshot): boolean {
+    const payloads = Object.fromEntries(
+      Object.entries(snapshot.contributors).map(([id, contributor]) => [id, contributor.payload]),
+    );
+    this.baseline = payloads;
+    this.baselineLoaded = true;
+    return this.writeHistory(runtime, { baseline: payloads });
+  }
+
+  private isCurrent(runtime: SyncRuntime, transport: SyncTransport, generation: number, sessionIdentity: object | null | undefined): boolean {
+    return this.generation === generation && this.runtime === runtime && runtime.getTransport()?.transport === transport
+      && runtime.getSessionIdentity?.() === sessionIdentity;
+  }
+
+  private pulledSignature(transport: SyncTransport, revision: number | null, snapshot: SyncSnapshot): string {
+    const kept = this.cloudSignature;
+    if (revision != null && kept && kept.transportId === transport.id && kept.revision === revision
+      && kept.clientId === snapshot.clientId && kept.createdAt === snapshot.createdAt) {
+      return kept.signature;
+    }
+    const signature = snapshotContentSignature(snapshot);
+    this.cloudSignature = revision == null
+      ? null
+      : { transportId: transport.id, revision, clientId: snapshot.clientId, createdAt: snapshot.createdAt, signature };
+    return signature;
+  }
+
+  private shouldApplyPulledRevision(revision: number | null): boolean {
+    return revision == null || this.appliedRevision == null || revision > this.appliedRevision;
+  }
+
+  private newerRevision(revision: number | null): number | null {
+    if (revision == null) return this.status.revision;
+    if (this.status.revision == null || revision > this.status.revision) return revision;
+    return this.status.revision;
+  }
+
+  private resetOperations(): void {
+    this.generation += 1;
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    this.pushTimer = null;
+    if (this.observeTimer) clearTimeout(this.observeTimer);
+    this.observeTimer = null;
+    this.observedSinceStart = false;
+    this.memos = null;
+    this.memosLoaded = false;
+    this.inFlight = null;
+    this.syncQueued = false;
+    this.lastSignature = null;
+    this.cloudSignature = null;
+    this.appliedRevision = null;
+    this.baseline = null;
+    this.baselineLoaded = false;
+    this.pulledContributors = {};
+  }
+
+  private updateAvailability(): void {
+    const transport = this.runtime?.getTransport() ?? null;
+    if (!transport) {
+      this.setStatus({ phase: "disabled", transportId: null, error: null });
+      return;
+    }
+    if (!transport.transport.isAvailable()) {
+      this.setStatus({ phase: "disabled", transportId: transport.transport.id, error: null });
+      return;
+    }
+    if (
+      this.status.transportId === transport.transport.id &&
+      this.status.phase !== "disabled" &&
+      this.status.phase !== "idle"
+    ) {
+      return;
+    }
+    this.setStatus({
+      phase: "idle",
+      transportId: transport.transport.id,
+      error: null,
+    });
+  }
+
+  private setStatus(patch: Partial<CloudSyncStatus>): void {
+    this.status = { ...this.status, ...patch };
+    this.emit();
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener();
+  }
+}
+
+export const cloudSyncController = new CloudSyncController();

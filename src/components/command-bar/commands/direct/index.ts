@@ -1,0 +1,459 @@
+import type { Dispatch } from "react";
+import {
+  applyLanguagePreference,
+  LANGUAGE_DISPLAY_NAMES,
+  resolveLanguageCommandPreference,
+  t,
+} from "../../../../i18n";
+import { exportConfig, importConfig, resetAllData } from "../../../../data/config/store";
+import type { PluginRegistry } from "../../../../plugins/registry";
+import {
+  applyTheme,
+  clearTransientThemePreview,
+} from "../../../../theme/colors";
+import { clampFontSize, MIN_FONT_SIZE_PX } from "../../../../theme/font-scale";
+import type { AppAction, AppState } from "../../../../state/app/context";
+import { openBrokerAddFlow } from "../../../../plugins/builtin/broker-manager/add-request";
+import { isManualPortfolio } from "../../../../portfolio/mutations";
+import { CHART_RENDERER_PREFERENCES } from "../../../chart/core/types";
+import type { Command } from "../registry";
+import type { AppConfig, BrokerInstanceConfig } from "../../../../types/config";
+import { requestFeedbackDialog } from "../../../feedback-dialog";
+import type { OpenInlineConfirm } from "../../routing/confirm";
+import { HEADER_MARKET_SEARCH } from "../../../../core/state/app/command-bar-launch";
+import {
+  isRouteCommandId,
+  routeCommandIdToScreen,
+  type CollectionCommandId,
+} from "../../helpers";
+import { parseWindowModeCommandArg } from "../../layout-items";
+import type { CommandBarRoute } from "../../workflow/types";
+import { recordFunctionOpen } from "../../../../telemetry/usage-counts";
+import { reportTelemetryConfig } from "../../../../telemetry/live-config";
+import { ATTENTION_OFF_MESSAGE } from "../../../../telemetry/attention-setting";
+import { NIGHTLY_CHANNEL_SUMMARY, withUpdateChannel } from "../../../../updater/channel";
+import { isPrereleaseVersion } from "../../../../utils/semver";
+import { VERSION } from "../../../../version";
+import { getDesktopWindows } from "../../../../state/desktop-windows";
+import { fireAndForget } from "../../../../utils/fire-and-forget";
+
+type NotifyFn = (body: string, options?: { type?: "info" | "success" | "error" }) => void;
+
+function getDefaultConfigBackupPath(): string {
+  const home = typeof process !== "undefined" ? process.env.HOME : undefined;
+  return `${home || "~"}/gloomberb-config-backup.json`;
+}
+
+export function runDirectCommandAction(options: {
+  command: Command;
+  arg: string;
+  activeCollectionId: string | null;
+  activeTickerSymbol: string | null;
+  closeAll: (options?: { revertThemePreview?: boolean }) => void;
+  /** The window's own minimize and maximize, as its title bar buttons run them. */
+  controlWindow: (action: "minimize" | "toggle-maximize") => void;
+  dispatch: Dispatch<AppAction>;
+  executeCollectionCommand: (commandId: CollectionCommandId, rawInput?: string) => void;
+  getState: () => AppState;
+  notify: NotifyFn;
+  onCheckForUpdates?: () => void | Promise<void>;
+  /** Settings' Run Setup Again; absent where setup cannot run. */
+  onRunSetupAgain?: () => Promise<void>;
+  openBuiltInWorkflow: (actionId: string) => void;
+  openInlineConfirm: OpenInlineConfirm;
+  openModeRoute: (screen: "ticker-search" | "layout", initialQuery?: string, payload?: Record<string, unknown>) => void;
+  openPaneSettings: (paneId: string | null) => void;
+  pluginRegistry: PluginRegistry;
+  persistConfig: (nextConfig: AppState["config"]) => void;
+  pushRoute: (route: CommandBarRoute) => void;
+  quitApp: () => void;
+  runSecurityDescriptionShortcut: (query?: string) => void;
+  setRootQuery: (query: string) => void;
+  setRootThemeBaseId: (themeId: string | null) => void;
+  cancelThemePreview: () => void;
+}): void {
+  const {
+    activeCollectionId,
+    activeTickerSymbol,
+    arg,
+    closeAll,
+    command,
+    controlWindow,
+    dispatch,
+    executeCollectionCommand,
+    getState,
+    notify,
+    onCheckForUpdates,
+    onRunSetupAgain,
+    openBuiltInWorkflow,
+    openInlineConfirm,
+    openModeRoute,
+    openPaneSettings,
+    persistConfig,
+    pluginRegistry,
+    pushRoute,
+    quitApp,
+    runSecurityDescriptionShortcut,
+    setRootQuery,
+    setRootThemeBaseId,
+    cancelThemePreview,
+  } = options;
+  const state = getState();
+  // DES is counted where the research pane opens (pinTicker, focusTicker).
+  if (command.id !== "security-description") {
+    recordFunctionOpen({ shortcut: command.prefix, externalPluginId: null });
+  }
+
+  switch (command.id) {
+    case "help":
+      closeAll({ revertThemePreview: false });
+      pluginRegistry.showPane("help");
+      return;
+    case "send-feedback":
+      closeAll({ revertThemePreview: false });
+      requestFeedbackDialog();
+      return;
+    case "layout-marketplace":
+      closeAll({ revertThemePreview: false });
+      pluginRegistry.showPane("layout-marketplace");
+      return;
+    case "share-pane":
+      closeAll({ revertThemePreview: false });
+      pluginRegistry.sharePane(state.focusedPaneId ?? undefined);
+      return;
+    case "pane-settings":
+      openPaneSettings(state.focusedPaneId);
+      return;
+    case "window-mode":
+      closeAll({ revertThemePreview: false });
+      pluginRegistry.openWindowMode(state.focusedPaneId ?? undefined, parseWindowModeCommandArg(arg) ?? "move");
+      return;
+    case "new-window":
+      closeAll({ revertThemePreview: false });
+      fireAndForget(getDesktopWindows()?.openWindow(), "desktop.openWindow");
+      return;
+    case "minimize-window":
+    case "maximize-window":
+      closeAll({ revertThemePreview: false });
+      controlWindow(command.id === "minimize-window" ? "minimize" : "toggle-maximize");
+      return;
+    case "add-broker-account":
+      // Profiles are added in the Brokers pane.
+      closeAll({ revertThemePreview: false });
+      openBrokerAddFlow(pluginRegistry);
+      return;
+    case "new-portfolio":
+    case "new-watchlist":
+    case "set-portfolio-position":
+    case "disconnect-broker-account":
+    case "delete-watchlist":
+    case "delete-portfolio":
+    case "reset-all-data":
+      if (
+        command.id === "new-portfolio"
+        || command.id === "new-watchlist"
+        || command.id === "set-portfolio-position"
+      ) {
+        openBuiltInWorkflow(command.id);
+        return;
+      }
+      if (command.id === "disconnect-broker-account") {
+        // "Interactive Brokers · Sign in" when the broker describes its profiles, else type and mode.
+        const describeBrokerProfile = (registry: PluginRegistry, instance: BrokerInstanceConfig) => {
+          const described = registry.getBrokerAdapter(instance.brokerType)?.describeInstance?.(instance);
+          return described
+            ? `${described.brokerName} · ${described.method}`
+            : `${instance.brokerType.toUpperCase()} · ${instance.connectionMode || String(instance.config.connectionMode || "configured")}`;
+        };
+        const instances = state.config.brokerInstances.map((instance) => ({
+          id: instance.id,
+          label: instance.label,
+          description: describeBrokerProfile(pluginRegistry, instance),
+        }));
+        if (instances.length === 0) return;
+        pushRoute({
+          kind: "picker",
+          pickerId: "disconnect-broker",
+          title: "Disconnect Broker Account",
+          query: "",
+          selectedIdx: 0,
+          hoveredIdx: null,
+          options: instances.map((instance) => ({
+            id: instance.id,
+            label: instance.label,
+            detail: instance.description,
+            description: instance.description,
+          })),
+        });
+        return;
+      }
+      if (command.id === "delete-watchlist") {
+        const pickerOptions = state.config.watchlists.map((watchlist) => ({
+          id: watchlist.id,
+          label: watchlist.name,
+          detail: `Delete watchlist "${watchlist.name}"`,
+          description: `Delete watchlist "${watchlist.name}"`,
+        }));
+        if (pickerOptions.length === 0) return;
+        pushRoute({
+          kind: "picker",
+          pickerId: "delete-watchlist",
+          title: "Delete Watchlist",
+          query: "",
+          selectedIdx: 0,
+          hoveredIdx: null,
+          options: pickerOptions,
+        });
+        return;
+      }
+      if (command.id === "delete-portfolio") {
+        const deletable = state.config.portfolios.filter(isManualPortfolio);
+        const pickerOptions = deletable.map((portfolio) => ({
+          id: portfolio.id,
+          label: portfolio.name,
+          detail: `Delete portfolio "${portfolio.name}"`,
+          description: `Delete portfolio "${portfolio.name}"`,
+        }));
+        if (pickerOptions.length === 0) return;
+        pushRoute({
+          kind: "picker",
+          pickerId: "delete-portfolio",
+          title: "Delete Portfolio",
+          query: "",
+          selectedIdx: 0,
+          hoveredIdx: null,
+          options: pickerOptions,
+        });
+        return;
+      }
+      openInlineConfirm({
+        confirmId: "reset-all-data",
+        title: "Reset All Data",
+        body: [
+          "This will permanently delete all portfolios, tickers, notes, broker credentials, and settings.",
+          "Apex Stock Terminal will quit and show the setup wizard on next launch.",
+        ],
+        confirmLabel: "Reset Everything",
+        cancelLabel: "Back",
+        tone: "danger",
+        onConfirm: async () => {
+          await resetAllData(getState().config.dataDir);
+          quitApp();
+        },
+      });
+      return;
+    case "export-config": {
+      const exportPath = getDefaultConfigBackupPath();
+      void exportConfig(state.config, exportPath)
+        .then(() => {
+          notify(`Config exported to ${exportPath}`, { type: "success" });
+          closeAll({ revertThemePreview: false });
+        })
+        .catch((error) => {
+          notify(error instanceof Error ? error.message : "Export failed.", { type: "error" });
+        });
+      return;
+    }
+    case "import-config": {
+      const importPath = getDefaultConfigBackupPath();
+      // An import replaces every layout, portfolio and setting at once, so it
+      // is never one keystroke away.
+      openInlineConfirm({
+        confirmId: "import-config",
+        title: "Import Config",
+        body: [
+          `This replaces your layouts, portfolios, watchlists and settings with the ones saved in ${importPath}.`,
+          "What you have now is not kept unless you export it first.",
+        ],
+        confirmLabel: "Import",
+        cancelLabel: "Back",
+        tone: "danger",
+        // A stray Enter keeps what is there.
+        defaultAction: "cancel",
+        onConfirm: async () => {
+          try {
+            const imported = await importConfig(getState().config.dataDir, importPath);
+            cancelThemePreview();
+            clearTransientThemePreview();
+            dispatch({ type: "SET_CONFIG", config: imported });
+            applyTheme(imported.theme);
+            dispatch({ type: "SET_THEME", theme: imported.theme });
+            notify(`Imported config from ${importPath}.`, { type: "success" });
+          } catch (error) {
+            notify(error instanceof Error ? error.message : "Import failed.", { type: "error" });
+          }
+        },
+      });
+      return;
+    }
+    case "cycle-chart-renderer": {
+      const current = state.config.chartPreferences.renderer;
+      const index = CHART_RENDERER_PREFERENCES.indexOf(current);
+      const next = CHART_RENDERER_PREFERENCES[(index + 1) % CHART_RENDERER_PREFERENCES.length] ?? "auto";
+      const nextConfig = {
+        ...state.config,
+        chartPreferences: {
+          ...state.config.chartPreferences,
+          renderer: next,
+        },
+      };
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "language": {
+      const current = state.config.language ?? "auto";
+      const next = resolveLanguageCommandPreference(current, arg);
+      if (!next) {
+        notify(
+          `${t("Unsupported language")}: ${arg.trim()}. LANG auto | en | es | zh-CN | zh-TW | ja | ko`,
+          { type: "error" },
+        );
+        return;
+      }
+      const nextConfig = { ...state.config, language: next };
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      applyLanguagePreference(next);
+      const languageLabel = next === "auto" ? t(LANGUAGE_DISPLAY_NAMES.auto) : LANGUAGE_DISPLAY_NAMES[next];
+      notify(`${t("Language")}: ${languageLabel}`, { type: "success" });
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "toggle-presentation-mode": {
+      const { presentationMode, ...rest } = state.config;
+      const nextConfig: AppConfig = presentationMode ? rest : { ...rest, presentationMode: true };
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "header-market":
+      openModeRoute("ticker-search", arg, HEADER_MARKET_SEARCH);
+      return;
+    case "toggle-value-flashing": {
+      const nextConfig = {
+        ...state.config,
+        valueFlashingEnabled: !state.config.valueFlashingEnabled,
+      };
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "toggle-crash-reports":
+    case "toggle-usage-counts":
+    case "toggle-attention-counts": {
+      const key = command.id === "toggle-crash-reports" ? "crashReports" : command.id === "toggle-usage-counts" ? "usage" : "attention";
+      // All three are on by default: only an explicit false is off.
+      const enabled = state.config.telemetry?.[key] === false;
+      const nextConfig = { ...state.config, telemetry: { ...state.config.telemetry, [key]: enabled } };
+      // Reported before React commits, so turning Attention Counts off drops unsent counts at once.
+      reportTelemetryConfig(nextConfig.telemetry);
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      notify(key === "attention" && !enabled
+        ? t(ATTENTION_OFF_MESSAGE)
+        : `${t(command.label)}: ${t(enabled ? "on" : "off")}`, { type: "success" });
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "font-size-increase":
+    case "font-size-decrease": {
+      const delta = command.id === "font-size-increase" ? 1 : -1;
+      const current = clampFontSize(state.config.fontSize);
+      const next = clampFontSize(current + delta);
+      if (next === current) {
+        notify(`Font size already at ${next === MIN_FONT_SIZE_PX ? "minimum" : "maximum"} (${next}px)`, { type: "info" });
+        closeAll({ revertThemePreview: false });
+        return;
+      }
+      const nextConfig = { ...state.config, fontSize: next };
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      notify(`Font size: ${next}px`, { type: "success" });
+      closeAll({ revertThemePreview: false });
+      return;
+    }
+    case "quit":
+      closeAll({ revertThemePreview: false });
+      quitApp();
+      return;
+    case "check-for-updates":
+      void onCheckForUpdates?.();
+      closeAll({ revertThemePreview: false });
+      return;
+    case "run-setup-again":
+      closeAll({ revertThemePreview: false });
+      void onRunSetupAgain?.().catch((error: unknown) => {
+        notify(error instanceof Error ? error.message : String(error), { type: "error" });
+      });
+      return;
+    case "release-channel": {
+      // The runtime checks again as soon as the channel changes.
+      const setChannel = (channel: "stable" | "nightly") => {
+        const nextConfig = withUpdateChannel(getState().config, channel);
+        dispatch({ type: "SET_CONFIG", config: nextConfig });
+        persistConfig(nextConfig);
+        notify(`${t(command.label)}: ${channel}`, { type: "success" });
+      };
+      // The saved setting flips; GLOOMBERB_UPDATE_CHANNEL still wins for the run it is set on.
+      // Back to stable asks too, to say a nightly build already running stays.
+      if (state.config.updates?.channel === "nightly") {
+        openInlineConfirm({
+          confirmId: "switch-to-stable",
+          title: "Switch to Stable?",
+          body: [
+            isPrereleaseVersion(VERSION)
+              ? "Updates come from stable releases only. This nightly build stays until a newer stable release is out."
+              : "Updates come from stable releases only.",
+          ],
+          confirmLabel: "Switch to Stable",
+          cancelLabel: "Stay on Nightly",
+          tone: "default",
+          onConfirm: async () => { setChannel("stable"); },
+        });
+        return;
+      }
+      openInlineConfirm({
+        confirmId: "switch-to-nightly",
+        title: "Switch to Nightly?",
+        body: [
+          `Nightly is ${NIGHTLY_CHANNEL_SUMMARY}. Stable releases still reach you when they are newer.`,
+          isPrereleaseVersion(VERSION)
+            ? "Switch back to Stable at any time."
+            : "Switch back to Stable at any time: the nightly build stays until a newer stable release is out.",
+        ],
+        confirmLabel: "Switch to Nightly",
+        cancelLabel: "Stay on Stable",
+        tone: "default",
+        // An opt-in to builds that can break: a stray Enter stays on stable.
+        defaultAction: "cancel",
+        onConfirm: async () => { setChannel("nightly"); },
+      });
+      return;
+    }
+    case "theme":
+      setRootThemeBaseId(getState().config.theme);
+      setRootQuery(arg ? `TH ${arg}` : "TH ");
+      return;
+    case "security-description":
+      runSecurityDescriptionShortcut(arg);
+      return;
+    case "remove-watchlist":
+    case "remove-portfolio":
+    case "add-watchlist":
+    case "add-portfolio":
+      executeCollectionCommand(command.id, arg);
+      return;
+    default:
+      if (isRouteCommandId(command.id)) {
+        const screen = routeCommandIdToScreen(command.id);
+        if (screen) openModeRoute(screen, arg);
+        return;
+      }
+      command.execute?.(dispatch, { activeTicker: activeTickerSymbol, activeCollectionId });
+      closeAll({ revertThemePreview: false });
+  }
+}

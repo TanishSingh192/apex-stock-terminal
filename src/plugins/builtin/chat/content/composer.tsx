@@ -1,0 +1,304 @@
+import type { ReactNode } from "react";
+import { Box, Text, TextAttributes, type TextareaRenderable } from "../../../../ui";
+import { getMessageComposerBlockHeight, MessageComposer } from "../../../../components/ui";
+import { colors } from "../../../../theme/colors";
+import { t } from "../../../../i18n";
+import { truncateToDisplayWidth } from "../../../../utils/format";
+import type { ChatMessage } from "../../../../api-client";
+import { InlineAuthActions } from "../../cloud/auth-actions";
+import { Button, ListView } from "../../../../components/ui";
+import { COMPOSER_ACTION_WIDTH } from "../layout";
+import { isManagedBot } from "../ghost-user";
+import { ChatBotIcon } from "../message/person-icons";
+import type { ChatDraftAttachment } from "../controller/attachments";
+import { DesktopChatAttachButton, DesktopChatAttachmentStrip } from "../attachments/desktop";
+import { TerminalChatAttachmentRows } from "../attachments/terminal";
+import type { TransferFile } from "../attachments/transfer";
+import { DesktopComposerPaneChips, TerminalComposerPaneChips } from "../message/pane-chip";
+import type { ComposerShareLink } from "../pane-links/composer";
+import type { ChatMessagePaneLink } from "../pane-links/model";
+
+const DESKTOP_CHAT_INPUT_TOP_MARGIN_PX = 6;
+/**
+ * The line saying why the composer is closed, a blank row, then its button,
+ * as a wall sets them. The desktop has no pane border under the button, so a
+ * row below keeps it off the pane's edge.
+ */
+function chatAuthPromptRows(nativePaneChrome: boolean | undefined): number {
+  return nativePaneChrome ? 4 : 3;
+}
+
+interface MutableRef<T> {
+  current: T;
+}
+
+interface ChatComposerAreaProps {
+  /** The first-chat handle prompt, drawn above everything else once you can send. */
+  handlePrompt?: ReactNode;
+  canSend: boolean;
+  cancelEditMessage: () => void;
+  clearReplyTarget: () => void;
+  commitLocalDraft: (draft: string) => void;
+  composerHeight: number;
+  composerWidth: number;
+  contentWidth: number;
+  focused: boolean;
+  focusComposer: () => void;
+  inputFocused: boolean;
+  inputPlaceholder: string;
+  inputRef: MutableRef<TextareaRenderable | null>;
+  inputValueRef: MutableRef<string>;
+  nativePaneChrome: boolean | undefined;
+  editingMessage: ChatMessage | null;
+  editingPreview: string;
+  replyPreview: string;
+  replyTo: ChatMessage | null;
+  sendMessage: () => void;
+  /** People after @, or functions after a backtick: one list at a time. */
+  suggestions: ChatComposerSuggestion[];
+  mentionSelectedIndex: number;
+  onMentionCursorChange: () => void;
+  onMentionSelect: (index?: number) => boolean;
+  user: { id: string; username: string; emailVerified: boolean } | null;
+  /** Images waiting for the next message. */
+  draftAttachments: ChatDraftAttachment[];
+  /** The server takes images and nothing (an edit) rules them out. */
+  canAttach: boolean;
+  onAttachFiles: (files: TransferFile[]) => void;
+  onRemoveAttachment: (localId: string) => void;
+  onRetryAttachment: (localId: string) => void;
+  /** Share links pasted into the field, waiting as the chips the message will show. */
+  draftLinks: readonly ComposerShareLink[];
+  onOpenDraftLink: (link: ChatMessagePaneLink) => void;
+  /** Takes out the chip at this place in `draftLinks`. */
+  onRemoveDraftLink: (index: number) => void;
+  /** Filled by the desktop attach button, so the pane menu can open its picker. */
+  attachPickerRef: { current: (() => void) | null };
+}
+
+/** A row of the list over the composer: a handle, or a function's code with its name at the end. */
+interface ChatComposerSuggestion {
+  id: string;
+  label: string;
+  detail?: string;
+}
+
+function ChatMentionSuggestions({
+  contentWidth,
+  onSelect,
+  selectedIndex,
+  suggestions,
+}: {
+  contentWidth: number;
+  onSelect: (index?: number) => boolean;
+  selectedIndex: number;
+  suggestions: ChatComposerSuggestion[];
+}) {
+  if (suggestions.length === 0) return null;
+  const width = Math.max(18, Math.min(contentWidth, 44));
+  return (
+    <Box width={width}>
+      <ListView
+        items={suggestions}
+        selectedIndex={selectedIndex}
+        height={suggestions.length}
+        rowGap={0}
+        surface="framed"
+        bgColor={colors.panel}
+        onActivate={(_, index) => { onSelect(index); }}
+      />
+    </Box>
+  );
+}
+
+export function ChatComposerArea({
+  handlePrompt,
+  canSend,
+  cancelEditMessage,
+  clearReplyTarget,
+  commitLocalDraft,
+  composerHeight,
+  composerWidth,
+  contentWidth,
+  focused,
+  focusComposer,
+  inputFocused,
+  inputPlaceholder,
+  inputRef,
+  inputValueRef,
+  nativePaneChrome,
+  editingMessage,
+  editingPreview,
+  replyPreview,
+  replyTo,
+  sendMessage,
+  suggestions,
+  mentionSelectedIndex,
+  onMentionCursorChange,
+  onMentionSelect,
+  user,
+  draftAttachments,
+  canAttach,
+  onAttachFiles,
+  onRemoveAttachment,
+  onRetryAttachment,
+  draftLinks,
+  onOpenDraftLink,
+  onRemoveDraftLink,
+  attachPickerRef,
+}: ChatComposerAreaProps) {
+  if (!canSend) {
+    // Signed out the pane shows the sign-in wall instead; what reaches here is
+    // a saved login to finish or an address to confirm. The line and its
+    // button sit as a wall's do, a row apart.
+    return (
+      // Inset like the transcript above it, so the prompt lines up with the messages.
+      <Box width={contentWidth + 2} paddingX={1} height={chatAuthPromptRows(nativePaneChrome)} flexDirection="column">
+        <Text fg={colors.positive}>
+          {truncateToDisplayWidth(user ? t("Verify your email to send messages.") : t("Saved login found. Log in again to send."), contentWidth)}
+        </Text>
+        <Box marginTop={1}>
+          <InlineAuthActions showSignup={false} needsVerification={!!user} />
+        </Box>
+      </Box>
+    );
+  }
+
+  return (
+    <>
+      {nativePaneChrome && (
+        <Box
+          width={composerWidth}
+          style={{
+            flex: `0 0 ${DESKTOP_CHAT_INPUT_TOP_MARGIN_PX}px`,
+            height: DESKTOP_CHAT_INPUT_TOP_MARGIN_PX,
+            minHeight: DESKTOP_CHAT_INPUT_TOP_MARGIN_PX,
+          }}
+        />
+      )}
+
+      {handlePrompt}
+
+      {editingMessage && (
+        <Box height={1} width={contentWidth} flexDirection="row">
+          <Text fg={colors.textMuted}>{` ${t("editing")} `}</Text>
+          <Text fg={colors.textDim}>{editingPreview ? `: ${editingPreview}` : ""}</Text>
+          <Box flexGrow={1} />
+          <Button stopPropagation
+            label={t("Cancel")}
+            width={COMPOSER_ACTION_WIDTH}
+            onPress={cancelEditMessage}
+          />
+        </Box>
+      )}
+
+      {!editingMessage && replyTo && (
+        <Box height={1} width={contentWidth} flexDirection="row">
+          <Text fg={colors.textMuted}>{` ${t("replying to")} `}</Text>
+          <Text fg={colors.positive} attributes={TextAttributes.BOLD}>{`@${replyTo.user.username}`}</Text>
+          {isManagedBot(replyTo.user) && <ChatBotIcon />}
+          {/* The bot's icon stands where the colon would. */}
+          <Text fg={colors.textDim}>{replyPreview ? `${isManagedBot(replyTo.user) ? " " : ": "}${replyPreview}` : ""}</Text>
+          <Box flexGrow={1} />
+          <Button stopPropagation
+            label={t("Cancel")}
+            width={COMPOSER_ACTION_WIDTH}
+            onPress={clearReplyTarget}
+          />
+        </Box>
+      )}
+
+      <ChatMentionSuggestions
+        contentWidth={contentWidth}
+        onSelect={onMentionSelect}
+        selectedIndex={mentionSelectedIndex}
+        suggestions={suggestions}
+      />
+
+      {!editingMessage && draftAttachments.length > 0 && (nativePaneChrome ? (
+        <DesktopChatAttachmentStrip
+          attachments={draftAttachments}
+          onRemove={onRemoveAttachment}
+          onRetry={onRetryAttachment}
+        />
+      ) : (
+        <TerminalChatAttachmentRows
+          attachments={draftAttachments}
+          width={contentWidth}
+          onRemove={onRemoveAttachment}
+          onRetry={onRetryAttachment}
+        />
+      ))}
+
+      {draftLinks.length > 0 && (nativePaneChrome ? (
+        <DesktopComposerPaneChips links={draftLinks} onOpen={onOpenDraftLink} onRemove={onRemoveDraftLink} />
+      ) : (
+        <TerminalComposerPaneChips links={draftLinks} width={contentWidth} onOpen={onOpenDraftLink} onRemove={onRemoveDraftLink} />
+      ))}
+
+      <MessageComposer
+        inputRef={inputRef}
+        initialValue={inputValueRef.current}
+        focused={inputFocused && focused}
+        placeholder={inputPlaceholder}
+        terminalPrefix=" > "
+        width={composerWidth}
+        height={composerHeight}
+        onFocusRequest={focusComposer}
+        onInput={commitLocalDraft}
+        onCursorChange={onMentionCursorChange}
+        keyBindings={[
+          { name: "return", action: "submit" },
+          { name: "linefeed", action: "submit" },
+          { name: "return", shift: true, action: "newline" },
+          { name: "linefeed", shift: true, action: "newline" },
+          { name: "return", meta: true, action: "submit" },
+          { name: "linefeed", meta: true, action: "submit" },
+        ]}
+        onSubmit={() => {
+          if (onMentionSelect()) return;
+          sendMessage();
+        }}
+        wrapText
+        accessory={nativePaneChrome && canAttach ? (
+          <DesktopChatAttachButton
+            onFiles={onAttachFiles}
+            pickerRef={attachPickerRef}
+          />
+        ) : undefined}
+      />
+    </>
+  );
+}
+
+export function getChatComposerAreaHeight({
+  canSend,
+  composerHeight,
+  editingMessage,
+  nativePaneChrome,
+  replyTo,
+  mentionSuggestionCount,
+  draftAttachmentCount = 0,
+  draftLinkCount = 0,
+  promptRows = 0,
+}: {
+  canSend: boolean;
+  composerHeight: number;
+  editingMessage: ChatMessage | null;
+  nativePaneChrome: boolean | undefined;
+  replyTo: ChatMessage | null;
+  mentionSuggestionCount?: number;
+  /** The terminal draws a row per waiting image; the desktop strip sizes itself. */
+  draftAttachmentCount?: number;
+  /** The same for waiting share links, which an edit shows too. */
+  draftLinkCount?: number;
+  /** Terminal rows the handle prompt above the composer takes. */
+  promptRows?: number;
+}) {
+  if (!canSend) return chatAuthPromptRows(nativePaneChrome);
+  return promptRows + getMessageComposerBlockHeight({ height: composerHeight, nativePaneChrome })
+    + (editingMessage || replyTo ? 1 : 0)
+    + Math.max(0, mentionSuggestionCount ?? 0)
+    + (!nativePaneChrome && !editingMessage ? draftAttachmentCount : 0)
+    + (!nativePaneChrome ? draftLinkCount : 0);
+}

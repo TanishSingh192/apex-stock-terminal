@@ -1,0 +1,305 @@
+import type { DataProvider } from "../types/data-provider";
+import type { Quote } from "../types/financials";
+import type { FormerIssuerRecord, TickerChangeHop, TickerChanges } from "../types/ticker-changes";
+import { isCryptoPairSymbol } from "../utils/crypto-pair";
+import { canonicalExchange, isUsListingExchange } from "../utils/exchanges";
+import { companyNameCase, sameCompany, shortCompanyName } from "./company-name";
+
+/**
+ * A symbol that changed (FB became META), as data for `--json`. `moved`: the
+ * issuer that held the symbol left it, so whatever lists under it now is a
+ * different security, and commands print `note`. `formerly`: the symbol's
+ * holder traded under another symbol before (METV was META); the user got
+ * what they typed, so nothing is printed.
+ */
+export interface TickerChange {
+  symbol: string;
+  kind: "moved" | "formerly";
+  /** The change in one line; printed for `moved` only (`tickerChangeLine`). */
+  note: string;
+  /** Each change, oldest first. */
+  changes: TickerChangeHop[];
+  /** moved: the symbol the issuer that left trades as now. */
+  tradesAs?: string;
+  /** moved: that issuer's name, when known. */
+  issuer?: string | null;
+  /** moved: what lists under the symbol today; null when nothing does. */
+  listed?: string | null;
+}
+
+/** What trades under the symbol now, as a command saw it: its name, and when it last traded. */
+export interface CurrentListing {
+  name?: string | null;
+  lastTraded?: number | null;
+}
+
+/** Where changes come from: the market data provider, which asks Gloom Cloud. */
+type TickerChangeSource = Pick<DataProvider, "getTickerChanges">;
+
+/** A lookup in flight: `settle` waits a little more for it, then gives up and stops the request. */
+export interface TickerChangeLookup {
+  settle(graceMs?: number): Promise<TickerChanges | null>;
+  /** Its answer once it has one, null when it failed or there is nothing to look up; undefined while it runs. */
+  peek(): TickerChanges | null | undefined;
+}
+
+/** A change whose company moved to another symbol (`movedAwayChange`). */
+export type MovedTickerChange = TickerChange & { tradesAs: string };
+
+/** How long a command waits for a note once its own answer is ready. */
+const TICKER_CHANGE_GRACE_MS = 200;
+/** The longest a lookup runs, for a caller that keeps waiting. */
+export const LOOKUP_TIMEOUT_MS = 5_000;
+/** A failed lookup is tried again after this, so a note comes back with the service. */
+const RETRY_FAILED_AFTER_MS = 60_000;
+/** A symbol the change history can hold: letters and digits, and a share class (BRK.B). */
+const PLAIN_SYMBOL = /^[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z0-9]{1,4})?$/;
+
+interface Entry {
+  promise: Promise<TickerChanges | null>;
+  controller: AbortController;
+  done: boolean;
+  value: TickerChanges | null;
+  failedAt: number | null;
+}
+
+/** One session's answers per source: a symbol is looked up once. */
+const sessions = new WeakMap<TickerChangeSource, Map<string, Entry>>();
+const NONE: TickerChangeLookup = { settle: async () => null, peek: () => null };
+
+/** A venue the change history is about: none named, a US exchange, or US over-the-counter. */
+export function isUsSymbolVenue(exchange?: string | null): boolean {
+  const venue = canonicalExchange(exchange ?? "");
+  return !venue || isUsListingExchange(venue) || venue.startsWith("OTC");
+}
+
+/**
+ * The symbol a change lookup is for: a plain one, bare or on a US venue. The
+ * history is of US listings; SAN:EPA, a future or a pair has none.
+ */
+export function tickerChangeSymbol(symbol: string, exchange?: string | null): string | null {
+  const plain = symbol.trim().toUpperCase();
+  return PLAIN_SYMBOL.test(plain) && !isCryptoPairSymbol(plain) && isUsSymbolVenue(exchange) ? plain : null;
+}
+
+/** A merged issuer as the service sent it; null for anything incomplete. */
+function readFormerIssuer(value: unknown): FormerIssuerRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<FormerIssuerRecord>;
+  const successor = record.successor;
+  if (typeof record.symbol !== "string" || typeof record.name !== "string" || !record.name.trim()
+    || typeof record.until !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(record.until)
+    || !successor || typeof successor.symbol !== "string" || !successor.symbol.trim()) return null;
+  return {
+    symbol: record.symbol,
+    name: record.name,
+    until: record.until.slice(0, 10),
+    successor: { symbol: successor.symbol.trim().toUpperCase(), name: typeof successor.name === "string" && successor.name.trim() ? successor.name : null },
+    source: typeof record.source === "string" && record.source ? record.source : null,
+  };
+}
+
+function readPayload(value: unknown): TickerChanges | null {
+  if (!value || typeof value !== "object") return null;
+  const payload = value as Partial<TickerChanges>;
+  if (typeof payload.symbol !== "string" || !Array.isArray(payload.changes)) return null;
+  const formerIssuer = readFormerIssuer(payload.formerIssuer);
+  return {
+    symbol: payload.symbol,
+    moved: payload.moved && Array.isArray(payload.moved.hops) && payload.moved.hops.length > 0 ? payload.moved : null,
+    formerly: Array.isArray(payload.formerly) && payload.formerly.length > 0 ? payload.formerly : null,
+    listedName: typeof payload.listedName === "string" && payload.listedName.trim() ? payload.listedName : null,
+    changes: payload.changes,
+    ...formerIssuer ? { formerIssuer } : {},
+  };
+}
+
+function entryFor(symbol: string, source: TickerChangeSource & Required<TickerChangeSource>): Entry {
+  let session = sessions.get(source);
+  if (!session) {
+    session = new Map();
+    sessions.set(source, session);
+  }
+  const cached = session.get(symbol);
+  if (cached && (cached.failedAt === null || Date.now() - cached.failedAt < RETRY_FAILED_AFTER_MS)) return cached;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS);
+  const entry: Entry = { promise: Promise.resolve(null), controller, done: false, value: null, failedAt: null };
+  entry.promise = source.getTickerChanges(symbol, { signal: controller.signal })
+    .then((payload) => entry.value = readPayload(payload))
+    .catch(() => {
+      entry.failedAt = Date.now();
+      return null;
+    })
+    .finally(() => {
+      entry.done = true;
+      clearTimeout(timer);
+    });
+  session.set(symbol, entry);
+  return entry;
+}
+
+/**
+ * Starts looking up a symbol's changes, beside the request that answers the
+ * command. Fails soft: offline, refused or slow means no note, and `settle`
+ * never holds the command up by more than its grace.
+ */
+export function startTickerChangeLookup(
+  source: TickerChangeSource | null | undefined,
+  symbol: string,
+  exchange?: string | null,
+): TickerChangeLookup {
+  const plain = tickerChangeSymbol(symbol, exchange);
+  if (!plain || !source?.getTickerChanges) return NONE;
+  const entry = entryFor(plain, source as Required<TickerChangeSource>);
+  return {
+    async settle(graceMs = TICKER_CHANGE_GRACE_MS) {
+      if (entry.done) return entry.promise;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<"late">((resolve) => {
+        timer = setTimeout(() => resolve("late"), graceMs);
+      });
+      const answer = await Promise.race([entry.promise, late]).finally(() => clearTimeout(timer));
+      if (answer !== "late") return answer;
+      // Given up: stop the request so nothing is left waiting on it.
+      entry.controller.abort();
+      return null;
+    },
+    peek: () => entry.done ? entry.value : undefined,
+  };
+}
+
+/** What a quote says trades under its symbol: the security's name and its last trade. */
+export function quotedListing(quote: Pick<Quote, "name" | "lastTradeTime" | "lastUpdated">): CurrentListing {
+  const last = Math.max(...[quote.lastTradeTime, quote.lastUpdated].filter((time): time is number => Number.isFinite(time)));
+  return { name: quote.name?.trim() || null, lastTraded: last > 0 ? last : null };
+}
+
+function day(date: string): number {
+  return Date.parse(`${date}T00:00:00Z`);
+}
+
+/** ", then MMATQ on 2024-08-21": each later hop of a chain. */
+function laterHops(hops: readonly TickerChangeHop[]): string {
+  return hops.slice(1).map((hop) => `, then ${hop.to} on ${hop.date}`).join("");
+}
+
+/**
+ * The line a command prints beside a symbol that changed: only when its
+ * company left it. Typing the symbol a company renamed into (META, METV) gets
+ * what was typed, so nothing extra.
+ */
+export function tickerChangeLine(change: TickerChange | null | undefined): string | null {
+  return change?.kind === "moved" ? change.note : null;
+}
+
+/**
+ * The change when the company that held the symbol trades under another now
+ * and nothing new lists under it (HFC became DINO): the symbol has no data of
+ * its own. Null for a symbol a new security took (FB lists a fund), one its
+ * holder renamed into (META), and one with no change.
+ */
+export function movedAwayChange(change: TickerChange | null | undefined): MovedTickerChange | null {
+  return change?.kind === "moved" && !change.listed && change.tradesAs ? { ...change, tradesAs: change.tradesAs } : null;
+}
+
+/**
+ * The note for a symbol's changes. `current` is what the command found
+ * trading under the symbol: null when nothing does, left out when it did not
+ * look. A quote that stopped before the change, or that names the issuer that
+ * left, is that issuer's old line rather than a new listing.
+ *
+ * "FB now lists ProShares S&P 500 Dynamic Daily Buffer ETF; FB was Meta Platforms before, now META (changed 2022-06-09)"
+ * "HFC became DINO on 2022-03-15"
+ * "METV was META until 2022-01-31" (data only: `tickerChangeLine` prints none)
+ */
+export function describeTickerChange(
+  typed: string,
+  payload: TickerChanges | null,
+  current?: CurrentListing | null,
+): TickerChange | null {
+  if (!payload) return null;
+  const symbol = typed.trim().toUpperCase();
+  const { moved, formerly } = payload;
+  if (moved) {
+    const [first] = moved.hops;
+    if (!first) return null;
+    // A name filed in capitals ("aTYR PHARMA INC") reads as it is written: aTyr Pharma.
+    const issuer = moved.name?.trim() ? shortCompanyName(companyNameCase(moved.name.trim())) : null;
+    const stillTheIssuer = !!current && (
+      (current.lastTraded != null && current.lastTraded < day(first.date))
+      || (!!current.name && !!moved.name && sameCompany(current.name, moved.name))
+    );
+    const listedHere = current === undefined ? payload.listedName !== null : current !== null && !stillTheIssuer;
+    const listed = listedHere ? current?.name?.trim() || payload.listedName || "another security" : null;
+    const when = moved.hops.length === 1
+      ? `changed ${first.date}`
+      : `changed to ${first.to} on ${first.date}${laterHops(moved.hops)}`;
+    // "LIFE now lists Ethos Technologies Inc.; LIFE was aTyr Pharma before, now ATYR (changed 2024-06-05)".
+    const note = listed
+      ? issuer
+        ? `${symbol} now lists ${listed}; ${symbol} was ${issuer} before, now ${moved.symbol} (${when})`
+        : `${symbol} now lists ${listed}; the former ${symbol} trades as ${moved.symbol} (${when})`
+      : `${symbol} became ${first.to} on ${first.date}${laterHops(moved.hops)}`;
+    return { symbol, kind: "moved", note, changes: moved.hops, tradesAs: moved.symbol, issuer, listed };
+  }
+  if (formerly) {
+    const [latest, ...earlier] = formerly;
+    if (!latest) return null;
+    const note = `${symbol} was ${latest.from} until ${latest.date}${earlier.map((hop) => `, and ${hop.from} until ${hop.date}`).join("")}`;
+    return { symbol, kind: "formerly", note, changes: [...formerly].reverse() };
+  }
+  return null;
+}
+
+/**
+ * The company that last held a symbol and merged into another one, as a
+ * command says it beside whatever lists under the symbol now: "GOGL was
+ * Golden Ocean Group until 2025, now Cmb.Tech: CMBT". `--json` carries it as
+ * `formerIssuer`, next to `tickerChange`.
+ */
+export interface FormerIssuer extends FormerIssuerRecord {
+  /** The line a command prints. */
+  note: string;
+}
+
+/** A line still trading this long after its company merged away is not that company's. */
+const MERGED_LINE_GRACE_MS = 7 * 24 * 60 * 60_000;
+
+/** BRK.B and BRK-B are one symbol. */
+function sameSymbol(left: string, right: string): boolean {
+  return left.trim().toUpperCase().replace(/-/g, ".") === right.trim().toUpperCase().replace(/-/g, ".");
+}
+
+/**
+ * The note for a symbol whose last issuer merged into another company.
+ * `current` is what the command found trading under the symbol: null when
+ * nothing does, left out when it did not look. Nothing when the company it
+ * merged into took the symbol or is what lists there now, or when what lists
+ * there is the merged company itself, trading well after the merger (the
+ * record is then not about this line).
+ */
+export function describeFormerIssuer(
+  typed: string,
+  payload: TickerChanges | null,
+  current?: CurrentListing | null,
+): FormerIssuer | null {
+  const record = payload?.formerIssuer;
+  if (!record) return null;
+  const symbol = typed.trim().toUpperCase();
+  const { successor } = record;
+  if (sameSymbol(successor.symbol, symbol) || sameCompany(current?.name, successor.name)) return null;
+  if (current?.name && sameCompany(current.name, record.name)
+    && current.lastTraded != null && current.lastTraded > day(record.until) + MERGED_LINE_GRACE_MS) return null;
+  return { ...record, note: formerIssuerLine(symbol, record, successor) };
+}
+
+/** "GOGL was Golden Ocean Group until 2025, now Cmb.Tech: CMBT": a merged issuer and the company it merged into. */
+export function formerIssuerLine(
+  symbol: string,
+  former: Pick<FormerIssuerRecord, "name" | "until">,
+  successor: { symbol: string; name?: string | null },
+): string {
+  const into = successor.name?.trim() ? `${shortCompanyName(successor.name)}: ${successor.symbol}` : successor.symbol;
+  return `${symbol} was ${shortCompanyName(former.name)} until ${former.until.slice(0, 4)}, now ${into}`;
+}

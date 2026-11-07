@@ -1,0 +1,1726 @@
+@keyframes gloom-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+html, body, #root { width: 100%; height: 100%; min-height: 100%; overflow: hidden; background: var(--gloom-bg, #272a34); }
+#root:focus { outline: none; }
+body {
+  --cell-w: 8px;
+  --cell-h: 18px;
+  --chrome-h: 20px;
+  /* Design tokens (src/theme/ui-tokens.ts, docs/pane-conventions.md "Tokens").
+     FONT+ sets --gloom-font-scale with the cell size. */
+  --gloom-font-scale: 1;
+  --gloom-type-caption: calc(10px * var(--gloom-font-scale));
+  --gloom-type-ui: calc(12px * var(--gloom-font-scale));
+  --gloom-type-body: calc(14px * var(--gloom-font-scale));
+  --gloom-type-heading: calc(16px * var(--gloom-font-scale));
+  --gloom-type-title: calc(20px * var(--gloom-font-scale));
+  --gloom-weight-regular: 400;
+  --gloom-weight-bold: 700;
+  --gloom-space-xs: 4px;
+  --gloom-space-sm: 8px;
+  --gloom-space-md: 12px;
+  --gloom-space-lg: 16px;
+  --gloom-space-xl: 24px;
+  --gloom-inset: var(--cell-w);
+  --gloom-radius-sm: 3px;
+  --gloom-radius-md: 6px;
+  --gloom-radius-lg: 8px;
+  --gloom-radius-full: 999px;
+  --gloom-hairline: color-mix(in srgb, var(--gloom-text) 14%, transparent);
+  --gloom-hover-fill: color-mix(in srgb, var(--gloom-text-bright) 8%, transparent);
+  --gloom-band: color-mix(in srgb, var(--gloom-text-bright) 3.5%, transparent);
+  --gloom-elevation: 0 12px 32px color-mix(in srgb, var(--gloom-bg) 48%, transparent);
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: var(--cell-h);
+  color: var(--gloom-text, #f2f2f2);
+  cursor: default;
+  /* The app is chrome, not a document: no text is selectable until it says so
+     (see "Selectable text" below). WebKit, the macOS app's WKWebView and
+     Safari, only knows the prefixed property and ignores the plain one, so every
+     user-select in this file and in the host is written with both. */
+  -webkit-user-select: none;
+  user-select: none;
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
+}
+* { box-sizing: border-box; }
+#root > * { height: 100%; min-height: 100%; }
+input, textarea, button { font: inherit; }
+/* Inherited "none" would also stop WebKit from typing into a field. */
+input, textarea, [contenteditable]:not([contenteditable="false"]) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+input, textarea { cursor: text; }
+/* One placeholder colour for every field (ui-tokens placeholderColour). A
+   field on a surface of its own, such as the command bar's prompt, sets
+   --gloom-placeholder to the same role lifted for that surface. */
+input::placeholder, textarea::placeholder { color: var(--gloom-placeholder); opacity: 1; }
+/* Selectable text: what a person may want to copy by hand. A host Text takes
+   the selectable prop; a block of text (a reader, markdown, a chat message, a
+   log) carries this attribute on its container, and everything inside it that
+   does not say otherwise can be selected. */
+[data-gloom-selectable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+button, [data-gloom-interactive="true"] { cursor: pointer; }
+/* Ghost and secondary buttons are clear and take the hover fill, a translucent
+   wash that reads the same on the sidebar, a pane body and the status bar;
+   filled ones keep their fill (control-styles.ts, buttonPalette). */
+[data-gloom-role="desktop-button"] { background-color: transparent; }
+[data-gloom-role="desktop-button"]:is([data-gloom-variant="plain"], [data-gloom-variant="ghost"], [data-gloom-variant="secondary"]):not(:disabled):not([aria-pressed="true"]):hover {
+  background-color: var(--gloom-hover-fill);
+}
+/* Quiet quick actions take the same wash, over a chosen one's fill too. */
+[data-gloom-role="desktop-button"][data-gloom-variant="quiet"]:not(:disabled):hover {
+  background-color: var(--gloom-hover-fill) !important;
+}
+[data-gloom-hover-bg="true"]:hover {
+  background-color: var(--gloom-box-hover-bg) !important;
+}
+[data-gloom-role="data-table-row"]:not([data-selected="true"]):hover,
+[data-gloom-role="data-table-row"]:not([data-selected="true"]):hover > [data-gloom-role="data-table-cell"] {
+  background-color: var(--gloom-hover-bg) !important;
+}
+[data-gloom-role="pane-window"] {
+  background-clip: padding-box;
+  isolation: isolate;
+}
+[data-gloom-role="detached-pane-window"] {
+  border: 0;
+  box-shadow: none;
+  background-clip: padding-box;
+}
+[data-gloom-role="app-header"][data-titlebar-overlay="true"],
+.electrobun-webkit-app-region-drag {
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+[data-titlebar-overlay="true"] {
+  min-height: __TITLEBAR_OVERLAY_HEIGHT_PX__px;
+  max-height: __TITLEBAR_OVERLAY_HEIGHT_PX__px;
+  align-items: center;
+}
+[data-titlebar-overlay="true"] * {
+  cursor: inherit;
+}
+/* A row of text grows with the text size and the title bar does not: at the
+   largest sizes the top bar's buttons and prompt would stand out of it. */
+[data-gloom-role="app-header"][data-titlebar-overlay="true"] button,
+[data-gloom-role="app-header"][data-titlebar-overlay="true"] [role="button"] {
+  max-height: __TITLEBAR_OVERLAY_HEIGHT_PX__px;
+}
+[data-titlebar-overlay="true"] button,
+[data-titlebar-overlay="true"] input,
+[data-titlebar-overlay="true"] textarea,
+[data-titlebar-overlay="true"] a,
+[data-titlebar-overlay="true"] .electrobun-webkit-app-region-no-drag,
+[data-titlebar-overlay="true"] [data-gloom-interactive="true"] {
+  cursor: pointer;
+}
+[data-gloom-role="window-controls"] {
+  height: 100%;
+  color: var(--gloom-header-text, #f2f2f2);
+}
+[data-gloom-role="window-control"] {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--gloom-header-text, #f2f2f2) 86%, transparent);
+  cursor: pointer;
+  transition: background-color 90ms linear, color 90ms linear;
+}
+[data-gloom-role="window-control"] svg {
+  display: block;
+  pointer-events: none;
+}
+[data-gloom-role="window-control"]:hover {
+  background: color-mix(in srgb, var(--gloom-header-text, #f2f2f2) 13%, transparent);
+  color: var(--gloom-header-text, #f2f2f2);
+}
+[data-gloom-role="window-control"][data-window-control-action="close"]:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+[data-gloom-role="pane-window"][data-floating="true"] {
+  border: 0;
+  border-radius: var(--gloom-radius-md);
+  overflow: hidden;
+  /* A floating pane is a floating surface: the one elevation. */
+  box-shadow: var(--gloom-elevation);
+}
+[data-gloom-role="pane-window"][data-floating="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--pane-border-color, var(--gloom-border));
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 100;
+}
+[data-gloom-role="pane-window"][data-floating="true"][data-window-mode-selected="true"] {
+  box-shadow:
+    var(--gloom-elevation),
+    0 0 0 2px var(--gloom-border-focused),
+    0 0 0 5px color-mix(in srgb, var(--gloom-border-focused) 28%, transparent);
+}
+[data-gloom-role="pane-window"][data-floating="true"][data-window-mode-selected="true"]::after {
+  border-color: var(--gloom-border-focused);
+  border-width: 2px;
+}
+[data-gloom-role="pane-window"][data-floating="false"] {
+  border: 0;
+  border-radius: 0;
+}
+/* Docked panes sit a small gap apart (the shell's dock geometry). Each one
+   rules the sides that face another pane across it, in the colour of the line
+   that ran between them, so the gap reads in every theme. */
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 0 solid var(--gloom-border);
+  pointer-events: none;
+  z-index: 100;
+}
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="left"]::after { border-left-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="right"]::after { border-right-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="top"]::after { border-top-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="bottom"]::after { border-bottom-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-focused="true"] {
+  box-shadow: inset 0 0 0 1px var(--pane-border-color, var(--gloom-border-focused));
+}
+[data-gloom-role="pane-window"][data-floating="false"][data-window-mode-selected="true"] {
+  box-shadow:
+    inset 0 0 0 3px var(--gloom-border-focused),
+    inset 0 0 0 6px color-mix(in srgb, var(--gloom-border-focused) 22%, transparent);
+}
+[data-gloom-role="pane-header"] {
+  align-items: center;
+  padding-inline: 7px;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+[data-gloom-role="pane-header"][data-drag-surface="pane"] {
+  cursor: grab;
+}
+[data-gloom-role="pane-header-tabs"] {
+  cursor: default;
+}
+[data-gloom-role="pane-header"] [data-gloom-role="tab-button"],
+[data-gloom-role="pane-header"] button,
+[data-gloom-role="pane-header"] [data-gloom-interactive="true"] {
+  cursor: pointer;
+}
+[data-gloom-role="pane-header"][data-window-mode-selected="true"] {
+  background: color-mix(in srgb, var(--gloom-border-focused) 24%, var(--gloom-panel)) !important;
+}
+[data-gloom-role="pane-action"],
+[data-gloom-role="pane-close"],
+[data-gloom-role="pane-restore"] {
+  cursor: pointer;
+}
+/* Up for the length of a drag (see drag-shield.ts): the grabbing cursor
+   everywhere, and no hover under the pointer. */
+[data-gloom-role="drag-shield"] {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  cursor: grabbing;
+}
+/* Surfaces that drag a pane, its size or a split keep the whole pointer
+   stream: a touch or pen press on them never starts a pan or zoom. */
+[data-gloom-role="pane-header"][data-drag-surface="pane"],
+[data-gloom-role="resize-handle"],
+[data-gloom-role="resize-edge"],
+[data-gloom-role="dock-divider"] {
+  touch-action: none;
+}
+[data-gloom-role="pane-title"] {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A list row out of view keeps its width until a live resize ends (resize-rows.ts).
+   Not inherited: setting it on a row does not restyle everything inside the row. */
+@property --gloom-resize-held-width {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+[data-gloom-resize-held] {
+  width: var(--gloom-resize-held-width) !important;
+}
+/* A row's hover band is painted from the chat's own state (data-hovered), not
+   :hover, so it can be dropped when the list scrolls or fills under a pointer
+   that did not move. Its actions show with it. */
+[data-gloom-role="chat-message-reply-action"] {
+  opacity: 0;
+  pointer-events: none;
+}
+[data-gloom-role="chat-message"][data-hovered="true"] [data-gloom-role="chat-message-reply-action"],
+[data-gloom-role="chat-message"][data-selected="true"] [data-gloom-role="chat-message-reply-action"],
+[data-gloom-role="chat-message-reply-action"][data-picker-open="true"] {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* The message a notification pointed at: marked, then fading out to its own
+   background (an announcement's band, or none). */
+[data-gloom-role="chat-message"][data-highlighted="true"] [data-gloom-role="chat-message-row"] {
+  animation: gloom-chat-highlight 2s ease-out forwards;
+}
+@keyframes gloom-chat-highlight {
+  from { background-color: var(--chat-highlight-bg); }
+  to { background-color: var(--chat-highlight-rest, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-gloom-role="chat-message"][data-highlighted="true"] [data-gloom-role="chat-message-row"] {
+    animation: none;
+  }
+}
+[data-gloom-role="chat-message-image"]:focus-visible {
+  outline: 2px solid var(--gloom-border-focused, currentColor);
+  outline-offset: 1px;
+}
+/* An upload whose progress the transport cannot report. */
+.gloom-chat-upload-indeterminate {
+  animation: gloom-chat-upload-slide 1.2s ease-in-out infinite;
+}
+@keyframes gloom-chat-upload-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gloom-chat-upload-indeterminate {
+    animation: none;
+    width: 100% !important;
+    opacity: 0.5;
+  }
+}
+/* The image viewer may use the whole window, not a dialog's usual width. */
+.gloom-dialog:has([data-gloom-role="chat-image-lightbox"]) {
+  max-width: calc(100vw - 48px);
+}
+[data-gloom-role="status-bar"] {
+  flex: none;
+  height: var(--cell-h);
+  align-items: center;
+  border-top: 1px solid var(--gloom-hairline);
+  font-size: var(--gloom-type-ui);
+}
+[data-gloom-role="status-bar"] span {
+  line-height: var(--cell-h);
+}
+[data-gloom-role="pane-body"] {
+  overflow: hidden;
+}
+[data-gloom-role="pane-content"] {
+  overflow: hidden;
+}
+/* A pane shown as a view inside another pane (Fixed Income's sections) gets
+   its space the way a pane gets the pane's: the host's bars are taller than
+   the rows the view was given, so its root never runs past the host's box. */
+[data-gloom-role="pane-content"] > *,
+[data-gloom-role="nested-pane-content"] > * {
+  min-width: 0;
+  min-height: 0;
+  max-height: 100%;
+}
+/* A chart or heat map takes the space its box gives it rather than the whole
+   cells it was given (host/surface-fit.ts): a fill at rest, and, while a
+   resize is under way, the boxes up to the pane that are exactly the space
+   their parent gives them follow the frame the same way. */
+[data-gloom-fill-x="stretch"], [data-gloom-follow-x="stretch"] {
+  width: auto !important;
+  align-self: stretch !important;
+}
+[data-gloom-fill-x="grow"], [data-gloom-follow-x="grow"] {
+  flex: 1 1 0px !important;
+  width: auto !important;
+  min-width: 0 !important;
+}
+[data-gloom-fill-y="stretch"], [data-gloom-follow-y="stretch"] {
+  height: auto !important;
+  align-self: stretch !important;
+}
+[data-gloom-fill-y="grow"], [data-gloom-follow-y="grow"] {
+  flex: 1 1 0px !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+/* A chart whose time axis reaches a floating pane's resize grip keeps its
+   last label clear of it. */
+[data-gloom-grip-clear] [data-gloom-role="chart-time-axis"] [data-gloom-edge="end"] {
+  right: calc(2 * var(--cell-w)) !important;
+}
+[data-gloom-grip-clear] [data-gloom-role="chart-time-axis"] [data-gloom-edge="end-segment"] {
+  padding-right: calc(2 * var(--cell-w)) !important;
+}
+/* The same chrome row as the pane header, query bar and table header. */
+[data-gloom-role="pane-footer"] {
+  flex: 0 0 var(--chrome-h);
+  height: var(--chrome-h);
+  min-height: var(--chrome-h);
+  max-height: var(--chrome-h);
+  align-items: center;
+  border-top: 1px solid var(--pane-footer-border-color, var(--gloom-hairline));
+  font-size: var(--gloom-type-ui);
+  overflow: hidden;
+}
+[data-gloom-role="pane-footer"][data-empty="true"] {
+  border-top-color: transparent;
+}
+[data-gloom-role="pane-footer"] span {
+  line-height: var(--cell-h);
+}
+[data-gloom-role="resize-handle"] {
+  cursor: nwse-resize;
+}
+/* The invisible strips around a floating pane that resize it from any edge or corner. */
+[data-gloom-role="resize-edge"][data-edge="left"],
+[data-gloom-role="resize-edge"][data-edge="right"] {
+  cursor: ew-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top"],
+[data-gloom-role="resize-edge"][data-edge="bottom"] {
+  cursor: ns-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top-left"],
+[data-gloom-role="resize-edge"][data-edge="bottom-right"] {
+  cursor: nwse-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top-right"],
+[data-gloom-role="resize-edge"][data-edge="bottom-left"] {
+  cursor: nesw-resize;
+}
+[data-gloom-role="window-mode-status"] {
+  border: 1px solid color-mix(in srgb, var(--gloom-border-focused) 76%, transparent);
+  border-radius: var(--gloom-radius-lg);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--gloom-border-focused) 95%, var(--gloom-bg) 5%),
+      color-mix(in srgb, var(--gloom-border-focused) 82%, var(--gloom-bg) 18%)
+    ) !important;
+  box-shadow: var(--gloom-elevation);
+  overflow: hidden;
+}
+[data-gloom-role="window-mode-status"] span {
+  line-height: var(--cell-h);
+}
+[data-gloom-role="window-mode-corner"] {
+  border-radius: var(--gloom-radius-sm);
+  box-shadow:
+    0 0 0 1px var(--gloom-bg),
+    0 0 0 4px color-mix(in srgb, var(--gloom-border-focused) 28%, transparent);
+  pointer-events: none;
+}
+/* Heat map tiles animate only transforms and opacity, which the compositor
+   runs on its own: a tile sliding from its old place after a relayout, the
+   previous colour fading out over the new one, and a light flash on a tile
+   whose move just jumped. */
+@keyframes gloom-heat-glide-a {
+  from { transform: translate(var(--heat-glide-x, 0), var(--heat-glide-y, 0)); }
+  to { transform: none; }
+}
+@keyframes gloom-heat-glide-b {
+  from { transform: translate(var(--heat-glide-x, 0), var(--heat-glide-y, 0)); }
+  to { transform: none; }
+}
+@keyframes gloom-heat-fade {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes gloom-heat-pulse {
+  0%, 100% { opacity: 0; }
+  30% { opacity: 0.16; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-gloom-role="heat-tile"],
+  [data-gloom-role="heat-tile"] * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+[data-gloom-role="chart-surface"] {
+  cursor: crosshair;
+}
+[data-gloom-role="tab-list"] {
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+[data-gloom-role="tab-list"]::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+[data-gloom-role="tab-button"] {
+  all: unset;
+  box-sizing: border-box;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-gloom-role="tab-button"] {
+    --tab-reorder-duration: 0ms;
+  }
+}
+/* One tab everywhere: title-bar tabs, sub-tabs, segmented choices and the
+   query bar's inline choices. Text only, no box: inactive dim, hovered the
+   text colour with a faint underline, active bright and bold on a 2px accent
+   underline. Keyboard focus is the hover look. */
+[data-gloom-role="tab-button"] {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--gloom-space-xs);
+  height: 100%;
+  padding: 0 var(--gloom-space-sm);
+  font-size: var(--gloom-type-ui);
+  font-weight: var(--gloom-weight-regular);
+  line-height: 1;
+  white-space: nowrap;
+  color: var(--tab-fg, var(--gloom-text-dim));
+  background: transparent;
+  border-radius: 0;
+  transition: color 110ms ease;
+}
+[data-gloom-role="tab-button"]::after {
+  content: "";
+  position: absolute;
+  left: var(--gloom-space-sm);
+  right: var(--gloom-space-sm);
+  bottom: 0;
+  height: 2px;
+  background: var(--gloom-accent);
+  opacity: 0;
+  transition: opacity 110ms ease;
+}
+[data-gloom-role="tab-button"][data-dense="true"] { padding: 0 var(--gloom-space-xs); }
+[data-gloom-role="tab-button"][data-dense="true"]::after { left: var(--gloom-space-xs); right: var(--gloom-space-xs); }
+[data-gloom-role="tab-button"]:not([data-active="true"]):not(:disabled):is(:hover, :focus-visible) {
+  color: var(--gloom-text);
+}
+[data-gloom-role="tab-button"]:not([data-active="true"]):not(:disabled):is(:hover, :focus-visible)::after {
+  opacity: 0.35;
+}
+[data-gloom-role="tab-button"][data-active="true"] {
+  color: var(--tab-active-fg, var(--gloom-text-bright));
+  font-weight: var(--gloom-weight-bold);
+}
+[data-gloom-role="tab-button"][data-active="true"]::after { opacity: 1; }
+[data-gloom-role="tab-button"]:disabled { color: var(--gloom-text-muted); cursor: default; }
+[data-gloom-role="tab-button"]:focus-visible { outline: none; }
+/* Title-bar tabs: the same text, sizes and colours, drawn as raised boxes
+   instead of underlines. The active tab is a box with rounded top corners,
+   open at the bottom: its top and sides in the header rule's colour (the
+   accent while the pane is focused), its fill the surface under it, laid over
+   the rule so it opens into the pane. An inactive tab takes the hover fill in
+   the same shape. The pane header sets the colours (pane/header.tsx). */
+[data-gloom-role="tab-list"][data-gloom-variant="header"] {
+  /* Header colour left above a box, and the box's line: the header rule's width. */
+  --pane-tab-top-gap: 2px;
+  --pane-tab-rule: 1px;
+}
+[data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"] {
+  height: calc(100% - var(--pane-tab-top-gap));
+  /* The sides take their line from the padding, so a label sits where it
+     would without the box. The gap and the top line push the label down; the
+     bottom padding lifts it back onto the header's centre line, halfway
+     between its top rule (a divider or a floating border, when there is one)
+     and its bottom rule, where the title sits. */
+  padding: 0 calc(var(--gloom-space-sm) - var(--pane-tab-rule)) calc(var(--pane-tab-top-gap) + 2 * var(--pane-tab-rule) - var(--pane-tab-top-inset, 0px));
+  border: var(--pane-tab-rule) solid transparent;
+  border-bottom: 0;
+  border-radius: var(--gloom-radius-md) var(--gloom-radius-md) 0 0;
+  /* The line lies on the bar, as the rule does, so a translucent hairline is
+     the same colour on both. */
+  background-clip: padding-box;
+}
+[data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"]::after { content: none; }
+[data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"][data-active="true"] {
+  background-color: var(--pane-tab-active-bg, var(--gloom-bg));
+  border-color: var(--pane-tab-border, var(--gloom-hairline));
+}
+[data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"]:not([data-active="true"]):not(:disabled):is(:hover, :focus-visible, [data-drag-target="true"]) {
+  background-color: var(--gloom-hover-fill);
+}
+/* A tab's close mark stays inside the box: in a 20px title bar the box is
+   shorter than the icon button, whose fill would cover the box's top line. */
+[data-gloom-role="tab-list"][data-gloom-variant="header"] [data-gloom-role="tab-close"] {
+  max-height: 100%;
+}
+/* A tab's close mark and a strip's plus are the icon button: 20 by 18, the control radius, the hover fill. */
+[data-gloom-role="tab-add"] {
+  border: 0;
+  background: transparent;
+  font: inherit;
+  margin-inline-start: var(--gloom-space-xs);
+}
+[data-gloom-role="tab-add"]:focus-visible { outline: none; background: var(--gloom-hover-fill); }
+[data-gloom-role="tab-add"],
+[data-gloom-role="tab-close"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 var(--gloom-space-xs);
+  box-sizing: border-box;
+  cursor: pointer;
+  border-radius: var(--gloom-radius-md);
+  color: var(--gloom-text-muted);
+}
+[data-gloom-role="tab-add"]:hover,
+[data-gloom-role="tab-close"]:hover {
+  background: var(--gloom-hover-fill);
+  color: var(--gloom-text-bright);
+}
+[data-gloom-scrollbar-x],
+[data-gloom-scrollbar-y] {
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+}
+[data-gloom-scrollbar-active="true"] {
+  scrollbar-color: color-mix(in srgb, var(--gloom-text) 26%, transparent) transparent;
+}
+[data-gloom-scrollbar-x]::-webkit-scrollbar,
+[data-gloom-scrollbar-y]::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  background: transparent;
+}
+[data-gloom-scrollbar-x]::-webkit-scrollbar-track,
+[data-gloom-scrollbar-y]::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-gloom-scrollbar-x]::-webkit-scrollbar-thumb,
+[data-gloom-scrollbar-y]::-webkit-scrollbar-thumb {
+  min-width: 24px;
+  min-height: 24px;
+  border: 2px solid transparent;
+  border-radius: var(--gloom-radius-full);
+  background: transparent;
+  background-clip: content-box;
+}
+[data-gloom-scrollbar-x]::-webkit-scrollbar-thumb:hover,
+[data-gloom-scrollbar-y]::-webkit-scrollbar-thumb:hover {
+  background: transparent;
+  background-clip: content-box;
+}
+[data-gloom-scrollbar-active="true"]::-webkit-scrollbar-thumb,
+[data-gloom-scrollbar-active="true"]::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--gloom-text) 24%, transparent);
+  background-clip: content-box;
+}
+[data-gloom-scrollbar-x]::-webkit-scrollbar-corner,
+[data-gloom-scrollbar-y]::-webkit-scrollbar-corner {
+  background: transparent;
+}
+[data-gloom-scrollbar-x="hidden"]:not([data-gloom-scrollbar-y="visible"]),
+[data-gloom-scrollbar-y="hidden"]:not([data-gloom-scrollbar-x="visible"]) {
+  scrollbar-width: none;
+}
+[data-gloom-scrollbar-x="hidden"]::-webkit-scrollbar:horizontal {
+  height: 0;
+  display: none;
+}
+[data-gloom-scrollbar-y="hidden"]::-webkit-scrollbar:vertical {
+  width: 0;
+  display: none;
+}
+[data-gloom-role="resize-handle"]::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 9px;
+  height: 9px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  opacity: .7;
+}
+/* Controls a surface shows only while the pointer is over it or the keyboard
+   is in it (a chart legend's fold, its tool bar's), so at rest it draws as it
+   always has. */
+[data-gloom-reveal-scope]:not(:hover):not(:focus-within) [data-gloom-reveal="hover"] {
+  display: none !important;
+}
+/* The line between two chart panels: drawn while the pointer is on it or
+   drags it, in the accent a pane sidebar's divider takes. */
+[data-gloom-role="composite-chart-panel-divider"] {
+  cursor: row-resize;
+}
+[data-gloom-role="composite-chart-panel-divider"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--gloom-accent);
+  opacity: 0;
+}
+[data-gloom-role="composite-chart-panel-divider"]:is(:hover, [data-active="true"])::before {
+  opacity: 1;
+}
+[data-gloom-role="dock-divider"] {
+  background: transparent !important;
+}
+/* Where a moving pane can land and where it will: one look for all of it
+   (shell/drag/drop-zones.ts, shell/drag/overlays.tsx). The accent outlines a
+   tint of itself, 12% at rest and 40% under the pointer. The landing preview
+   is the exact rectangle the pane takes (a split, a tab, an edge of the
+   layout, a floating window's tab or half, window mode's keyboard move),
+   see-through so the panes under it still show. A strip along each edge of
+   the window is see-through too, and thinner. A square of the target on the
+   pane under the pointer sits raised and opaque over it. */
+[data-gloom-role="drop-preview"],
+[data-gloom-role="window-mode-drop-preview"],
+[data-gloom-role="drop-strip"],
+[data-gloom-role="drop-zone"] {
+  --drop-tint: 12%;
+  --drop-under: transparent;
+  border: 2px solid var(--gloom-accent);
+  border-radius: var(--gloom-radius-md);
+  background: color-mix(in srgb, var(--gloom-accent) var(--drop-tint), var(--drop-under));
+}
+[data-gloom-role="drop-strip"] {
+  border-width: 1px;
+  border-radius: var(--gloom-radius-sm);
+}
+[data-gloom-role="drop-zone"] {
+  --drop-under: var(--gloom-bg);
+  box-shadow: var(--gloom-elevation);
+}
+[data-gloom-role="drop-strip"][data-active="true"],
+[data-gloom-role="drop-zone"][data-active="true"] {
+  --drop-tint: 40%;
+}
+/* Inside a square, the part of the pane the moving one takes: all of it for a tab, a half for a side. */
+[data-gloom-role="drop-zone"]::before {
+  content: "";
+  position: absolute;
+  inset: var(--gloom-space-xs);
+  border-radius: var(--gloom-radius-sm);
+  background: var(--gloom-accent);
+  opacity: .5;
+}
+[data-gloom-role="drop-zone"][data-side="left"]::before { right: 50%; }
+[data-gloom-role="drop-zone"][data-side="right"]::before { left: 50%; }
+[data-gloom-role="drop-zone"][data-side="top"]::before { bottom: 50%; }
+[data-gloom-role="drop-zone"][data-side="bottom"]::before { top: 50%; }
+[data-gloom-role="drop-zone"][data-active="true"]::before { opacity: 1; }
+/* The gap between the panes is the divider at rest; its line shows while it
+   is dragged or resized from the keyboard. */
+[data-gloom-role="dock-divider"]::before {
+  content: "";
+  position: absolute;
+  background: var(--divider-color);
+  opacity: 0;
+}
+[data-gloom-role="dock-divider"][data-active="true"]::before {
+  opacity: .9;
+}
+[data-gloom-role="dock-divider"][data-axis="horizontal"] {
+  cursor: col-resize;
+}
+[data-gloom-role="dock-divider"][data-axis="horizontal"]::before {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+[data-gloom-role="dock-divider"][data-axis="vertical"] {
+  cursor: row-resize;
+}
+[data-gloom-role="dock-divider"][data-axis="vertical"]::before {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+}
+/* The frame a launch draws before the app is up (boot-frame.ts): the last
+   layout's chrome with empty panes, or the bare header and status bar. It
+   covers the app until the app has drawn its own layout. The page sets the
+   theme's colours before drawing it, so it needs no fallbacks. */
+#gloom-boot-frame {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  overflow: hidden;
+  pointer-events: none;
+  background: var(--gloom-bg);
+}
+#gloom-boot-frame[data-gloom-boot-frame="layout"] > * { height: 100%; min-height: 100%; }
+#gloom-boot-frame [data-gloom-role="pane-body"] { position: relative; }
+/* Lines of text still to come, faint enough to read as the pane's shape:
+   one bar every line of text (lh), half a line thick. */
+#gloom-boot-frame [data-gloom-role="pane-body"]::before {
+  content: "";
+  position: absolute;
+  inset: var(--gloom-space-sm) var(--gloom-inset);
+  background: repeating-linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--gloom-text-muted) 10%, transparent) 0 0.5lh,
+    transparent 0.5lh 1lh
+  );
+  -webkit-mask-image: linear-gradient(to right, var(--gloom-bg) 40%, transparent 80%), linear-gradient(to bottom, var(--gloom-bg) 30%, transparent 90%);
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(to right, var(--gloom-bg) 40%, transparent 80%), linear-gradient(to bottom, var(--gloom-bg) 30%, transparent 90%);
+  mask-composite: intersect;
+}
+/* Where the app draws its own: the app's column runs a hairline taller than
+   the window and sits scrolled by it, so its header shows one pixel short and
+   its status bar ends a pixel above the bottom. The shell sits the same, and
+   nothing moves when the app takes over. */
+.gloom-boot-header, .gloom-boot-status {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+/* Every desktop and web window draws its header as the title bar. */
+.gloom-boot-header {
+  top: -1px;
+  height: __TITLEBAR_OVERLAY_HEIGHT_PX__px;
+  background: var(--gloom-header);
+}
+/* One line of text tall, as the status bar is, its hairline inside it. */
+.gloom-boot-status {
+  bottom: 1px;
+  box-shadow: inset 0 1px 0 var(--gloom-hairline);
+  background: var(--gloom-panel);
+}
+.gloom-boot-status::before { content: "\200b"; }
+.gloom-loading, .gloom-fatal {
+  padding: 24px;
+  color: var(--gloom-text, #f2f2f2);
+  background: var(--gloom-bg, #272a34);
+}
+.gloom-fatal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+}
+.gloom-fatal h1 {
+  margin: 0 0 6px;
+  font-size: 28px;
+  line-height: 1.25;
+}
+.gloom-fatal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.gloom-fatal button {
+  border: 1px solid var(--gloom-border, #5b6070);
+  border-radius: 6px;
+  padding: 5px 10px;
+  color: var(--gloom-text, #f2f2f2);
+  background: var(--gloom-panel, #1f222b);
+}
+.gloom-fatal button:hover {
+  background: color-mix(in srgb, var(--gloom-text-bright, #fff) 10%, var(--gloom-panel, #1f222b));
+}
+.gloom-fatal button[data-variant="primary"] {
+  border-color: var(--gloom-border-focused, #8cb4ff);
+  color: var(--gloom-bg, #111318);
+  background: var(--gloom-border-focused, #8cb4ff);
+}
+.gloom-fatal-status {
+  min-height: var(--cell-h);
+  color: var(--gloom-text-dim, #a7acba);
+}
+.gloom-fatal pre {
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--gloom-negative, #ff5f5f);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.gloom-toast-viewport {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  width: min(380px, calc(100vw - 32px));
+  flex-direction: column;
+  gap: var(--gloom-space-sm);
+  pointer-events: none;
+  z-index: 10000;
+}
+.gloom-toast {
+  --gloom-toast-accent: var(--gloom-border-focused);
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  align-items: start;
+  width: 100%;
+  padding: var(--gloom-space-md);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--gloom-toast-accent) 54%, var(--gloom-control-border));
+  border-radius: var(--gloom-radius-lg);
+  background: var(--gloom-surface-raised);
+  color: var(--gloom-text);
+  box-shadow: var(--gloom-elevation);
+  pointer-events: auto;
+}
+.gloom-toast[data-type="success"] { --gloom-toast-accent: var(--gloom-positive); }
+.gloom-toast[data-type="error"] { --gloom-toast-accent: var(--gloom-negative); }
+.gloom-toast[data-actionable="true"] {
+  cursor: pointer;
+  transition: transform 120ms cubic-bezier(0.23, 1, 0.32, 1), border-color 120ms ease, background-color 120ms ease;
+}
+.gloom-toast[data-actionable="true"]:active { transform: scale(0.985); }
+.gloom-toast-indicator {
+  grid-area: 1 / 1;
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--gloom-toast-accent);
+}
+.gloom-toast-heading {
+  grid-area: 1 / 2;
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+}
+.gloom-toast-title {
+  flex: none;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--gloom-text-bright);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gloom-toast-subtitle {
+  overflow: hidden;
+  color: var(--gloom-text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gloom-toast-body {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--gloom-text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+/* With a heading, the controls share its row and the body runs under them. */
+.gloom-toast-heading + .gloom-toast-body { grid-column: 2 / -1; }
+.gloom-toast-controls {
+  grid-area: 1 / 3;
+  display: flex;
+  align-items: center;
+  gap: var(--gloom-space-xs);
+}
+@media (hover: hover) and (pointer: fine) {
+  .gloom-toast[data-actionable="true"]:hover {
+    border-color: var(--gloom-toast-accent);
+    background: color-mix(in srgb, var(--gloom-surface-raised) 88%, var(--gloom-toast-accent));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gloom-toast[data-actionable="true"] { transition: none; }
+  .gloom-toast[data-actionable="true"]:active { transform: none; }
+}
+/* The dialog takes focus only so its content can; its controls show their own rings. */
+.gloom-dialog:focus {
+  outline: none;
+}
+.gloom-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--gloom-bg) 64%, transparent);
+  z-index: 9999;
+}
+.gloom-dialog {
+  max-width: min(920px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid var(--gloom-control-border);
+  border-radius: var(--gloom-radius-lg);
+  background: var(--gloom-surface-raised);
+  color: var(--gloom-text);
+  padding: 0;
+  box-shadow: var(--gloom-elevation);
+}
+.gloom-popover-anchor {
+  display: inline-flex;
+  min-width: 0;
+  outline: none;
+}
+.gloom-popover {
+  position: fixed;
+  z-index: 10001;
+  max-height: min(420px, calc(100vh - 20px));
+  overflow: auto;
+  border: 1px solid var(--gloom-control-border);
+  border-radius: var(--gloom-radius-lg);
+  padding: var(--gloom-space-sm);
+  outline: none;
+  background: var(--gloom-surface-raised);
+  box-shadow: var(--gloom-elevation);
+}
+/* Chart screenshot watermark: mounted by every chart, revealed together by
+   html[data-gloom-screenshot] (pane capture, OS screenshot chords, CLI shots). */
+[data-gloom-role="chart-watermark"] {
+  visibility: hidden;
+  pointer-events: none;
+  opacity: 0.1;
+}
+html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
+  visibility: visible;
+}
+
+/* Query bar: search, filters and a view switch above a list. One faint band;
+   controls sit flush, split by hairlines, and a filter that narrows the list is
+   tinted with an accent base line. The row scrolls sideways when the pane is
+   narrower than its controls. */
+.gloom-qb {
+  --qb-hairline: var(--gloom-hairline);
+  --qb-fill: var(--gloom-hover-fill);
+  --qb-accent-fill: color-mix(in srgb, var(--gloom-border-focused) 18%, transparent);
+  --qb-label: color-mix(in srgb, var(--gloom-text) 58%, transparent);
+  /* 20px at the default font size, whole pixels at every size. The bottom
+     padding keeps the controls clear of the hairline, so they centre between
+     the header rule above and the hairline below. */
+  height: var(--chrome-h);
+  padding-bottom: 1px;
+  flex-shrink: 0;
+  min-width: 0;
+  background: var(--gloom-band);
+  box-shadow: inset 0 -1px 0 var(--qb-hairline);
+  font-size: var(--gloom-type-ui);
+}
+.gloom-qb button { font: inherit; border: 0; margin: 0; }
+.gloom-qb-scroll {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.gloom-qb-scroll::-webkit-scrollbar { display: none; }
+.gloom-qb-search,
+.gloom-qb-chip,
+.gloom-qb-inline,
+.gloom-qb-clear {
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: var(--gloom-space-xs);
+  padding: 0 var(--gloom-space-sm);
+  border-radius: 0;
+  background: transparent;
+  color: var(--gloom-text);
+  white-space: nowrap;
+  box-shadow: inset -1px 0 0 var(--qb-hairline);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.gloom-qb-search {
+  flex: 0 1 260px;
+  min-width: 150px;
+  color: var(--gloom-text-muted);
+  cursor: text;
+}
+.gloom-qb-search:hover { background: var(--qb-fill); }
+/* A search field standing on its own (input-search-bar.tsx) takes the query
+   bar's search look: the hover fill, and the accent under it while typing. */
+[data-gloom-role="search-strip"]:hover { background: var(--gloom-hover-fill) !important; }
+[data-gloom-role="search-strip"][data-active="true"] {
+  background: var(--gloom-hover-fill) !important;
+  box-shadow: inset 0 -2px 0 var(--gloom-border-focused) !important;
+}
+.gloom-qb-search[data-active="true"] {
+  background: var(--qb-fill);
+  color: var(--gloom-text);
+  box-shadow: inset -1px 0 0 var(--qb-hairline), inset 0 -2px 0 var(--gloom-border-focused);
+}
+.gloom-qb-search-icon { width: 11px; height: 11px; flex: none; }
+.gloom-qb-search[data-active="true"] .gloom-qb-search-icon { color: var(--gloom-border-focused); }
+.gloom-qb-search-input { flex: 1; min-width: 0; display: flex; align-items: center; }
+/* The one key cap (dialog-actions.tsx WebKeycap): mixed from the text colour it
+   sits with, so it reads on a filled button, a plain one and in every theme. */
+.gloom-qb-kbd,
+.gloom-keycap {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 var(--gloom-space-xs);
+  font-size: var(--gloom-type-caption);
+  font-weight: var(--gloom-weight-regular);
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: nowrap;
+  border-radius: var(--gloom-radius-sm);
+  font-family: inherit;
+  color: color-mix(in srgb, currentColor 80%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent);
+}
+/* The one key hint (dialog-actions.tsx WebKeyHint): a pane footer's, a
+   dialog's and the command bar prompt's. The key in a keycap before the
+   whole words, the words in the muted tone and the keycap a step brighter,
+   nothing bold; a hint that runs its action brightens under the pointer. */
+.gloom-hint {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--gloom-space-xs);
+  white-space: nowrap;
+  font-weight: var(--gloom-weight-regular);
+  color: var(--gloom-key-hint-words, var(--gloom-text-muted));
+}
+.gloom-hint > .gloom-keycap { color: var(--gloom-key-hint-key, var(--gloom-text-dim)); }
+.gloom-hint[data-interactive="true"] { cursor: pointer; }
+.gloom-hint[data-interactive="true"]:hover {
+  --gloom-key-hint-words: var(--gloom-text);
+  --gloom-key-hint-key: var(--gloom-text-bright);
+}
+.gloom-hint[data-disabled="true"] { --gloom-key-hint-key: var(--gloom-text-muted); }
+.gloom-qb-filters { display: flex; align-items: stretch; flex: none; }
+.gloom-qb-filters .gloom-popover-anchor { display: flex; align-items: stretch; }
+.gloom-qb-chip { cursor: pointer; }
+.gloom-qb-chip:hover, .gloom-qb-chip[data-open="true"] { background: var(--qb-fill); }
+.gloom-qb-label { color: var(--qb-label); }
+.gloom-qb-chevron { width: 9px; height: 9px; color: var(--gloom-text-muted); }
+.gloom-qb-chip[data-narrowing="true"],
+.gloom-qb-chip[data-narrowing="true"]:hover {
+  background: var(--qb-accent-fill);
+  box-shadow: inset -1px 0 0 var(--qb-hairline), inset 0 -2px 0 var(--gloom-border-focused);
+}
+.gloom-qb-chip[data-narrowing="true"] .gloom-qb-label { color: color-mix(in srgb, var(--gloom-border-focused) 80%, var(--gloom-text)); }
+.gloom-qb-chip[data-narrowing="true"] .gloom-qb-value { color: var(--gloom-text-bright); font-weight: var(--gloom-weight-bold); }
+/* A chip's reset is the icon button (20 by 18, the hover fill), at the chip's end. */
+.gloom-qb-reset {
+  width: 20px;
+  height: 18px;
+  margin-right: calc(-1 * var(--gloom-space-sm));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--gloom-radius-md);
+  color: var(--gloom-text-muted);
+  cursor: pointer;
+}
+.gloom-qb-reset svg { width: 10px; height: 10px; }
+.gloom-qb-reset:hover { background: var(--qb-fill); color: var(--gloom-text-bright); }
+.gloom-qb-clear { color: var(--gloom-text-muted); cursor: pointer; box-shadow: none; }
+.gloom-qb-clear:hover { color: var(--gloom-text); background: var(--qb-fill); }
+.gloom-qb-inline { gap: 0; padding-right: 0; }
+.gloom-qb-inline .gloom-qb-label { padding-right: var(--gloom-space-xs); color: var(--gloom-text-muted); }
+.gloom-qb-view {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  flex: none;
+  box-shadow: inset 1px 0 0 var(--qb-hairline);
+}
+.gloom-qb-inline .gloom-qb-view { margin-left: 0; box-shadow: none; align-self: stretch; }
+/* A nested tab strip's choices start the bar, where the terminal's tab row starts. */
+.gloom-qb-view[data-placement="start"] { margin-left: 0; box-shadow: none; }
+/* A long inline choice (an expiry strip) scrolls by itself, as the terminal's
+   does, so its label and the controls beside it stay in view. It narrows with
+   its group and has no floor of its own: a floor wider than the room the bar
+   gives it drew its next choice under the control beside it. */
+.gloom-qb-filters[data-strip="true"],
+.gloom-qb-inline[data-strip="true"] { flex: 0 1 auto; min-width: 0; }
+.gloom-qb-inline[data-strip="true"] .gloom-qb-segments {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.gloom-qb-inline[data-strip="true"] .gloom-qb-segments::-webkit-scrollbar { display: none; }
+.gloom-qb-inline[data-strip="true"] .gloom-qb-segments > button { flex: none; white-space: nowrap; }
+.gloom-qb-filters[data-strip="true"] > :not([data-strip="true"]) { flex: none; }
+/* Inline choices are tabs (the tab rule above): text only, the active one
+   bright and bold on the accent underline. */
+.gloom-qb-view button {
+  height: 100%;
+  padding: 0 var(--gloom-space-sm);
+  border-radius: 0;
+  background: transparent;
+  color: var(--gloom-text-dim);
+  font-weight: var(--gloom-weight-regular);
+  cursor: pointer;
+  transition: color 120ms ease, box-shadow 120ms ease;
+}
+.gloom-qb-view button:hover { color: var(--gloom-text); box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--gloom-accent) 35%, transparent); }
+.gloom-qb-view button[data-active="true"] {
+  color: var(--gloom-text-bright);
+  font-weight: var(--gloom-weight-bold);
+  box-shadow: inset 0 -2px 0 var(--gloom-accent);
+}
+/* Context gives way first when the pane is narrow. */
+.gloom-qb-meta {
+  margin-left: auto;
+  align-self: center;
+  flex: 0 1000 auto;
+  min-width: 0;
+  padding: 0 var(--gloom-space-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--gloom-text-muted);
+}
+.gloom-qb-meta + .gloom-qb-view { margin-left: 0; }
+
+.gloom-qb-leading {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  padding: 0 var(--gloom-space-xs) 0 var(--gloom-inset);
+}
+
+/* Audio player: the query bar's band at the foot of what it plays, so its
+   hairline is on top. Play, the elapsed time, the track, the length and the
+   speed sit flush like the bar's controls; the speed is the bar's inline
+   choice. */
+.gloom-player {
+  --player-rail: color-mix(in srgb, var(--gloom-text) 22%, transparent);
+  padding-bottom: 0;
+  padding-top: 1px;
+  box-shadow: inset 0 1px 0 var(--qb-hairline);
+}
+.gloom-player-toggle {
+  height: 100%;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--gloom-space-sm);
+  background: transparent;
+  color: var(--gloom-text-bright);
+  cursor: pointer;
+  box-shadow: inset -1px 0 0 var(--qb-hairline);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.gloom-player-toggle:hover { background: var(--qb-fill); }
+.gloom-player-toggle:focus-visible {
+  outline: none;
+  background: var(--qb-fill);
+  box-shadow: inset -1px 0 0 var(--qb-hairline), inset 0 -2px 0 var(--gloom-border-focused);
+}
+.gloom-player-time {
+  flex: none;
+  align-self: center;
+  padding: 0 var(--gloom-space-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--gloom-text);
+  white-space: nowrap;
+  text-box: trim-both cap alphabetic;
+}
+.gloom-player-time[data-gloom-role="audio-total"] { color: var(--gloom-text-muted); }
+/* The track is the whole height of the band, so it is easy to hit; the rail
+   is drawn thin in its middle and the thumb shows under the pointer. */
+.gloom-player-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 48px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+.gloom-player-rail {
+  width: 100%;
+  height: 3px;
+  border-radius: var(--gloom-radius-full);
+  background: var(--player-rail);
+  overflow: hidden;
+}
+.gloom-player-fill { height: 100%; background: var(--gloom-border-focused); }
+.gloom-player-thumb {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  margin: -4.5px 0 0 -4.5px;
+  border-radius: 50%;
+  background: var(--gloom-text-bright);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.gloom-player-track:hover .gloom-player-thumb,
+.gloom-player-track[data-scrubbing="true"] .gloom-player-thumb { opacity: 1; }
+.gloom-player .gloom-qb-inline {
+  margin-left: var(--gloom-space-sm);
+  box-shadow: inset 1px 0 0 var(--qb-hairline);
+}
+
+/* A passage of a transcript that plays from where it starts. The one being
+   heard is marked like the row under a table's cursor, with the accent's bar
+   at its edge so it reads in themes whose cursor row is faint; the pointer
+   shows the hover fill and no bar. The mark reaches a little past the text
+   without moving it. */
+.gloom-playback-line {
+  --line-bg: transparent;
+  position: relative;
+  border-radius: var(--gloom-radius-sm);
+  cursor: pointer;
+  background-color: var(--line-bg);
+  box-shadow: 0 0 0 2px var(--line-bg), -3px 0 0 2px var(--line-bg), 3px 0 0 2px var(--line-bg);
+  transition: background-color 120ms ease, box-shadow 120ms ease;
+}
+.gloom-playback-line:hover { --line-bg: var(--gloom-hover-bg); }
+.gloom-playback-line[data-current="true"] { --line-bg: var(--gloom-selected); }
+.gloom-playback-line[data-current="true"]::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  border-radius: var(--gloom-radius-sm) 0 0 var(--gloom-radius-sm);
+  background: var(--gloom-border-focused);
+}
+
+
+/* Detail header of a list/detail stack: the same band as the query bar, so
+   Back and the item title read as the pane's toolbar. Grows when a long title
+   wraps rather than hiding it. */
+.gloom-stack-bar {
+  --qb-hairline: var(--gloom-hairline);
+  --qb-fill: var(--gloom-hover-fill);
+  display: flex;
+  align-items: stretch;
+  min-height: var(--chrome-h);
+  padding-bottom: 1px;
+  flex-shrink: 0;
+  background: var(--gloom-band);
+  box-shadow: inset 0 -1px 0 var(--qb-hairline);
+  font-size: var(--gloom-type-ui);
+}
+.gloom-stack-back {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gloom-space-xs);
+  padding: 0 var(--gloom-space-sm);
+  border: 0;
+  margin: 0;
+  font: inherit;
+  background: transparent;
+  color: var(--gloom-text);
+  box-shadow: inset -1px 0 0 var(--qb-hairline);
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.gloom-stack-back:hover { background: var(--qb-fill); color: var(--gloom-text-bright); }
+.gloom-stack-back svg { width: 11px; height: 11px; color: var(--gloom-text-muted); }
+.gloom-stack-back:hover svg { color: var(--gloom-text-bright); }
+.gloom-stack-title {
+  flex: 1;
+  min-width: 0;
+  align-self: center;
+  padding: 1px var(--gloom-space-sm);
+  line-height: var(--cell-h);
+  font-weight: var(--gloom-weight-bold);
+  color: var(--gloom-text-bright);
+  overflow-wrap: break-word;
+}
+.gloom-stack-hint { flex: none; align-self: center; padding: 0 var(--gloom-space-sm); color: var(--gloom-text-muted); white-space: nowrap; }
+/* Back and the title when a detail's query bar has taken the stack header. */
+.gloom-qb .gloom-stack-back { height: 100%; }
+.gloom-qb-title {
+  flex: 0 1 auto;
+  max-width: 40ch;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--gloom-space-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--gloom-weight-bold);
+  color: var(--gloom-text-bright);
+  box-shadow: inset -1px 0 0 var(--qb-hairline);
+}
+
+/* Optical centring for one-line chrome text: size the text by its capitals and
+   baseline, so flex centring puts the letters in the middle whatever the font's
+   ascent and descent are (SF Mono and Menlo differ from the Linux fallbacks).
+   Equal padding and negative margin keep ascenders and descenders inside any
+   overflow clip without changing the layout size. */
+[data-gloom-role="pane-header"] [data-gloom-role="pane-title"],
+[data-gloom-role="pane-header-tabs"] [data-gloom-role="tab-label"],
+[data-gloom-role="pane-stack-tabs"] [data-gloom-role="tab-label"],
+.gloom-qb-label,
+.gloom-qb-value,
+.gloom-qb-text,
+.gloom-qb-title,
+.gloom-qb-meta,
+.gloom-stack-title {
+  text-box: trim-both cap alphabetic;
+}
+[data-gloom-role="pane-header"] [data-gloom-role="pane-title"],
+[data-gloom-role="pane-header-tabs"] [data-gloom-role="tab-label"],
+[data-gloom-role="pane-stack-tabs"] [data-gloom-role="tab-label"],
+.gloom-qb-title,
+.gloom-qb-meta {
+  padding-block: var(--gloom-space-xs);
+  margin-block: calc(-1 * var(--gloom-space-xs));
+}
+.gloom-qb-view button { display: inline-flex; align-items: center; }
+
+/* A stack detail fills everything under its header, down to the pane footer.
+   Details are often given a height worked out in terminal rows (pane height
+   minus the rows the terminal spends on chrome); on the desktop that chrome is
+   a different size, and a fixed height left a band of empty pane above the
+   footer. The detail's own layout still flexes inside the filled box. */
+.gloom-stack-detail > * {
+  flex: 1 1 0 !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+}
+/* Except a query bar the detail opens with (OSA's contract choice): it is the
+   detail's chrome, one row high, and filling would split the pane with the
+   content under it, Back and all. */
+.gloom-stack-detail > .gloom-qb {
+  flex: none !important;
+  height: var(--chrome-h) !important;
+}
+
+/* Popovers take focus so their keys work; the focus ring is noise on a
+   surface that is plainly the active one. */
+.gloom-popover:focus, .gloom-popover:focus-visible { outline: none; }
+.gloom-popover[data-density="menu"] { padding: var(--gloom-space-xs); }
+
+/* Menu: the one list of choices every popover menu renders (filter menus,
+   selects, multi-selects, the pane menu). */
+.gloom-menu { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-size: var(--gloom-type-ui); }
+.gloom-menu-title {
+  padding: var(--gloom-space-xs) var(--gloom-space-sm);
+  color: var(--gloom-text-muted);
+  white-space: nowrap;
+}
+.gloom-menu-divider { height: 1px; margin: var(--gloom-space-xs); background: var(--gloom-hairline); }
+.gloom-menu-item {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  gap: var(--gloom-space-sm);
+  padding: var(--gloom-space-xs) var(--gloom-space-sm);
+  border-radius: var(--gloom-radius-md);
+  cursor: pointer;
+  color: var(--gloom-text);
+  white-space: nowrap;
+}
+.gloom-menu-item[aria-disabled="true"] { color: var(--gloom-text-muted); cursor: default; }
+.gloom-menu-item[data-highlighted="true"] { background: var(--gloom-hover-fill); color: var(--gloom-text-bright); }
+.gloom-menu-item[data-selected="true"] { font-weight: var(--gloom-weight-bold); }
+.gloom-menu-label { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.gloom-menu-text { overflow: hidden; text-overflow: ellipsis; }
+.gloom-menu-description { color: var(--gloom-text-muted); font-weight: var(--gloom-weight-regular); white-space: normal; }
+.gloom-menu-hint { flex: none; padding-left: var(--gloom-space-lg); color: var(--gloom-text-muted); font-weight: var(--gloom-weight-regular); }
+.gloom-menu-check { flex: none; color: var(--gloom-border-focused); display: inline-flex; }
+.gloom-menu-check svg { width: 11px; height: 11px; }
+
+/* A labelled text filter beside the search (e.g. tickers). Its width is the
+   input's, as in the terminal; the segment grows to fit the label. */
+.gloom-qb-textfield { flex: none; min-width: 0; }
+.gloom-qb-textfield .gloom-qb-search-input { flex: 0 0 var(--qb-input-w); width: var(--qb-input-w); }
+
+/* Field grid: a calculator's inputs as one sheet under the query bar. Same
+   band surface and hairlines; each cell is label, value, unit. The cell being
+   edited takes the accent base line the active search field uses. */
+[data-gloom-role="field-grid"] {
+  --fg-hairline: var(--gloom-hairline);
+  --fg-fill: var(--gloom-hover-fill);
+  background: var(--gloom-band);
+  box-shadow: inset 0 -1px 0 var(--fg-hairline);
+}
+/* Every row is the same column grid, so a short last row stays aligned. */
+[data-gloom-role="field-grid-row"] {
+  display: grid !important;
+  grid-template-columns: repeat(var(--field-columns, 3), minmax(0, 1fr));
+}
+[data-gloom-role="field-grid-cell"] {
+  /* Cells share the row, so the sheet spans the pane; the value keeps its
+     own width beside the label, so a unit never drifts from its number. */
+  width: auto !important;
+  min-width: 0;
+  align-items: center;
+  gap: var(--gloom-space-sm);
+  padding: 0 var(--gloom-space-sm);
+  box-sizing: border-box;
+  box-shadow: inset -1px 0 0 var(--fg-hairline);
+  cursor: text;
+  transition: background-color 120ms ease;
+}
+[data-gloom-role="field-grid-cell"][data-wide="true"] { grid-column: 1 / -1; box-shadow: none; }
+[data-gloom-role="field-grid-cell"][data-kind="action"] { cursor: pointer; padding: 0; }
+[data-gloom-role="field-grid-cell"]:hover { background: var(--fg-fill); }
+[data-gloom-role="field-grid-cell"][data-active="true"] {
+  background: var(--fg-fill);
+  box-shadow: inset -1px 0 0 var(--fg-hairline), inset 0 -2px 0 var(--gloom-border-focused);
+}
+[data-gloom-role="field-grid-label"] {
+  flex: 0 0 var(--field-label-w, 9ch);
+  width: var(--field-label-w, 9ch);
+  display: block !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-gloom-role="field-grid-cell"][data-active="true"] [data-gloom-role="field-grid-label"] { color: var(--gloom-text); }
+/* Values keep one column position whether they are shown or being edited, so
+   the unit sits in the same place while typing. */
+[data-gloom-role="field-grid-value"] { flex: 0 0 auto; width: 12ch !important; justify-content: flex-end; min-width: 0; }
+[data-gloom-role="field-grid-value"] > * { width: 100% !important; }
+[data-gloom-role="field-grid-cell"][data-kind="text"] [data-gloom-role="field-grid-value"] { flex: 1 1 auto; width: auto !important; justify-content: flex-start; }
+[data-gloom-role="field-grid-value"] button { justify-content: flex-end; color: var(--gloom-text-bright) !important; font-weight: var(--gloom-weight-bold); }
+[data-gloom-role="field-grid-value"] input { text-align: right; color: var(--gloom-text-bright); font-weight: var(--gloom-weight-bold); }
+[data-gloom-role="field-grid-cell"][data-kind="text"] [data-gloom-role="field-grid-value"] input { text-align: left; font-weight: var(--gloom-weight-regular); }
+[data-gloom-role="field-grid-unit"] { flex: none; color: var(--gloom-text-muted); }
+
+/* Stat grid: the read-only sibling of the field grid. A pane's summary figures
+   sit in the same band of hairline-split cells, so the header zone (title-bar
+   tab, query bar, figures) reads as one surface. Cells are not editable: no
+   hover, no text cursor. Each cell is label, value, muted context. */
+/* Key-value rows carry no rule between them: alignment and the band are enough. */
+[data-gloom-role="stat-grid"] {
+  --sg-hairline: var(--gloom-hairline);
+  background: var(--gloom-band);
+  box-shadow: inset 0 -1px 0 var(--sg-hairline);
+}
+[data-gloom-role="stat-grid-row"] {
+  display: grid !important;
+  grid-template-columns: repeat(var(--stat-columns, 3), minmax(0, 1fr));
+}
+[data-gloom-role="stat-grid-cell"] {
+  width: auto !important;
+  min-width: 0;
+  align-items: center;
+  gap: var(--gloom-space-sm);
+  padding: 0 var(--gloom-inset);
+  box-sizing: border-box;
+  box-shadow: inset -1px 0 0 var(--sg-hairline);
+}
+[data-gloom-role="stat-grid-cell"][data-wide="true"] { grid-column: 1 / -1; box-shadow: none; }
+/* A whole-row cell too narrow for its value and detail on one line: the label
+   stays on the first line, the value and the detail run down beside it. */
+[data-gloom-role="stat-grid-cell"][data-wrapped="true"] { align-items: flex-start; }
+[data-gloom-role="stat-grid-cell"][data-wrapped="true"] [data-gloom-role="stat-grid-detail"] { flex: none; }
+/* Column grid text whose track can be narrower than it, and the grid itself: clipped
+   without a scroll container where the engine has `overflow: clip`. A text box sets its
+   own overflow inline, hence !important. The margin keeps the antialiased edge of a glyph
+   that ends at the box from being cut. */
+[data-gloom-clip] {
+  overflow: clip !important;
+  overflow-clip-margin: 2px;
+}
+@supports not (overflow: clip) {
+  [data-gloom-clip] {
+    overflow: hidden !important;
+  }
+}
+[data-gloom-clip="text"] {
+  text-overflow: ellipsis !important;
+}
+[data-gloom-role="stat-grid-label"] {
+  flex: 0 0 var(--stat-label-w, 10ch);
+  width: var(--stat-label-w, 10ch);
+  display: block !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-gloom-role="stat-grid-value"] { flex: none; white-space: nowrap; font-weight: var(--gloom-weight-bold); }
+[data-gloom-role="stat-grid-detail"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: block !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Icon-only button: pane header, footer, dialog close, window controls. A
+   footer status icon (a delayed source's clock) takes the same box. */
+.gloom-icon-button, [data-gloom-role="pane-footer-icon"] {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 var(--gloom-space-xs);
+  margin: 0;
+  border: 0;
+  border-radius: var(--gloom-radius-md);
+  background: transparent;
+  color: var(--gloom-text-dim);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.gloom-icon-button:disabled, [data-gloom-role="pane-footer-icon"] { cursor: default; }
+.gloom-icon-button:not(:disabled):hover { background: var(--gloom-hover-fill); color: var(--gloom-text-bright); }
+.gloom-icon-button[aria-pressed="true"] { color: var(--gloom-warning); }
+.gloom-qb-view button:disabled { color: var(--gloom-text-muted); opacity: 0.55; cursor: default; }
+[data-gloom-role="field-grid-value"] button,
+[data-gloom-role="field-grid-value"] button > span { justify-content: flex-end !important; text-align: right; padding-inline: 0 !important; }
+[data-gloom-role="field-grid-value"] input { padding: 0 !important; }
+[data-gloom-role="field-grid-cell"][data-kind="text"] [data-gloom-role="field-grid-value"] { width: auto !important; }
+
+/* ===== Chrome: title-bar tab overflow, query bar edges, quick-add band ===== */
+
+/* Title-bar tabs that do not fit: a chevron after the strip lists them all.
+   The strip hangs over the header's rules; the padding puts the chevron back
+   on the header's centre line. */
+.gloom-tab-overflow {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: var(--pane-tab-top-inset, 0px) 0 1px 2px;
+}
+
+/* A search with nothing beside it takes the room filters would have used. */
+.gloom-qb[data-search-only="true"] .gloom-qb-search { flex: 1 1 260px; max-width: 480px; }
+
+/* Band text starts one cell in, on the same edge as the table columns and
+   body text below it; segments after the first keep their 8px (--gloom-space-sm). */
+.gloom-qb-scroll > :is(.gloom-stack-back, .gloom-qb-search, .gloom-player-toggle):first-child,
+.gloom-qb-scroll > .gloom-qb-view[data-placement="start"]:first-child > button:first-child,
+.gloom-qb-scroll > .gloom-qb-filters:first-child > :first-child:not(.gloom-popover-anchor),
+.gloom-qb-scroll > .gloom-qb-filters:first-child > .gloom-popover-anchor:first-child > *,
+.gloom-stack-bar > .gloom-stack-back,
+[data-gloom-role="field-grid-cell"]:first-child:not([data-kind="action"]) {
+  padding-left: var(--cell-w);
+}
+
+/* Inline quick add across a pane (a watchlist's ticker field): the query bar's
+   band at the foot of the list, the field as its leading segment. */
+[data-gloom-role="inline-quick-add"][data-band="true"] {
+  --qb-hairline: var(--gloom-hairline);
+  --qb-fill: var(--gloom-hover-fill);
+  height: var(--chrome-h);
+  padding-top: 1px;
+  align-items: stretch;
+  background: var(--gloom-band);
+  box-shadow: inset 0 1px 0 var(--qb-hairline);
+  font-size: var(--gloom-type-ui);
+  cursor: text;
+}
+[data-gloom-role="inline-quick-add"][data-band="true"] [data-gloom-role="inline-quick-add-field"] {
+  gap: var(--gloom-space-xs);
+  padding: 0 var(--gloom-space-sm) 0 var(--gloom-inset);
+  box-shadow: inset -1px 0 0 var(--qb-hairline);
+  transition: background-color 120ms ease;
+}
+[data-gloom-role="inline-quick-add"][data-band="true"]:hover [data-gloom-role="inline-quick-add-field"] { background: var(--qb-fill); }
+[data-gloom-role="inline-quick-add"][data-band="true"][data-active="true"] [data-gloom-role="inline-quick-add-field"] {
+  background: var(--qb-fill);
+  box-shadow: inset -1px 0 0 var(--qb-hairline), inset 0 -2px 0 var(--gloom-border-focused);
+}
+[data-gloom-role="inline-quick-add"][data-band="true"] [data-gloom-role="inline-quick-add-preview"] { padding: 0 var(--gloom-space-sm); }
+
+/* ===== Data table: sortable headers ===== */
+
+/* A section header's action (the preset a group is set to) is quiet text at
+   the right end of the header; the pointer brings out that it is a control. */
+[data-gloom-role="data-table-section-action"] {
+  margin-left: auto;
+  flex: none;
+  height: var(--cell-h);
+  padding: 0 var(--gloom-space-xs);
+  border: 0;
+  border-radius: var(--gloom-radius-md);
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gloom-space-xs);
+  font-weight: var(--gloom-weight-regular);
+  white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+[data-gloom-role="data-table-section-action"] svg { color: var(--gloom-text-muted); }
+[data-gloom-role="data-table-section-action"]:hover {
+  color: var(--gloom-text-bright) !important;
+  background-color: var(--gloom-hover-fill);
+}
+
+/* A header that sorts brightens under the pointer; plain headers (no
+   onHeaderClick) are not interactive and stay put. Tinted headers keep
+   their colour. */
+[data-gloom-role="data-table-header-cell"][data-gloom-interactive="true"]:not([data-gloom-tinted="true"]):hover > * {
+  color: var(--gloom-text) !important;
+}
+
+/* A link is the text around it, underlined (external-link.tsx); the pointer or keyboard focus brightens it. */
+[data-gloom-link="true"] { text-underline-offset: 2px; }
+[data-gloom-link="true"]:is(:hover, :focus-visible) { color: var(--gloom-link-hover) !important; }
+
+/* Keyboard focus. Tab walks the controls of an open dialog, and a focused
+   control shows where Enter and Space will land. Pointer focus draws nothing. */
+:where(button, a[href], summary, [role="button"], [role="radio"], [role="option"], input[type="checkbox"]):focus-visible {
+  outline: 2px solid var(--gloom-accent);
+  outline-offset: 1px;
+}
+
+/* Keycaps on buttons and in dialog hints, and the keys the command bar and
+   the layout tabs name, are for a keyboard; a touch screen has none to press
+   them with. A note beside them (a deadline) stays, and so do the words of
+   a pane footer's hints, which a tap runs. Text set whole with its key (a
+   layout tab's `⌘1 Research`) has the same words without the key beside
+   it, shown only where the key hint goes. */
+.gloom-without-keys { display: none; }
+@media (hover: none) and (pointer: coarse) {
+  .gloom-keycap, .gloom-key-hint { display: none !important; }
+  .gloom-without-keys { display: inline; }
+}
+
+/* Reading columns (src/components/reader) set their type from their own
+   width, not from a count of cells: body text at 1.1667em of the app's size
+   (14px), or 1.1em (13.2px) under 480px. The rest of the reader's scale is in
+   em of it (reader-text.tsx). */
+[data-gloom-ui="article-reader"],
+[data-gloom-ui="detail-reader"],
+[data-gloom-ui="docs-reader"] {
+  container-type: inline-size;
+}
+@container (max-width: 480px) {
+  [data-gloom-ui="reader-column"] {
+    --reader-em: 1.1;
+  }
+}
+/* A detail's facts: label and value pairs, two pairs to a row when the
+   reader is wide enough for them. */
+[data-gloom-ui="detail-facts"] {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+@container (min-width: 720px) {
+  [data-gloom-ui="detail-facts"] {
+    grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr);
+  }
+  [data-gloom-ui="detail-facts"] > :nth-child(4n + 3) {
+    padding-left: 1.2em;
+  }
+}

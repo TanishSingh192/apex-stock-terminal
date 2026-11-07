@@ -1,0 +1,177 @@
+import { useRef, type CSSProperties } from "react";
+import { TextAttributes, type TextProps } from "../../../ui/host";
+import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../theme/font-scale";
+
+export function cellWidth(value: unknown): CSSProperties["width"] {
+  if (typeof value === "number") return `${value * WEB_CELL_WIDTH}px`;
+  return value as CSSProperties["width"];
+}
+
+export function cellHeight(value: unknown): CSSProperties["height"] {
+  if (typeof value === "number") return `${value * WEB_CELL_HEIGHT}px`;
+  return value as CSSProperties["height"];
+}
+
+function cellInset(value: unknown, axis: "x" | "y"): CSSProperties["paddingLeft"] {
+  if (typeof value === "number") return `${value * (axis === "x" ? WEB_CELL_WIDTH : WEB_CELL_HEIGHT)}px`;
+  return value as CSSProperties["paddingLeft"];
+}
+
+export function commonStyle(props: Record<string, unknown>): CSSProperties {
+  const border = props.border;
+  const hasFixedInlineSize = props.width != null || props.flexBasis != null;
+  const hasFixedBlockSize = props.height != null;
+  const gapUnit = props.flexDirection === "row" ? WEB_CELL_WIDTH : WEB_CELL_HEIGHT;
+  const zeroMinInlineSize = props.minWidth == null && allowsZeroMinSize(props, "inline");
+  const zeroMinBlockSize = props.minHeight == null && allowsZeroMinSize(props, "block");
+  return {
+    color: typeof props.fg === "string" ? props.fg : undefined,
+    backgroundColor: typeof props.bg === "string" ? props.bg : typeof props.backgroundColor === "string" ? props.backgroundColor : undefined,
+    display: "flex",
+    flexDirection: props.flexDirection === "row" ? "row" : "column",
+    flexGrow: typeof props.flexGrow === "number" ? props.flexGrow : undefined,
+    flexShrink: typeof props.flexShrink === "number" ? props.flexShrink : hasFixedInlineSize || hasFixedBlockSize ? 0 : undefined,
+    flexBasis: cellWidth(props.flexBasis),
+    flexWrap: props.flexWrap === "wrap" ? "wrap" : undefined,
+    alignItems: props.alignItems as CSSProperties["alignItems"],
+    justifyContent: props.justifyContent as CSSProperties["justifyContent"],
+    position: props.position as CSSProperties["position"],
+    left: cellWidth(props.left),
+    right: cellWidth(props.right),
+    top: cellHeight(props.top),
+    bottom: cellHeight(props.bottom),
+    zIndex: typeof props.zIndex === "number" ? props.zIndex : undefined,
+    width: cellWidth(props.width),
+    height: cellHeight(props.height),
+    minWidth: cellWidth(props.minWidth),
+    minHeight: cellHeight(props.minHeight),
+    maxWidth: cellWidth(props.maxWidth),
+    maxHeight: cellHeight(props.maxHeight),
+    paddingLeft: cellInset(props.paddingLeft ?? props.paddingX ?? props.padding, "x"),
+    paddingRight: cellInset(props.paddingRight ?? props.paddingX ?? props.padding, "x"),
+    paddingTop: cellInset(props.paddingTop ?? props.paddingY ?? props.padding, "y"),
+    paddingBottom: cellInset(props.paddingBottom ?? props.paddingY ?? props.padding, "y"),
+    marginLeft: cellInset(props.marginLeft ?? props.marginX ?? props.margin, "x"),
+    marginRight: cellInset(props.marginRight ?? props.marginX ?? props.margin, "x"),
+    marginTop: cellInset(props.marginTop ?? props.marginY ?? props.margin, "y"),
+    marginBottom: cellInset(props.marginBottom ?? props.marginY ?? props.margin, "y"),
+    gap: typeof props.gap === "number" ? `${props.gap * gapUnit}px` : props.gap as CSSProperties["gap"],
+    // Axis gaps as Yoga takes them in the terminal. Only set when given: React
+    // writes an undefined longhand as an empty value, clearing what `gap` set.
+    ...(props.columnGap != null ? { columnGap: cellWidth(props.columnGap) as CSSProperties["columnGap"] } : {}),
+    ...(props.rowGap != null ? { rowGap: cellHeight(props.rowGap) as CSSProperties["rowGap"] } : {}),
+    overflow: props.overflow as CSSProperties["overflow"],
+    // A requested divider or accent is not a frame. Use longhands consistently
+    // so switching between one edge, all edges and no border clears stale sides.
+    borderStyle: props.border ? "solid" : undefined,
+    borderColor: props.border ? typeof props.borderColor === "string" ? props.borderColor : "var(--gloom-border)" : undefined,
+    borderWidth: Array.isArray(border) ? ["top", "right", "bottom", "left"].map(side => border.includes(side) ? "1px" : "0px").join(" ") : border ? "1px" : undefined,
+    boxSizing: "border-box",
+    minInlineSize: zeroMinInlineSize ? 0 : undefined,
+    minBlockSize: zeroMinBlockSize ? 0 : undefined,
+  };
+}
+
+/**
+ * Whether a run of text can be selected. The page is not selectable by
+ * default (styles.css); `true` opts a run in and `false` keeps it out inside
+ * a selectable block. Both spellings: WebKit, the macOS app's WKWebView and
+ * Safari, ignores the unprefixed property, which is how interface text became
+ * selectable there while Chrome kept it plain.
+ */
+export function selectionStyle(selectable: unknown): CSSProperties {
+  if (typeof selectable !== "boolean") return {};
+  const value = selectable ? "text" : "none";
+  return { userSelect: value, WebkitUserSelect: value };
+}
+
+export function textStyle(props: TextProps): CSSProperties {
+  const attributes = props.attributes;
+  const shouldWrap = props.wrapText || props.wrapMode === "word" || props.wrapMode === "char";
+  return {
+    color: props.fg,
+    backgroundColor: props.bg,
+    display: "inline-block",
+    lineHeight: "var(--cell-h)",
+    fontWeight: props.bold || hasAttribute(attributes, TextAttributes.BOLD) ? 700 : undefined,
+    fontStyle: props.italic || hasAttribute(attributes, TextAttributes.ITALIC) ? "italic" : undefined,
+    textDecoration: [
+      props.underline || hasAttribute(attributes, TextAttributes.UNDERLINE) ? "underline" : "",
+      props.strikethrough || hasAttribute(attributes, TextAttributes.STRIKETHROUGH) ? "line-through" : "",
+    ].filter(Boolean).join(" ") || undefined,
+    opacity: props.dim || hasAttribute(attributes, TextAttributes.DIM) ? 0.65 : undefined,
+    filter: props.inverse || hasAttribute(attributes, TextAttributes.INVERSE) ? "invert(1)" : undefined,
+    whiteSpace: shouldWrap ? "pre-wrap" : "pre",
+    overflowWrap: shouldWrap ? "break-word" : undefined,
+    overflow: "visible",
+    textOverflow: "clip",
+    width: cellWidth(props.width),
+    maxWidth: cellWidth(props.maxWidth),
+    minWidth: cellWidth(props.minWidth) ?? 0,
+    flexShrink: shouldWrap ? 1 : 0,
+    ...selectionStyle(props.selectable),
+  };
+}
+
+/** Kit props a host element takes that are not DOM attributes (`onMouse*` handlers are left out too). */
+const NON_DOM_PROPS: ReadonlySet<string> = new Set([
+  "fg", "bg", "backgroundColor", "flexDirection", "flexGrow", "flexShrink", "flexBasis", "flexWrap",
+  "alignItems", "justifyContent",
+  "padding", "paddingX", "paddingY", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom",
+  "margin", "marginX", "marginY", "marginLeft", "marginRight", "marginTop", "marginBottom",
+  "bold", "underline", "inverse", "dim", "italic", "strikethrough", "attributes", "content", "position", "left", "right", "top", "bottom",
+  "zIndex", "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight", "gap", "columnGap", "rowGap",
+  "border", "borderStyle", "borderColor", "overflow", "selectable", "visible", "name", "color",
+  "focused", "focusedBackgroundColor", "textColor", "focusedTextColor", "placeholderColor",
+  "cursorColor", "selectionBg", "selectionFg", "showCursor", "keyBindings", "wrapText", "wrapMode",
+  "initialValue", "value", "onInput", "onChange", "onSubmit", "onEscape", "onCursorChange", "onMouse",
+  "scrollX", "scrollY", "focusable", "bitmap", "bitmaps", "crosshair", "vectors", "text", "font",
+  "hoverBackgroundColor", "joinPastedLines", "stickyScroll", "stickyStart", "onStickyPinChange", "pinchAsWheel",
+]);
+
+/**
+ * The props a host element passes on to its DOM node, in their order. Built in
+ * one pass: every box and text run calls this on every render.
+ */
+export function cleanDomProps(props: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = {};
+  for (const key of Object.keys(props)) {
+    if (NON_DOM_PROPS.has(key) || key.startsWith("onMouse")) continue;
+    next[key] = props[key];
+  }
+  return next;
+}
+
+/**
+ * `style` as it was last rendered while nothing in it changed, so React skips
+ * the element's inline style on a re-render instead of comparing every
+ * property again (and reading `element.style`). A host box re-renders with
+ * each render of its parent, and most leave its style as it was.
+ */
+export function useStableStyle<T extends object>(style: T): T {
+  const previousRef = useRef<{ style: T; keys: string[] } | null>(null);
+  const previous = previousRef.current;
+  if (previous && sameStyle(previous.style as Record<string, unknown>, previous.keys, style as Record<string, unknown>)) return previous.style;
+  previousRef.current = { style, keys: Object.keys(style) };
+  return style;
+}
+
+/** The same keys with the same values, so React would write nothing. Read in order, which a rebuilt style keeps. */
+function sameStyle(left: Record<string, unknown>, leftKeys: readonly string[], right: Record<string, unknown>): boolean {
+  let index = 0;
+  for (const key in right) {
+    if (leftKeys[index] !== key || left[key] !== right[key]) return false;
+    index += 1;
+  }
+  return index === leftKeys.length;
+}
+
+function allowsZeroMinSize(props: Record<string, unknown>, axis: "inline" | "block"): boolean {
+  if (props.overflow === "hidden" || props.overflow === "clip") return true;
+  if (typeof props.flexShrink === "number" && props.flexShrink > 0) return true;
+  return axis === "inline" ? props.scrollX === true : props.scrollY === true;
+}
+
+function hasAttribute(attributes: unknown, flag: number): boolean {
+  return typeof attributes === "number" && (attributes & flag) !== 0;
+}

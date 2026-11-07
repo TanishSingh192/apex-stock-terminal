@@ -1,0 +1,143 @@
+// Published full-day closures (weekend dates omitted) for Asia-Pacific venues, EGX and Wiener
+// Boerse, not a holiday-rule engine. A year a venue has not published is unknown, not
+// open: every weekday of it reads as a session. The half-day sessions of HKEX, SGX and
+// ASX are listed below the closures (PUBLISHED_APAC_EARLY_CLOSES). Checked 2026-10-09:
+// KRX, also KOSDAQ: http://open.krx.co.kr/contents/MKD/01/0110/01100305/MKD01100305.jsp
+// TWSE, whose closures TPEx shares: https://www.twse.com.tw/en/trading/holiday.html
+//   (2027 not yet published; 12 and 13 Feb 2026 are clearing-only days without trading)
+//   and a day it closed unscheduled: 23 Oct 2026 for Typhoon Champi, announced the evening before
+// BHB closes on the dates its own daily closes skip in 2026, which match the holidays it lists
+//   (some moved, as its list warns), and on National Day, 16 and 17 Dec. Its week is Sunday to Thursday.
+// HKEX: https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2025/ce_SEHK_CT_075_2025.pdf
+//   and https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2026/ce_SEHK_CT_077_2026.pdf
+// Wiener Boerse closes its main market (VIE) and the Vienna MTF (WBDM) on its stock exchange holidays,
+//   and trades on Austria's other public holidays:
+//   https://www.wienerborse.at/uploads/u/cms/files/trading/stock-exchange-holidays-2026-en.pdf (and -2027-en.pdf)
+// SGX closes on Singapore's gazetted public holidays, one on a Sunday moving to the Monday:
+//   https://www.sgx.com/stock-exchange/trading and https://www.mom.gov.sg/employment-practices/public-holidays
+// MSX closes on the holidays its site lists (msx.om exchange holidays, read 10 Oct 2026).
+//   Its week is Sunday to Thursday.
+// ASX: https://www.asx.com.au/markets/market-resources/trading-hours-calendar/cash-market-trading-hours/trading-calendar
+// EGX closes on Egypt's public holidays, often moved to the Thursday of their
+// week (Armed Forces Day, Tuesday 6 Oct 2026, to Thursday 8 Oct, by the
+// exchange's statement of 5 Oct). Its week is Sunday to Thursday.
+// JSE closes on South Africa's public holidays, a Sunday one moving to the Monday (Women's Day, 9 Aug 2026):
+//   JSE Market Notice 380/25, JSE Markets Calendar 2026 (clientportal.jse.co.za), and the
+//   local government election day, Wed 4 Nov 2026, declared a public holiday on 15 Sep 2026 (gov.za).
+const KRX_CLOSURES: Record<number, readonly string[]> = {
+  2026: [
+    "01-01", "02-16", "02-17", "02-18", "03-02", "05-01", "05-05", "05-25", "06-03",
+    "07-17", "08-17", "09-24", "09-25", "10-05", "10-09", "12-25", "12-31",
+  ],
+  2027: [
+    "01-01", "02-08", "02-09", "03-01", "05-03", "05-05", "05-13", "07-19", "08-16",
+    "09-14", "09-15", "09-16", "10-04", "10-11", "12-27", "12-31",
+  ],
+};
+
+const WIENER_BOERSE_CLOSURES: Record<number, readonly string[]> = {
+  2026: ["01-01", "04-03", "04-06", "05-01", "10-26", "12-24", "12-25", "12-31"],
+  2027: ["01-01", "03-26", "03-29", "10-26", "12-24", "12-31"],
+};
+
+const TWSE_CLOSURES: Record<number, readonly string[]> = {
+  2026: [
+    "01-01", "02-12", "02-13", "02-16", "02-17", "02-18", "02-19", "02-20", "02-27",
+    "04-03", "04-06", "05-01", "06-19", "09-25", "09-28", "10-09", "10-23", "10-26", "12-25",
+  ],
+};
+
+/** Closures by canonical venue code. */
+export const PUBLISHED_APAC_CLOSURES: Readonly<Record<string, Record<number, readonly string[]>>> = {
+  KRX: KRX_CLOSURES,
+  KOSDAQ: KRX_CLOSURES,
+  TWSE: TWSE_CLOSURES,
+  TPEX: TWSE_CLOSURES,
+  BHB: {
+    2026: [
+      "01-01", "03-22", "03-23", "03-24", "05-03", "05-26", "05-27", "05-28", "05-31", "06-16", "06-25", "06-28",
+      "08-25", "12-16", "12-17",
+    ],
+  },
+  HKEX: {
+    2026: [
+      "01-01", "02-17", "02-18", "02-19", "04-03", "04-06", "04-07", "05-01", "05-25",
+      "06-19", "07-01", "10-01", "10-19", "12-25",
+    ],
+    2027: [
+      "01-01", "02-08", "02-09", "03-26", "03-29", "04-05", "05-13", "06-09", "07-01",
+      "09-16", "10-01", "10-08", "12-27",
+    ],
+  },
+  SGX: {
+    2026: ["01-01", "02-17", "02-18", "04-03", "05-01", "05-27", "06-01", "08-10", "11-09", "12-25"],
+    2027: ["01-01", "02-08", "03-10", "03-26", "05-17", "05-20", "08-09", "10-28"],
+  },
+  VIE: WIENER_BOERSE_CLOSURES,
+  WBDM: WIENER_BOERSE_CLOSURES,
+  MSX: {
+    2026: ["01-15", "01-18", "03-19", "03-22", "03-23", "05-26", "05-27", "05-28", "06-18", "08-27", "11-25", "11-26"],
+  },
+  ASX: {
+    2026: ["01-01", "01-26", "04-03", "04-06", "06-08", "12-25", "12-28"],
+    2027: ["01-01", "01-26", "03-26", "03-29", "06-14", "12-27", "12-28"],
+  },
+  JSE: {
+    2026: ["01-01", "04-03", "04-06", "04-27", "05-01", "06-16", "08-10", "09-24", "11-04", "12-16", "12-25"],
+  },
+  EGX: {
+    2026: [
+      "01-01", "01-07", "01-29", "03-19", "03-22", "03-23", "04-12", "04-13", "05-07",
+      "05-26", "05-27", "05-28", "05-31", "06-18", "07-02", "07-23", "08-27", "10-08",
+    ],
+  },
+};
+
+const HKEX_HALF_DAY_CLOSE = 12 * 60 + 10;
+const SGX_HALF_DAY_CLOSE = 12 * 60 + 20;
+const ASX_EARLY_CLOSE = 14 * 60 + 15;
+
+/**
+ * Half-day sessions, as the local close with the closing auction rounded up
+ * the way freshness.ts lists regular closes (a weekend eve has none):
+ * - HKEX trades its morning session only on the eves of Lunar New Year,
+ *   Christmas and New Year, its closing auction ending by 12:10 (the circulars
+ *   above, and hkex.com.hk Trading Hours, Securities Market).
+ * - SGX trades to 12:00 on the same eves, its closing routine and trade at
+ *   close ending 12:16 (sgx.com/stock-exchange/trading; 2027 by that rule from
+ *   the MOM holidays above).
+ * - ASX closes at 14:10 with its closing auction on the last business day
+ *   before Christmas and the last of the year (ASX Notice 1245.26, Oct 2026,
+ *   and the trading calendar above).
+ */
+const PUBLISHED_APAC_EARLY_CLOSES: Readonly<Record<string, Record<number, Readonly<Record<string, number>>>>> = {
+  HKEX: {
+    2026: { "02-16": HKEX_HALF_DAY_CLOSE, "12-24": HKEX_HALF_DAY_CLOSE, "12-31": HKEX_HALF_DAY_CLOSE },
+    2027: { "02-05": HKEX_HALF_DAY_CLOSE, "12-24": HKEX_HALF_DAY_CLOSE, "12-31": HKEX_HALF_DAY_CLOSE },
+  },
+  SGX: {
+    2026: { "02-16": SGX_HALF_DAY_CLOSE, "12-24": SGX_HALF_DAY_CLOSE, "12-31": SGX_HALF_DAY_CLOSE },
+    2027: { "02-05": SGX_HALF_DAY_CLOSE, "12-24": SGX_HALF_DAY_CLOSE, "12-31": SGX_HALF_DAY_CLOSE },
+  },
+  ASX: {
+    2026: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
+    2027: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
+  },
+};
+
+/** The local close, in minutes of the day, of a published half-day session on `date`; undefined on any other day. */
+export function publishedApacEarlyClose(exchange: string, date: string): number | undefined {
+  if (!Object.hasOwn(PUBLISHED_APAC_EARLY_CLOSES, exchange)) return undefined;
+  return PUBLISHED_APAC_EARLY_CLOSES[exchange]![Number(date.slice(0, 4))]?.[date.slice(5)];
+}
+
+/** True only for a published full-day closure; unpublished years are unknown, not open. */
+export function isPublishedApacClosure(exchange: string, date: string): boolean {
+  if (!Object.hasOwn(PUBLISHED_APAC_CLOSURES, exchange)) return false;
+  return PUBLISHED_APAC_CLOSURES[exchange]![Number(date.slice(0, 4))]?.includes(date.slice(5)) ?? false;
+}
+
+/** True when the venue's closures of that year are published. */
+export function hasPublishedApacCalendar(exchange: string, year: number): boolean {
+  return Object.hasOwn(PUBLISHED_APAC_CLOSURES, exchange) && PUBLISHED_APAC_CLOSURES[exchange]![year] !== undefined;
+}

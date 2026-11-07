@@ -1,0 +1,508 @@
+import { futuresListingPriceBasis } from "../../utils/futures-generic";
+import type { TimeRange } from "../../time-series/range";
+import { RANGE_HISTORY_RESOLUTION } from "../../time-series/resolution";
+import type {
+  FinancialStatement,
+  Fundamentals,
+  NextEarnings,
+  OptionContract,
+  OptionsChain,
+  PricePoint,
+  Quote,
+  TickerFinancials,
+} from "../../types/financials";
+import {
+  type CloudFinancialsPayload,
+  type CloudMarketBatchItem,
+  type CloudMarketResponse,
+  type CloudOptionsChainPayload,
+  type CloudPricePointPayload,
+  type CloudQuotePayload,
+} from "../../api-client";
+import { normalizePriceValueByDivisor, resolveCurrencyUnit } from "../../utils/currency-units";
+import { resolveExchangeTimeZone } from "../../utils/exchanges";
+import { isRoundTheClockCoin } from "../../utils/crypto-pair";
+import { latestSettledSessionDate } from "../../utils/price-history";
+import { zonedDateTimeParts, zonedWallClockToUtcMs } from "../../utils/zoned-date-time";
+import { createProviderMiss } from "../provider-errors";
+import { parseOptionTicker } from "../../utils/options";
+import { reconcileQuoteDayRange } from "../../market-data/quotes/day-range";
+import { redactUnavailableFundamentals } from "../../utils/fundamentals";
+import { readWithdrawnObservations } from "../../utils/statement-gaps";
+import { parseListingDelisting } from "../../market-data/quotes/delisting";
+import { readIntradayBar, readStaleReason } from "../../market-data/quotes/intraday-bar";
+import { readSessionSplit } from "../../market-data/quotes/session-split";
+
+export const GLOOMBERB_CLOUD_PROVIDER_ID = "gloomberb-cloud" as const;
+
+export type CloudProviderMeta = NonNullable<
+  CloudMarketResponse<unknown>["providerMeta"]
+>;
+
+function cloudInternalProviderId(providerMeta?: CloudProviderMeta): string | null {
+  const upstream = providerMeta?.provider ?? providerMeta?.upstream;
+  return upstream ? `${GLOOMBERB_CLOUD_PROVIDER_ID}:${upstream}` : null;
+}
+
+/**
+ * A previous close is a price from inside the trailing 52 weeks, so it cannot
+ * sit far below the 52-week low. The service has sent 0.000205 as the
+ * Shanghai Composite's close (52-week low 3,741), which drew a +1.86e9% move.
+ * Today's price plays no part, so a real gap of any size still shows; two
+ * orders of magnitude leave room for a 52-week low that lags a crash or a split.
+ */
+const IMPOSSIBLE_CLOSE_FACTOR = 100;
+
+function isImpossiblePreviousClose(
+  previousClose: number | null | undefined,
+  low52w: number | null | undefined,
+): boolean {
+  return typeof previousClose === "number" && Number.isFinite(previousClose) && previousClose > 0
+    && typeof low52w === "number" && Number.isFinite(low52w) && low52w > 0
+    && previousClose * IMPOSSIBLE_CLOSE_FACTOR < low52w;
+}
+
+/** A quote that says it is something other than a future (an equity, a fund) keeps its own price basis. */
+function isNonFutureType(instrumentType: string | undefined): boolean {
+  const type = instrumentType?.trim().toUpperCase();
+  return !!type && type !== "FUTURE" && type !== "FUTURES" && type !== "FUT";
+}
+
+export function mapQuote(
+  quote: CloudQuotePayload,
+  providerMeta?: CloudProviderMeta,
+): Quote {
+  if (quote.priceBasis != null && !["nav", "per-unit", "percent-of-par", "points", "thirty-seconds"].includes(quote.priceBasis)) {
+    throw createProviderMiss("Unsupported quote price basis");
+  }
+  const { currency, divisor } = resolveCurrencyUnit(quote.currency);
+  const listingExchangeName = quote.listingExchangeName ?? quote.exchangeName;
+  const listingExchangeFullName =
+    quote.listingExchangeFullName ??
+    quote.fullExchangeName ??
+    listingExchangeName;
+  const internalProviderId = cloudInternalProviderId(providerMeta);
+  const impossibleClose = isImpossiblePreviousClose(quote.previousClose, quote.low52w);
+  const change = !impossibleClose && typeof quote.change === "number" && Number.isFinite(quote.change)
+    ? quote.change / divisor
+    : Number.NaN;
+  const changePercent = !impossibleClose && typeof quote.changePercent === "number" && Number.isFinite(quote.changePercent)
+    ? quote.changePercent
+    : Number.NaN;
+  // Generics, continuous symbols and listed contracts share their root's
+  // price basis: index futures in points and Treasury futures in 32nds.
+  const futuresBasis = isNonFutureType(quote.instrumentType) ? null
+    : futuresListingPriceBasis(quote.symbol, quote.listingExchangeName ?? quote.exchangeName);
+  const priceObservation = quote.priceBasis === "nav" ? "nav" : undefined;
+  const priceBasis = quote.priceBasis === "nav"
+    ? "per-unit"
+    : futuresBasis ?? quote.priceBasis;
+  return withoutUndefinedFields(reconcileQuoteDayRange({
+    ...quote,
+    delisting: parseListingDelisting(quote.delisting),
+    intradayBar: readIntradayBar(quote.intradayBar),
+    staleReason: readStaleReason(quote.staleReason),
+    priceBasis,
+    priceObservation,
+    currency: currency || quote.currency,
+    price: normalizePriceValueByDivisor(quote.price, divisor) ?? quote.price,
+    change,
+    changePercent,
+    previousClose: impossibleClose ? undefined : normalizePriceValueByDivisor(quote.previousClose, divisor),
+    // A split in the quote's session: its previous close is on the new basis already.
+    sessionSplit: impossibleClose ? undefined : readSessionSplit(quote.sessionSplit, divisor),
+    regularClose: normalizePriceValueByDivisor(quote.regularClose, divisor),
+    // JSON carries an unavailable move as null; the percent is unitless.
+    regularChange: normalizePriceValueByDivisor(quote.regularChange ?? undefined, divisor),
+    regularChangePercent: typeof quote.regularChangePercent === "number" && Number.isFinite(quote.regularChangePercent)
+      ? quote.regularChangePercent
+      : undefined,
+    high52w: normalizePriceValueByDivisor(quote.high52w, divisor),
+    low52w: normalizePriceValueByDivisor(quote.low52w, divisor),
+    bid: normalizePriceValueByDivisor(quote.bid, divisor),
+    ask: normalizePriceValueByDivisor(quote.ask, divisor),
+    open: normalizePriceValueByDivisor(quote.open, divisor),
+    high: normalizePriceValueByDivisor(quote.high, divisor),
+    low: normalizePriceValueByDivisor(quote.low, divisor),
+    mark: normalizePriceValueByDivisor(quote.mark, divisor),
+    lastTradePrice: normalizePriceValueByDivisor(quote.lastTradePrice, divisor),
+    preMarketPrice: normalizePriceValueByDivisor(quote.preMarketPrice, divisor),
+    preMarketChange: normalizePriceValueByDivisor(
+      quote.preMarketChange,
+      divisor,
+    ),
+    postMarketPrice: normalizePriceValueByDivisor(
+      quote.postMarketPrice,
+      divisor,
+    ),
+    postMarketChange: normalizePriceValueByDivisor(
+      quote.postMarketChange,
+      divisor,
+    ),
+    extendedSessionPrint: typeof quote.extendedSessionPrint === "boolean" ? quote.extendedSessionPrint : undefined,
+    // A coin's move over 24 hours, or none, when its previous close is undatable.
+    changeBasis: quote.changeBasis === "24h" || quote.changeBasis === "none" ? quote.changeBasis : undefined,
+    overnightPrice: normalizePriceValueByDivisor(quote.overnightPrice, divisor),
+    overnightChange: normalizePriceValueByDivisor(quote.overnightChange, divisor),
+    overnightPriceKind: quote.overnightPriceKind === "trade" || quote.overnightPriceKind === "mark"
+      ? quote.overnightPriceKind
+      : undefined,
+    listingExchangeName,
+    listingExchangeFullName,
+    exchangeName: listingExchangeName,
+    fullExchangeName: listingExchangeFullName,
+    providerId: GLOOMBERB_CLOUD_PROVIDER_ID,
+    provenance: internalProviderId
+      ? {
+          ...quote.provenance,
+          price: {
+            providerId: internalProviderId,
+            dataSource: quote.dataSource,
+          },
+          session: {
+            providerId: internalProviderId,
+            dataSource: quote.dataSource,
+          },
+          routing: {
+            providerId: GLOOMBERB_CLOUD_PROVIDER_ID,
+            dataSource: quote.dataSource,
+          },
+          fields: {
+            ...quote.provenance?.fields,
+            cloudProvider: {
+              providerId: internalProviderId,
+              dataSource: quote.dataSource,
+            },
+            ...(providerMeta?.fallbackReason
+              ? { fallbackReason: { providerId: providerMeta.fallbackReason } }
+              : {}),
+          },
+        }
+      : quote.provenance,
+  }));
+}
+
+/**
+ * JSON has no undefined, so a field the server left out must stay absent here
+ * too; the desktop window only ever sees the JSON form. Whether an omitted
+ * field keeps the earlier value is decided when contributions merge: the
+ * 52-week range and name carry over, a close or volume from another trading
+ * day does not.
+ */
+function withoutUndefinedFields<T extends object>(value: T): T {
+  const result = {} as T;
+  for (const key in value) {
+    if (value[key] !== undefined) result[key] = value[key];
+  }
+  return result;
+}
+
+const LOCAL_DATE_TIME_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?)?$/;
+const EXPLICIT_TIME_ZONE_PATTERN = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+function parseCloudPricePointDate(
+  value: Date | string | number,
+  exchange: string,
+): Date {
+  if (value instanceof Date || typeof value === "number") return new Date(value);
+  if (EXPLICIT_TIME_ZONE_PATTERN.test(value)) return new Date(value);
+
+  const match = value.match(LOCAL_DATE_TIME_PATTERN);
+  if (!match) return new Date(value);
+
+  const hasTime = match[4] !== undefined;
+  if (!hasTime) {
+    return new Date(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`);
+  }
+
+  const timeZone = resolveExchangeTimeZone(exchange);
+  return timeZone
+    ? new Date(zonedWallClockToUtcMs(
+      timeZone,
+      Number(match[1]),
+      Number(match[2]),
+      Number(match[3]),
+      Number(match[4]),
+      Number(match[5]),
+      Number(match[6] ?? "0"),
+    ))
+    : new Date(value);
+}
+
+/** A served venue count, when it is one: a venue name and a count of zero or more. */
+function venueVolume(value: unknown): { venueVolume: { venue: string; volume: number } } | null {
+  if (!value || typeof value !== "object") return null;
+  const { venue, volume } = value as { venue?: unknown; volume?: unknown };
+  return typeof venue === "string" && venue.trim() && typeof volume === "number" && Number.isFinite(volume) && volume >= 0
+    ? { venueVolume: { venue: venue.trim(), volume } }
+    : null;
+}
+
+/** What a served bar's volume counts, when it is a short plain phrase (`aggregate`, `3 spot venues`). */
+function volumeBasis(value: unknown): { volumeBasis: string } | null {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9 ]{0,31}$/i.test(value.trim()) ? { volumeBasis: value.trim() } : null;
+}
+
+/**
+ * One served bar. `coin`: the bars are a coin's, which trades every hour of every day. Its intraday volume is the
+ * value traded in the bar on major spot venues, and a bar no venue reported has none rather than 0, so a 0 (from an
+ * older copy, or a daily bar) is volume not reported, not a bar nothing traded in. It is read as missing, so no table
+ * prints 0 and no sum or average counts it. Any other listing keeps a 0, which a thin stock can truly trade.
+ */
+export function mapPricePoint(
+  point: CloudPricePointPayload,
+  divisor = 1,
+  exchange = "",
+  coin = false,
+): PricePoint {
+  return {
+    date: parseCloudPricePointDate(point.date, exchange),
+    open: normalizePriceValueByDivisor(point.open, divisor),
+    high: normalizePriceValueByDivisor(point.high, divisor),
+    low: normalizePriceValueByDivisor(point.low, divisor),
+    close: normalizePriceValueByDivisor(point.close, divisor) ?? point.close,
+    volume: coin && point.volume === 0 ? undefined : point.volume,
+    ...(venueVolume(point.venueVolume) ?? {}),
+    ...(volumeBasis(point.volumeBasis) ?? {}),
+    ...(point.partial === true ? { partial: true } : {}),
+    ...(point.filled === true ? { filled: true } : {}),
+    ...(point.unsettled === true ? { unsettled: true } : {}),
+    ...(typeof point.contract === "string" && FUTURES_CONTRACT_CODE.test(point.contract) ? { contract: point.contract } : {}),
+  };
+}
+
+/** A listed contract as a continuous future's bar names it: root, month letter and year (NGZ26, ZQF27). */
+const FUTURES_CONTRACT_CODE = /^[A-Z0-9]{1,4}[FGHJKMNQUVXZ]\d{2}$/;
+
+/** Per-share bases the statistics block serves beside its multiples. */
+const CLOUD_PER_SHARE_BASES = ["forwardEps", "dividendRate"] as const;
+
+/**
+ * The served statistics block with retractions applied. Forward EPS and the
+ * dividend rate are the per-share bases the live quote reprices forward P/E
+ * and the dividend yield from; JSON encodes a withdrawn one as null, and only
+ * a finite number is kept.
+ */
+function mapCloudFundamentals(fundamentals: Fundamentals | undefined): Fundamentals | undefined {
+  const value = redactUnavailableFundamentals(fundamentals);
+  if (!value) return value;
+  let result = value;
+  for (const field of CLOUD_PER_SHARE_BASES) {
+    const raw: unknown = value[field];
+    if (raw === undefined || (typeof raw === "number" && Number.isFinite(raw))) continue;
+    if (result === value) result = { ...value };
+    delete result[field];
+  }
+  return result;
+}
+
+const EARNINGS_TIMINGS: ReadonlySet<unknown> = new Set(["bmo", "dmh", "amc"]);
+// "company": a date (and time) the company announced itself, which the service keeps over the calendar's.
+const EARNINGS_TIMING_SOURCES: ReadonlySet<unknown> = new Set(["filing", "calendar", "history", "company"]);
+
+/** The served next report; one without a calendar date is left out. */
+function mapCloudNextEarnings(value: NextEarnings | undefined): NextEarnings | undefined {
+  if (!value || typeof value.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value.date)) return undefined;
+  return {
+    date: value.date,
+    timing: EARNINGS_TIMINGS.has(value.timing) ? value.timing : null,
+    timingSource: EARNINGS_TIMING_SOURCES.has(value.timingSource) ? value.timingSource : null,
+  };
+}
+
+/**
+ * A served statement row with withdrawn values read as declared gaps, without
+ * the per-issuer provenance the service can still attach.
+ */
+function mapCloudStatement(row: FinancialStatement): FinancialStatement {
+  const { earningsResult: _earnings, operatingResult: _operating, operatingResultAggregation: _aggregation, ...statement } = row;
+  return readWithdrawnObservations(statement);
+}
+
+export function mapCloudFinancials(
+  financials: CloudFinancialsPayload,
+  providerMeta?: CloudProviderMeta,
+): TickerFinancials {
+  const rawQuote = financials.quote;
+  const quote = rawQuote ? mapQuote(rawQuote, providerMeta) : undefined;
+  const divisor = rawQuote ? resolveCurrencyUnit(rawQuote.currency).divisor : 1;
+  const exchange = rawQuote?.listingExchangeName ?? rawQuote?.exchangeName ?? "";
+  const coin = isRoundTheClockCoin(rawQuote?.symbol, exchange);
+  return {
+    quote,
+    quoteMetadata: financials.quoteMetadata,
+    quoteContributions: financials.quoteContributions,
+    profile: financials.profile,
+    ...(financials.nextEarnings ? { nextEarnings: mapCloudNextEarnings(financials.nextEarnings) } : {}),
+    fundamentals: mapCloudFundamentals(financials.fundamentals),
+    financialCurrency: financials.financialCurrency,
+    statementHistory: financials.statementHistory,
+    annualStatements: (financials.annualStatements ?? []).map(mapCloudStatement),
+    quarterlyStatements: (financials.quarterlyStatements ?? []).map(mapCloudStatement),
+    priceHistory: (financials.priceHistory ?? []).map((point) =>
+      point.date instanceof Date
+        ? point
+        : mapPricePoint(point as unknown as CloudPricePointPayload, divisor, exchange, coin),
+    ),
+    ...(financials.epsEstimates ? { epsEstimates: financials.epsEstimates } : {}),
+  };
+}
+
+/**
+ * Whether a contract is one a corporate action adjusted: the server tags the
+ * ones it lists on request, and a contract under a numbered root that is not
+ * the underlying's (ETHA1 beside ETHA) is one too, from a server that does not.
+ */
+function adjustedRoot(contract: OptionContract, underlying: string): string | null {
+  if (contract.adjusted) return contract.adjusted.root;
+  const root = parseOptionTicker(contract.contractSymbol)?.underlying.toUpperCase();
+  return root && /\d$/.test(root) && root !== underlying.toUpperCase() ? root : null;
+}
+
+/**
+ * A served chain: its standard contracts, or with `adjusted` the contracts a
+ * corporate action adjusted, which price another deliverable and are listed
+ * only when asked for.
+ */
+export function mapOptionsChain(
+  chain: CloudOptionsChainPayload,
+  { adjusted = false }: { adjusted?: boolean } = {},
+): OptionsChain {
+  // An adjusted contract a server did not tag is tagged here, its deliverable unstated.
+  const contracts = (side: OptionContract[] | undefined) => (side ?? []).flatMap((contract) => {
+    const root = adjustedRoot(contract, chain.underlyingSymbol);
+    if ((root != null) !== adjusted) return [];
+    return [root && !contract.adjusted ? { ...contract, adjusted: { root, deliverable: null } } : contract];
+  });
+  return {
+    underlyingSymbol: chain.underlyingSymbol,
+    expirationDates: chain.expirationDates ?? [],
+    calls: contracts(chain.calls),
+    puts: contracts(chain.puts),
+    providerId: chain.providerId,
+    dataSource: chain.dataSource,
+    feed: chain.feed,
+    delayMinutes: chain.delayMinutes,
+    realtimeEligible: chain.realtimeEligible,
+    asOf: chain.asOf,
+    // Left absent when the server does not send it, so the date is then established against OPX.
+    ...(chain.openInterestAsOf !== undefined ? { openInterestAsOf: chain.openInterestAsOf } : {}),
+    ...(Number.isFinite(chain.rate) ? { rate: chain.rate } : {}),
+    ...(chain.venue ? { venue: chain.venue } : {}),
+  };
+}
+
+/** The reason code Gloom Cloud gives an empty answer for a symbol no listing carries. */
+export const NOT_FOUND_REASON = "NOT_FOUND";
+
+export function isEmptyCloudStatus(
+  status: CloudMarketResponse<unknown>["status"],
+): boolean {
+  return status === "empty" || status === "unsupported";
+}
+
+/** The service answered that its own source failed: `retryable_error`, or `fatal_error`, its catch-all for an upstream error. */
+export function isCloudSourceFailure(status: CloudMarketResponse<unknown>["status"]): boolean {
+  return status === "retryable_error" || status === "fatal_error";
+}
+
+export function mapBatchError<T>(
+  item: CloudMarketBatchItem<T>,
+  fallbackMessage: string,
+): Error {
+  if (isEmptyCloudStatus(item.status)) {
+    return createProviderMiss(item.reasonCode ?? fallbackMessage, item.message, { notFound: item.reasonCode === NOT_FOUND_REASON });
+  }
+  return new Error(item.reasonCode ?? fallbackMessage);
+}
+
+export function toCloudInterval(interval: string): string {
+  switch (interval) {
+    case "1m":
+      return "1min";
+    case "5m":
+      return "5min";
+    case "15m":
+      return "15min";
+    case "30m":
+      return "30min";
+    case "45m":
+      return "45min";
+    case "1d":
+      return "1day";
+    case "1wk":
+      return "1week";
+    case "1mo":
+      return "1month";
+    default:
+      return interval;
+  }
+}
+
+function padTimePart(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+export function formatCloudDateTime(
+  date: Date,
+  includeTime: boolean,
+  exchange = "",
+): string {
+  if (includeTime) {
+    const timeZone = resolveExchangeTimeZone(exchange);
+    if (timeZone) {
+      const { year, month, day, hour, minute, second } = zonedDateTimeParts(date.getTime(), timeZone);
+      return `${year}-${padTimePart(month)}-${padTimePart(day)} ${padTimePart(hour)}:${padTimePart(minute)}:${padTimePart(second)}`;
+    }
+    // Without a venue timezone, an explicit offset keeps host and server clocks
+    // from interpreting the same intraday boundary as different instants.
+    return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  const year = date.getUTCFullYear();
+  const month = padTimePart(date.getUTCMonth() + 1);
+  const day = padTimePart(date.getUTCDate());
+  return `${year}-${month}-${day}`;
+}
+
+const DAY_MS = 24 * 60 * 60_000;
+
+/**
+ * The end of a window of bars that ends now. Gloom Cloud reads a date-only end
+ * as exclusive, so a daily or longer window ending on today's date holds no
+ * bar of today. Once today's regular session has settled its bar is final and
+ * the window ends the day after, so the bar is served as the range requests
+ * serve it. While the session trades, or before it opens, today's date stands:
+ * the day's bar is the live quote's then. Intraday ends carry their time.
+ */
+export function formatCloudHistoryEnd(end: Date, includeTime: boolean, exchange = ""): string {
+  const formatted = formatCloudDateTime(end, includeTime, exchange);
+  if (includeTime) return formatted;
+  const settled = latestSettledSessionDate(exchange, end.getTime());
+  return settled && settled >= formatted
+    ? new Date(Date.parse(`${settled}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10)
+    : formatted;
+}
+
+const HISTORY_OUTPUT_SIZE: Record<TimeRange, number> = {
+  "1D": 24 * 12,
+  "1W": 7 * 24,
+  "1M": 31,
+  "3M": 93,
+  "6M": 186,
+  "1Y": 366,
+  "5Y": 261,
+  "ALL": 600,
+};
+
+/** The bar size comes from the shared range table, which `gloom help history` also lists. */
+export function toHistoryRequest(range: TimeRange): {
+  interval: string;
+  outputsize: number;
+  rangeKey: TimeRange;
+} {
+  const resolution = RANGE_HISTORY_RESOLUTION[range];
+  if (!resolution) return { interval: "1day", outputsize: 366, rangeKey: range };
+  return { interval: toCloudInterval(resolution), outputsize: HISTORY_OUTPUT_SIZE[range], rangeKey: range };
+}

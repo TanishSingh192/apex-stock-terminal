@@ -1,0 +1,281 @@
+import { createCliRenderer, type CliRenderer } from "@opentui/core";
+import { createRoot, useKeyboard, useTerminalDimensions } from "@opentui/react";
+import { Profiler, type ReactNode } from "react";
+import { resetTerminalInputState } from "./terminal-input-reset";
+import type { KeyEventLike } from "../../react/input";
+import type { NativeRendererHost, PixelResolution, RendererHost } from "../../ui/host";
+import { colors } from "../../theme/colors";
+import { safeExternalUrl } from "../../utils/external-url";
+import { browserOpenCommands, runBrowserOpener } from "./browser-open";
+import { buildTerminalMediaArgs, createTerminalMediaReaper, terminalMediaStateFile } from "./terminal-media";
+import { saveTextFileToDownloads } from "../../utils/save-text-file";
+import { installInteractionPerformanceRecorder } from "./interaction-performance";
+import { provideKittyServices } from "./kitty-services";
+import { captureRendererFrame } from "./frame-capture";
+import {
+  createTimerFrameDriver,
+  installMarketDataFrameDriver,
+  TERMINAL_DATA_FRAME_INTERVAL_MS,
+  withLoadPacing,
+} from "../../market-data/frame-scheduler";
+
+export { useKeyboard, useTerminalDimensions };
+
+const terminalMedia = createTerminalMediaReaper({ stateFile: terminalMediaStateFile() });
+
+export interface OpenTuiHost {
+  renderer: CliRenderer;
+  rendererHost: RendererHost;
+  nativeRenderer: NativeRendererHost;
+  render(node: ReactNode): void;
+  destroy(): void;
+}
+
+export function toKeyEventLike(event: {
+  name?: string;
+  ctrl?: boolean;
+  shift?: boolean;
+  alt?: boolean;
+  meta?: boolean;
+  option?: boolean;
+  preventDefault?: () => void;
+  stopPropagation?: () => void;
+  defaultPrevented?: boolean;
+  propagationStopped?: boolean;
+  sequence?: string;
+  key?: string;
+  super?: boolean;
+  /** Set only when the terminal reports key event types (kitty protocol); the app does not ask for them. */
+  repeated?: boolean;
+}): KeyEventLike {
+  const key = event.name ?? event.key ?? "";
+  return {
+    key,
+    name: key,
+    sequence: event.sequence,
+    ctrl: event.ctrl ?? false,
+    shift: event.shift ?? false,
+    // OpenTUI follows terminal naming: `meta` is Alt/Option, while the
+    // kitty keyboard protocol exposes the Command/Windows modifier as
+    // `super`. Keep the shared input model aligned with browser semantics.
+    alt: event.alt === true || event.meta === true || event.option === true,
+    meta: event.super === true,
+    super: event.super === true,
+    // Left unset unless the terminal says so: a press it does not flag may still be a repeat.
+    repeat: event.repeated === true ? true : undefined,
+    get defaultPrevented() {
+      return event.defaultPrevented ?? false;
+    },
+    get propagationStopped() {
+      return event.propagationStopped ?? false;
+    },
+    preventDefault: () => event.preventDefault?.(),
+    stopPropagation: () => event.stopPropagation?.(),
+  };
+}
+
+function samePixelResolution(left: PixelResolution | null, right: PixelResolution | null): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.width === right.width && left.height === right.height;
+}
+
+function installResolutionEventBridge(renderer: CliRenderer): void {
+  let lastResolution = renderer.resolution ?? null;
+  const emitIfChanged = () => {
+    const nextResolution = renderer.resolution ?? null;
+    if (samePixelResolution(lastResolution, nextResolution)) return;
+    lastResolution = nextResolution;
+    renderer.emit("resolution", nextResolution);
+  };
+
+  renderer.prependInputHandler(() => {
+    queueMicrotask(emitIfChanged);
+    return false;
+  });
+  renderer.on("resize", () => {
+    queueMicrotask(emitIfChanged);
+  });
+}
+
+export async function createOpenTuiHost(): Promise<OpenTuiHost> {
+  resetTerminalInputState();
+
+  // A watch reload SIGKILLs this process, so the player it started outlives it
+  // and keeps decoding into the terminal. Clear those before taking the screen.
+  terminalMedia.reapStale();
+
+  // Mouse motion is reported per pixel; our @opentui/core patch coalesces moves
+  // to one per fastest frame (~16ms) so pointer-tracked UI like the chart
+  // crosshair follows the cursor instead of stepping at 10fps.
+  const renderer = await createCliRenderer({
+    exitOnCtrlC: true,
+    backgroundColor: colors.bg,
+    enableMouseMovement: true,
+  });
+  const root = createRoot(renderer);
+  // Every mounted ScrollBox listens for `selection` and many components for
+  // `resize`, so the counts grow with the panes on screen (14 and 18 with one
+  // DES open at 80x24) and fall back when they close. Node's default warning
+  // at 11 is not a leak here, and it prints over the panes.
+  renderer.setMaxListeners(0);
+  installResolutionEventBridge(renderer);
+  // Streamed quotes apply and notify on one clock of up to 10 Hz: every
+  // visible row stays live while a burst of ticks costs one terminal redraw,
+  // and a layout whose redraws are expensive gets fewer of them.
+  installMarketDataFrameDriver(withLoadPacing(createTimerFrameDriver(TERMINAL_DATA_FRAME_INTERVAL_MS)));
+  const stopInteractionPerformanceRecorder = installInteractionPerformanceRecorder(renderer);
+  renderer.once("destroy", stopInteractionPerformanceRecorder);
+
+  const rendererHost: RendererHost = {
+    requestExit: () => renderer.destroy(),
+    async openExternal(rawUrl) {
+      const url = safeExternalUrl(rawUrl);
+      if (!url) return false;
+      for (const command of browserOpenCommands(url, process.env, process.platform)) {
+        if (await runBrowserOpener(command)) return true;
+      }
+      // Leave the link on the clipboard, so it can at least be pasted.
+      renderer.copyToClipboardOSC52(url);
+      return false;
+    },
+    async copyText(text) {
+      if (!text) return;
+      if (renderer.copyToClipboardOSC52(text)) return;
+      if (process.platform !== "darwin") return;
+      const proc = Bun.spawn(["pbcopy"], {
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      proc.stdin.write(text);
+      proc.stdin.end();
+      await proc.exited;
+    },
+    async readText() {
+      if (process.platform !== "darwin") return "";
+      const proc = Bun.spawn(["pbpaste"], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      return await new Response(proc.stdout).text();
+    },
+    async saveTextFile({ name, text }) {
+      return saveTextFileToDownloads(name, text);
+    },
+    notify() {
+      // The app-level notifier still owns toast/desktop notification behavior.
+    },
+    async playTerminalMedia(url, title, options) {
+      const mpv = Bun.which("mpv");
+      if (!mpv) {
+        throw new Error("mpv is required for terminal TV playback. Install mpv and try again.");
+      }
+
+      terminalMedia.reapStale();
+      renderer.suspend();
+      try {
+        const proc = Bun.spawn([
+          mpv,
+          ...buildTerminalMediaArgs({ url, title, muted: options?.muted }),
+        ], {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "pipe",
+        });
+        terminalMedia.track(proc);
+        const stderrPromise = new Response(proc.stderr).text();
+        const exitCode = await proc.exited;
+        const stderr = await stderrPromise;
+        if (exitCode !== 0) {
+          const detail = stderr.trim().split("\n").slice(-3).join(" ");
+          throw new Error(detail || `mpv exited with status ${exitCode}`);
+        }
+      } finally {
+        terminalMedia.stopActive();
+        renderer.resume();
+        renderer.requestRender();
+      }
+    },
+    stopTerminalMedia() {
+      terminalMedia.stopActive();
+    },
+  };
+
+  const nativeRenderer = provideKittyServices({
+    get terminalWidth() {
+      return renderer.terminalWidth;
+    },
+    get terminalHeight() {
+      return renderer.terminalHeight;
+    },
+    get resolution() {
+      return renderer.resolution ?? null;
+    },
+    get capabilities() {
+      return renderer.capabilities;
+    },
+    get isDestroyed() {
+      return renderer.isDestroyed;
+    },
+    get currentFocusedRenderable() {
+      return renderer.currentFocusedRenderable ?? null;
+    },
+    get currentFocusedEditor() {
+      return renderer.currentFocusedEditor ?? null;
+    },
+    get keyInput() {
+      return renderer.keyInput as unknown as NativeRendererHost["keyInput"];
+    },
+    on: (event, handler) => renderer.on(event, handler),
+    off: (event, handler) => renderer.off(event, handler),
+    requestRender: () => renderer.requestRender(),
+    registerLifecyclePass: (renderable) => renderer.registerLifecyclePass(renderable as any),
+    unregisterLifecyclePass: (renderable) => renderer.unregisterLifecyclePass(renderable as any),
+    getSelection: () => renderer.getSelection(),
+    getCursorState: () => renderer.getCursorState(),
+    setCursorPosition: (x, y, visible = true) => renderer.setCursorPosition(x, y, visible),
+    addPostProcessFn: (processFn) => renderer.addPostProcessFn(processFn as any),
+    removePostProcessFn: (processFn) => renderer.removePostProcessFn(processFn as any),
+    copyToClipboardOSC52: (text) => renderer.copyToClipboardOSC52(text),
+    captureFrame: () => captureRendererFrame(renderer),
+    async capturePaneImage(rect) {
+      if (renderer.isDestroyed) throw new Error("The terminal has closed.");
+      // Loaded on first use: the glyph atlas is only needed for a picture.
+      const { captureTerminalPaneImage } = await import("./pane-image");
+      return captureTerminalPaneImage(renderer, nativeRenderer.nativeSurfaceManager, rect, colors.bg);
+    },
+    captureMouseRenderable(renderable) {
+      const capture = (renderer as unknown as { setCapturedRenderable?: (target: unknown) => void }).setCapturedRenderable;
+      if (typeof capture === "function") {
+        capture.call(renderer, renderable);
+      }
+    },
+    write(data) {
+      if (renderer.isDestroyed) return false;
+      const writer = (renderer as unknown as { writeOut?: (payload: string | Uint8Array) => void }).writeOut;
+      if (typeof writer !== "function") return false;
+      writer.call(renderer, data);
+      return true;
+    },
+  });
+
+  return {
+    renderer,
+    rendererHost,
+    nativeRenderer,
+    render: (node) => root.render(
+      stopInteractionPerformanceRecorder.enabled
+        ? (
+            <Profiler
+              id="interaction-performance"
+              onRender={stopInteractionPerformanceRecorder.markCommit}
+            >
+              {node}
+            </Profiler>
+          )
+        : node,
+    ),
+    destroy: () => renderer.destroy(),
+  };
+}

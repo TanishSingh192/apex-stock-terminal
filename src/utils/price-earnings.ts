@@ -1,0 +1,104 @@
+import type { Fundamentals } from "../types/financials";
+import { formatNumber } from "./format";
+import { enterpriseValueNotMeaningful } from "./fundamentals";
+
+export const PRICE_EARNINGS_NOTICE = "N/M = not meaningful. Non-positive P/E values are excluded from ranking.";
+
+/** A multiple over a loss or zero base: there is no number to show, rank or export. */
+export const NOT_MEANINGFUL = "not-meaningful";
+export type PriceEarnings = number | typeof NOT_MEANINGFUL;
+
+function nonPositive(value: number | null | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value <= 0;
+}
+
+/**
+ * A P/E checked against the earnings it divides by. Zero or negative earnings
+ * make it not meaningful whatever multiple a source served beside them: a
+ * source P/E priced at an older, profitable period stays positive after the
+ * trailing EPS turns into a loss (MSTR's 5.47 beside EPS -99.08). Unknown
+ * earnings leave the multiple as served.
+ */
+export function priceEarningsOnEarnings(
+  multiple: number | null | undefined,
+  earnings: number | null | undefined,
+): PriceEarnings | undefined {
+  if (nonPositive(earnings)) return NOT_MEANINGFUL;
+  return typeof multiple === "number" && Number.isFinite(multiple) ? multiple : undefined;
+}
+
+/** Negative earnings do not make a security cheaper than a profitable peer. */
+export function comparablePriceEarnings(value: PriceEarnings | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** P/E, forward P/E or PEG: N/M below zero, as the multiple says nothing there. */
+export function formatPriceEarnings(value: PriceEarnings | null | undefined, precision = 1): string {
+  if (value === NOT_MEANINGFUL) return "N/M";
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value <= 0 ? "N/M" : formatNumber(value, precision);
+}
+
+/**
+ * The fiscal year a forward consensus is for, as a label names it: `FY27`
+ * for a year that ends in 2027, whichever month. Null for a block that does
+ * not say.
+ */
+export function forwardFiscalYear(periodEnd: string | null | undefined): string | null {
+  return typeof periodEnd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(periodEnd) ? `FY${periodEnd.slice(2, 4)}` : null;
+}
+
+/**
+ * Whether a forward P/E line is shown even with no figure: the block read
+ * next year's consensus for a company (one with a trailing EPS) and found
+ * none, or one from before the last split, which reads as a dash.
+ */
+export function forwardPEAsked(fundamentals: Pick<Fundamentals, "forwardEpsPeriodEnd" | "eps"> | undefined): boolean {
+  return fundamentals?.forwardEpsPeriodEnd !== undefined && fundamentals.eps != null;
+}
+
+type PriceEarningsField = "trailingPE" | "forwardPE" | "pegRatio";
+
+/**
+ * Why each earnings multiple of a fundamentals block is not meaningful, if it
+ * is not: a trailing or forward EPS at or below zero, or a multiple that is
+ * itself at or below zero. Forward P/E is judged on its own estimate only, so
+ * a trailing loss leaves a positive forward multiple alone.
+ */
+export function notMeaningfulMultiples(
+  fundamentals: Pick<Fundamentals, PriceEarningsField | "eps" | "forwardEps"> | undefined,
+): Partial<Record<PriceEarningsField, string>> {
+  const reasons: Partial<Record<PriceEarningsField, string>> = {};
+  if (!fundamentals) return reasons;
+  if (nonPositive(fundamentals.eps)) reasons.trailingPE = "trailing EPS is not positive";
+  else if (nonPositive(fundamentals.trailingPE)) reasons.trailingPE = "trailing earnings are not positive";
+  if (nonPositive(fundamentals.forwardEps)) reasons.forwardPE = "forward EPS is not positive";
+  else if (nonPositive(fundamentals.forwardPE)) reasons.forwardPE = "forward earnings are not positive";
+  if (nonPositive(fundamentals.pegRatio)) reasons.pegRatio = "P/E or expected growth is not positive";
+  return reasons;
+}
+
+/**
+ * The fundamentals block as JSON exports it: a multiple that is not meaningful
+ * reads null, with the reason under `notMeaningful`, never as a number. An
+ * enterprise value at or below zero does too, with EV/revenue over it.
+ */
+export function exportedFundamentals<T extends Fundamentals>(
+  fundamentals: T | undefined,
+): (Omit<T, PriceEarningsField | EnterpriseValueField> & Partial<Record<PriceEarningsField | EnterpriseValueField, number | null>> & {
+  notMeaningful?: Partial<Record<PriceEarningsField | EnterpriseValueField, string>>;
+}) | undefined {
+  if (!fundamentals) return fundamentals;
+  const reasons: Partial<Record<PriceEarningsField | EnterpriseValueField, string>> = notMeaningfulMultiples(fundamentals);
+  const enterpriseValue = enterpriseValueNotMeaningful(fundamentals);
+  if (enterpriseValue) reasons.enterpriseValue = reasons.enterpriseToRevenue = enterpriseValue;
+  const fields = Object.keys(reasons) as Array<PriceEarningsField | EnterpriseValueField>;
+  if (fields.length === 0) return fundamentals;
+  return {
+    ...fundamentals,
+    ...Object.fromEntries(fields.map((field) => [field, null])),
+    notMeaningful: reasons,
+  };
+}
+
+type EnterpriseValueField = "enterpriseValue" | "enterpriseToRevenue";

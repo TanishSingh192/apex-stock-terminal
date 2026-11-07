@@ -1,0 +1,294 @@
+import { logFailure } from "../../utils/log-failure";
+import { useCallback, useEffect, useRef, type Dispatch } from "react";
+import { loadPersistedBrokerAccountMap } from "../../brokers/account-cache";
+import type { AppSessionSnapshot } from "../../core/state/session-persistence";
+import type { AppTickerRepositoryPort } from "../../core/app-service-ports";
+import type { MarketDataCoordinator } from "../../market-data/coordinator";
+import { instrumentFromTicker, type InstrumentRef } from "../../market-data/request-types";
+import { useSavedLayoutWarmup } from "./layout-warmup";
+import { chatController } from "../../plugins/builtin/chat/controller";
+import { PLUGIN_MARKETPLACE_PANE_ID } from "../../plugins/marketplace/ids";
+import { activateInstall } from "../../plugins/marketplace/activation";
+import { getMarketplaceHost, getPluginManager } from "../../plugins/marketplace/store";
+import { listExternalPlugins } from "../../plugins/external-runtime";
+import { scheduleConfigSave } from "../../state/config-save-scheduler";
+import { startPluginSeedConsumer, withPluginSeedRecord } from "./plugin-seed";
+import type { LoadedExternalPlugin } from "../../plugins/loader";
+import type { PluginRegistry } from "../../plugins/registry";
+import type {
+  AppAction,
+  AppState,
+} from "../../state/app/context";
+import {
+  initializeAppState,
+  type InitializeAppStateArgs,
+} from "../../state/app/bootstrap";
+import type { DataProvider } from "../../types/data-provider";
+import {
+  findPaneInstance,
+  getPlacedPaneInstanceIds,
+  type LayoutConfig,
+} from "../../types/config";
+import type { BrokerAccount } from "../../types/trading";
+import {
+  recordRestoredFunctions,
+  usageFunctionForPane,
+  type UsageFunction,
+} from "../../telemetry/usage-counts";
+import { debugLog } from "../../utils/debug-log";
+import { markStartupComplete, startMainThreadStallMonitor } from "../../utils/main-thread-stall";
+import { measurePerfAsync } from "../../utils/perf-marks";
+
+const appLog = debugLog.createLogger("app");
+
+/** How long the restored panes wait for plugins that register theirs during setup. */
+const RESTORED_FUNCTIONS_WAIT_MS = 15_000;
+/** Long enough to read what to install before it goes. */
+const PLUGIN_SEED_NOTICE_MS = 12_000;
+
+/**
+ * One function per pane placed in the layout: docked, floating and popped
+ * out. Panes of disabled plugins are hidden and left out.
+ */
+function restoredUsageFunctions(
+  layout: LayoutConfig,
+  pluginRegistry: PluginRegistry,
+  disabledPlugins: readonly string[],
+): UsageFunction[] {
+  const functions: UsageFunction[] = [];
+  for (const instanceId of getPlacedPaneInstanceIds(layout)) {
+    const paneId = findPaneInstance(layout, instanceId)?.paneId;
+    if (!paneId) continue;
+    const pluginId = pluginRegistry.getPanePluginId(paneId);
+    if (pluginId && disabledPlugins.includes(pluginId)) continue;
+    functions.push(usageFunctionForPane(pluginRegistry, paneId));
+  }
+  return functions;
+}
+
+interface UseAppStartupRuntimeOptions {
+  appActive: boolean;
+  autoImportBrokerPositions: InitializeAppStateArgs["autoImportBrokerPositions"];
+  /** Syncs one saved broker profile, as its Sync action does. */
+  importBrokerPositions: (instanceId: string) => Promise<unknown>;
+  dataProvider: DataProvider;
+  dispatch: Dispatch<AppAction>;
+  externalPlugins: readonly LoadedExternalPlugin[];
+  focusedTickerSymbol: string | null;
+  getState: () => AppState;
+  isDetachedWindow?: boolean;
+  marketData: MarketDataCoordinator;
+  pluginRegistry: PluginRegistry;
+  /** Settles once every plugin has registered, setup included. */
+  pluginsReady?: Promise<unknown>;
+  primeCachedFinancials: InitializeAppStateArgs["primeCachedFinancials"];
+  refreshQuote: InitializeAppStateArgs["refreshQuote"];
+  refreshQuotesBatch: InitializeAppStateArgs["refreshQuotesBatch"];
+  refreshTicker: InitializeAppStateArgs["refreshTicker"];
+  refreshTickersBatch: InitializeAppStateArgs["refreshTickersBatch"];
+  sessionSnapshot?: AppSessionSnapshot | null;
+  state: AppState;
+  tickerRepository: AppTickerRepositoryPort;
+}
+
+export function useAppStartupRuntime({
+  appActive,
+  autoImportBrokerPositions,
+  importBrokerPositions,
+  dataProvider,
+  dispatch,
+  externalPlugins,
+  focusedTickerSymbol,
+  getState,
+  isDetachedWindow = false,
+  marketData,
+  pluginRegistry,
+  pluginsReady,
+  primeCachedFinancials,
+  refreshQuote,
+  refreshQuotesBatch,
+  refreshTicker,
+  refreshTickersBatch,
+  sessionSnapshot,
+  state,
+  tickerRepository,
+}: UseAppStartupRuntimeOptions): void {
+  useEffect(() => {
+    chatController.setAppActive(appActive);
+    appLog.info("app activity propagated", { active: appActive });
+  }, [appActive]);
+
+  useEffect(() => {
+    chatController.setRaisesBackgroundAlerts(!isDetachedWindow);
+  }, [isDetachedWindow]);
+
+  // Runs for the life of the app: a freeze is only reportable if something
+  // was watching the clock while it happened.
+  useEffect(() => startMainThreadStallMonitor(), []);
+
+  useEffect(() => {
+    if (state.initialized || (globalThis as any).__gloomInitStarted) return;
+    (globalThis as any).__gloomInitStarted = true;
+    (async () => {
+      try {
+        let persistedBrokerAccounts: Record<string, BrokerAccount[]> = {};
+        try {
+          persistedBrokerAccounts = loadPersistedBrokerAccountMap(
+            pluginRegistry.persistence.resources,
+            state.config.brokerInstances,
+            pluginRegistry.brokers,
+          );
+        } catch (error) {
+          appLog.error("Failed to load persisted broker accounts", { error: error instanceof Error ? error.message : String(error) });
+          pluginRegistry.notify({
+            body: "Failed to load saved broker account data. Check local storage permissions.",
+            type: "error",
+          });
+        }
+        await measurePerfAsync("startup.app.initialize-state", () => initializeAppState({
+          config: state.config,
+          tickerRepository,
+          dataProvider,
+          sessionSnapshot,
+          paneState: state.paneState,
+          getPaneState: () => getState().paneState,
+          dispatch,
+          primeCachedFinancials,
+          refreshTicker,
+          refreshQuote,
+          refreshTickersBatch,
+          refreshQuotesBatch,
+          autoImportBrokerPositions,
+          persistedBrokerAccounts,
+        }), {
+          brokerInstanceCount: state.config.brokerInstances.length,
+          layoutPaneCount: state.config.layout.instances.length,
+          sessionHydrationTargetCount: sessionSnapshot?.hydrationTargets.length ?? 0,
+        });
+      } catch (err) {
+        logFailure("app.runtime.startup", "Workspace startup hydration failed")(err);
+      }
+      // The workspace has its data (or gave up on it): stalls from here on are not startup ones.
+      markStartupComplete();
+    })();
+  }, [
+    autoImportBrokerPositions,
+    dataProvider,
+    dispatch,
+    getState,
+    pluginRegistry.brokers,
+    pluginRegistry.persistence.resources,
+    primeCachedFinancials,
+    refreshQuote,
+    refreshQuotesBatch,
+    refreshTicker,
+    refreshTickersBatch,
+    sessionSnapshot,
+    state.config,
+    state.initialized,
+    tickerRepository,
+  ]);
+
+  // A plugin that failed to import is otherwise silent: its panes are simply
+  // absent, and the reason sits in a pane the user has no cause to open. Say
+  // so once, with a way in. Unsupported-renderer entries are not failures.
+  useEffect(() => {
+    // Popped-out desktop panes load the same list; the main window owns the notice.
+    if (!state.initialized || isDetachedWindow) return;
+    const failed = externalPlugins.filter((entry) => entry.error && !entry.unsupportedTarget);
+    if (failed.length === 0) return;
+    const names = failed.map((entry) => entry.plugin.name);
+    const body = failed.length === 1
+      ? `${names[0]} failed to load.`
+      : `${failed.length} plugins failed to load: ${names.join(", ")}.`;
+    appLog.warn("external plugins failed to load", { plugins: failed.map((entry) => ({ id: entry.plugin.id, error: entry.error })) });
+    pluginRegistry.notify({
+      body,
+      type: "error",
+      persistent: true,
+      action: {
+        label: "Open Plugins",
+        onClick: () => pluginRegistry.showPane(PLUGIN_MARKETPLACE_PANE_ID),
+      },
+    });
+    // Once per process: `externalPlugins` is the startup list and never changes
+    // identity, so this runs when initialization flips and not again.
+  }, [externalPlugins, isDetachedWindow, pluginRegistry, state.initialized]);
+
+  // Official plugins that moved out of Gloom install after the first frame
+  // (cli/restore-plugins.ts). Each is brought into the session as it lands,
+  // the outcome is recorded, and what could not be installed (no git,
+  // offline) is said once, since it is otherwise simply missing. The import
+  // is read through a ref: a new one must not restart the restore's consumer,
+  // which would say its outcome again.
+  const importBrokerPositionsRef = useRef(importBrokerPositions);
+  importBrokerPositionsRef.current = importBrokerPositions;
+  useEffect(() => {
+    if (!state.initialized || isDetachedWindow) return;
+    return startPluginSeedConsumer({
+      ready: pluginsReady ?? Promise.resolve(),
+      activate: async (install) => {
+        const host = getMarketplaceHost();
+        const manager = getPluginManager();
+        return host && manager ? activateInstall(install, host, manager) : null;
+      },
+      isRunning: (directory) => listExternalPlugins().some((entry) => entry.directory === directory && !entry.error),
+      brokerTypes: () => pluginRegistry.brokers.keys(),
+      syncBrokers: (types) => {
+        for (const instance of getState().config.brokerInstances) {
+          if (instance.enabled === false || !types.has(instance.brokerType)) continue;
+          // A failure is on the profile's row, with Sync to retry.
+          void importBrokerPositionsRef.current(instance.id).catch(logFailure("app.runtime.startup", "Restored broker positions import failed"));
+        }
+      },
+      record: (record) => {
+        const config = withPluginSeedRecord(getState().config, record);
+        if (!config) return;
+        dispatch({ type: "SET_CONFIG", config });
+        scheduleConfigSave(config);
+      },
+      notify: (notice) => {
+        appLog.warn("official plugin restore", { notice: notice.body });
+        pluginRegistry.notify({ ...notice, duration: PLUGIN_SEED_NOTICE_MS });
+      },
+    });
+  }, [dispatch, getState, isDetachedWindow, pluginRegistry, pluginsReady, state.initialized]);
+
+  // What people keep on screen: the functions open in the workspace restored
+  // at launch, counted once per session. The layout is taken as restored,
+  // before cloud sync can replace it; the first launch shows the default
+  // layout, not one anybody chose.
+  useEffect(() => {
+    if (!state.initialized || isDetachedWindow) return;
+    const { config } = getState();
+    if (!config.onboardingComplete) return;
+    const waitForPlugins = new Promise<void>((resolve) => {
+      setTimeout(resolve, RESTORED_FUNCTIONS_WAIT_MS);
+    });
+    void Promise.race([pluginsReady, waitForPlugins]).then(() => {
+      recordRestoredFunctions(restoredUsageFunctions(config.layout, pluginRegistry, config.disabledPlugins));
+    }).catch(logFailure("app.runtime.startup", "Restored function usage recording failed"));
+  }, [getState, isDetachedWindow, pluginRegistry, pluginsReady, state.initialized]);
+
+  useEffect(() => {
+    if (!focusedTickerSymbol) return;
+    const ticker = state.tickers.get(focusedTickerSymbol);
+    if (!ticker) return;
+    appLog.info("focused ticker prefetch scheduled", {
+      symbol: ticker.metadata.ticker,
+      exchange: ticker.metadata.exchange,
+    });
+    marketData.prefetchTicker(instrumentFromTicker(ticker, ticker.metadata.ticker));
+  }, [focusedTickerSymbol, marketData, state.tickers]);
+
+  const prefetchInstrument = useCallback((instrument: InstrumentRef) => {
+    marketData.prefetchTicker(instrument);
+  }, [marketData]);
+  useSavedLayoutWarmup({
+    appActive,
+    config: state.config,
+    initialized: state.initialized,
+    prefetch: prefetchInstrument,
+    tickers: state.tickers,
+  });
+}

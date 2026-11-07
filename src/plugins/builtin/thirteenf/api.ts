@@ -1,0 +1,577 @@
+import type {
+  ThirteenFEdgarFiling,
+  ThirteenFFilerStatus,
+  ThirteenFFormSummary,
+  ThirteenFFund,
+  ThirteenFHoldingRecord,
+  ThirteenFTickerHolders,
+  ThirteenFTickerInfo,
+  ThirteenFTopFund,
+} from "./types";
+import type { PluginPersistence } from "../../../types/plugin";
+import { apiClient } from "../../../api-client";
+import { ApiRequestError, isPermanentClientError, isTransientFailure } from "../../../api-client/errors";
+import { httpFetch } from "../../../utils/http-transport";
+import { isNetworkFailure } from "../../../utils/network-failure";
+import { asRecord, finiteOrNull } from "../../../utils/guards";
+import { logFailure } from "../../../utils/log-failure";
+
+const FORMS_13F_BASE_URL = "https://forms13f.com/api/v1";
+const FORM_PAGE_LIMIT = 100;
+/** The most rows the 13F source gives in one page. */
+const FILING_PAGE_ROWS = 250;
+/** Pages of one filing read at once where the service cannot send it whole. */
+const FILING_PAGE_CONCURRENCY = 4;
+// Large funds file tens of thousands of positions (BlackRock about 50,000), and
+// a silently clipped list makes every weight, total, and buy/sell action wrong.
+const MAX_FORM_ROWS = 100_000;
+/** Rows asked first of a large filing the service is still reading. */
+const FIRST_ROWS = 2_000;
+/** How long a large filing is waited for whole before its first rows are asked. */
+const FIRST_ROWS_AFTER_MS = 300;
+const CACHE_KIND = "forms13f-api";
+const CACHE_SOURCE = "forms13f";
+const CACHE_SCHEMA_VERSION = 1;
+const FORMS_13F_CACHE_POLICY = {
+  staleMs: 24 * 60 * 60_000,
+  expireMs: 30 * 24 * 60 * 60_000,
+} as const;
+
+export interface Forms13FReadOptions {
+  /** A part of the answer that could not be read, said beside what was. */
+  onWarning?: (warning: string) => void;
+  /**
+   * A read answered from the copy saved at `savedAt` (ms) because its refresh
+   * failed. Only a caller that says when its copy was saved (the footer's
+   * "saved copy from", a command's closing line) is answered from one.
+   */
+  onSavedCopy?: (savedAt: number) => void;
+  forceRefresh?: boolean;
+}
+
+interface Forms13FRequestOptions extends Forms13FReadOptions {
+  cache?: boolean;
+  signal?: AbortSignal;
+  /** Gloom Cloud only: a path the public 13F source does not serve. */
+  cloudOnly?: boolean;
+}
+
+let forms13FPersistence: PluginPersistence | null = null;
+const failedRefreshes = new Set<string>();
+// The promise is the generation. A newer download replaces it, and the replaced one must not write.
+const activeRequests = new Map<string, Promise<unknown>>();
+/** The service answered a whole filing with 404: it is an older one, so filings are read a page at a time. */
+let wholeFilingsMissing = false;
+
+export function attachThirteenFApiPersistence(persistence: PluginPersistence) {
+  if (forms13FPersistence !== persistence) resetThirteenFApiPersistence();
+  forms13FPersistence = persistence;
+}
+
+export function resetThirteenFApiPersistence() {
+  forms13FPersistence = null;
+  failedRefreshes.clear();
+  activeRequests.clear();
+  wholeFilingsMissing = false;
+}
+
+function padCik(value: string): string {
+  const digits = value.replace(/\D/g, "");
+  return digits ? digits.padStart(10, "0").slice(-10) : value;
+}
+
+export function normalizeCik(value: string): string {
+  return padCik(value.trim());
+}
+
+function stringOrEmpty(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function boolOrFalse(value: unknown): boolean {
+  return value === true;
+}
+
+function arrayResponse(value: unknown): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeAccessionNumber(rawValue: unknown, rawUrl: unknown): string {
+  const value = stringOrEmpty(rawValue);
+  if (value.includes("-")) return value;
+  const url = stringOrEmpty(rawUrl);
+  const urlMatch = /(\d{10}-\d{2}-\d{6})\.txt\b/.exec(url);
+  if (urlMatch) return urlMatch[1]!;
+  const digits = value.replace(/\D/g, "");
+  if (digits.length === 18) {
+    return `${digits.slice(0, 10)}-${digits.slice(10, 12)}-${digits.slice(12)}`;
+  }
+  return value;
+}
+
+function cacheKey(path: string, params: URLSearchParams): string {
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+const isRateLimited = (error: unknown): error is ApiRequestError => error instanceof ApiRequestError && error.status === 429;
+
+/** How long to wait before asking again, in whole seconds, from a rate limit's `Retry-After`. */
+export function retryAfterSeconds(error: unknown): number | null {
+  return isRateLimited(error) && error.retryAfterMs != null && error.retryAfterMs > 0
+    ? Math.ceil(error.retryAfterMs / 1000)
+    : null;
+}
+
+/** A refusal that carries no words of the service's own: an empty body, or the status alone. */
+const GENERIC_LIMIT_TEXT = /^\s*(?:(?:HTTP\s*)?429\b.*|too many requests\.?)?\s*$/i;
+
+/**
+ * A 13F read the service refused for its signed-out limit: the service's own
+ * message when it sent one (it says how long to wait and that signing in lifts
+ * the limit), else the same in the app's words. The limit itself is the
+ * service's.
+ */
+export function thirteenFReadError(error: unknown): unknown {
+  if (!isRateLimited(error) || !GENERIC_LIMIT_TEXT.test(error.message)) return error;
+  const seconds = retryAfterSeconds(error);
+  return new ApiRequestError(
+    `Too many 13F reads without signing in: try again in ${seconds != null ? `${seconds} s` : "a minute"}, or sign in to lift the limit.`,
+    429, error.retryAfterMs, error.code, error.details,
+  );
+}
+
+async function fetchForms13F<T>(
+  path: string,
+  params: Record<string, string | number | undefined>,
+  options: Forms13FRequestOptions = {},
+): Promise<T> {
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined) continue;
+    searchParams.set(key, String(value));
+  }
+
+  const key = cacheKey(path, searchParams);
+  const store = forms13FPersistence;
+  const cacheOptions = { sourceKey: CACHE_SOURCE, schemaVersion: CACHE_SCHEMA_VERSION };
+  const cached = options.cache !== false ? store?.getResource<T>(CACHE_KIND, key, cacheOptions) ?? null : null;
+  if (cached != null && !options.forceRefresh && !cached.stale && !failedRefreshes.has(key)) return cached.value;
+
+  if (!options.forceRefresh) {
+    const pending = activeRequests.get(key) as Promise<T> | undefined;
+    if (pending) {
+      if (cached != null) return cached.value;
+      // Another reader's request, which that reader may stop (a fund read ahead
+      // while the cursor rested on it): this reader then asks again on its own.
+      return pending.catch((error: unknown) => {
+        if (options.signal?.aborted || !(error instanceof Error && error.name === "AbortError")) throw error;
+        return fetchForms13F<T>(path, params, options);
+      });
+    }
+  }
+
+  const slot: { promise?: Promise<T> } = {};
+  const current = () => forms13FPersistence === store && activeRequests.get(key) === slot.promise;
+  const promise = (async (): Promise<T> => {
+    // Yield once so the caller can publish this promise before a synchronous abort settles it.
+    await Promise.resolve();
+    try {
+      options.signal?.throwIfAborted();
+      let value: T;
+      try {
+        value = await apiClient.getCloudSec13F(path, params, { signal: options.signal }) as T;
+      } catch (cloudError) {
+        options.signal?.throwIfAborted();
+        const error = thirteenFReadError(cloudError);
+        if (options.cloudOnly) throw error;
+        const url = `${FORMS_13F_BASE_URL}${path}?${searchParams.toString()}`;
+        // The service's own limit says when to ask again; a direct read that fails as well says less.
+        const response = await httpFetch(url, {
+          headers: { Accept: "application/json" },
+          signal: options.signal,
+        }).catch((fallbackError: unknown) => {
+          throw isRateLimited(error) ? error : fallbackError;
+        });
+        if (!response.ok) {
+          if (isRateLimited(error)) throw error;
+          throw new ApiRequestError(`Forms13F ${response.status} for ${path}`, response.status);
+        }
+        value = await response.json() as T;
+      }
+      options.signal?.throwIfAborted();
+      if (current()) {
+        failedRefreshes.delete(key);
+        if (value != null && options.cache !== false) {
+          store?.setResource(CACHE_KIND, key, value, { ...cacheOptions, cachePolicy: FORMS_13F_CACHE_POLICY });
+        }
+      }
+      return value;
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      if (current()) failedRefreshes.add(key);
+      // A saved copy answers only for a failure asking again may get past; a refusal or a reply that
+      // fails validation is the error, and a missing or denied resource also drops its copy.
+      if (!isTransientFailure(error)) {
+        if (isPermanentClientError(error) && current()) store?.deleteResource(CACHE_KIND, key, { sourceKey: CACHE_SOURCE });
+        throw error;
+      }
+      const retained = options.cache !== false
+        ? store?.getResource<T>(CACHE_KIND, key, { ...cacheOptions, allowExpired: true }) : null;
+      // A caller may retain old research only when it can say when it was saved.
+      if (!retained || !options.onSavedCopy || !Number.isFinite(retained.fetchedAt)) throw error;
+      options.onSavedCopy(retained.fetchedAt);
+      return retained.value;
+    } finally {
+      if (activeRequests.get(key) === slot.promise) activeRequests.delete(key);
+    }
+  })();
+  slot.promise = promise;
+  activeRequests.set(key, promise);
+  if (cached != null && !options.forceRefresh) {
+    void promise.catch((error: unknown) => {
+      if (!options.signal?.aborted) logFailure("thirteenf.api", "Refresh cached filing data failed")(error);
+    });
+    return cached.value;
+  }
+  return promise;
+}
+
+function mapFund(raw: any): ThirteenFFund | null {
+  const cik = normalizeCik(stringOrEmpty(raw.CIK ?? raw.cik));
+  const name = stringOrEmpty(raw.name ?? raw.company_name ?? raw.company_names?.[0]).trim();
+  if (!cik || !name) return null;
+  return { cik, name };
+}
+
+export function mapForm(raw: any): ThirteenFFormSummary | null {
+  const cik = normalizeCik(stringOrEmpty(raw.cik));
+  const accessionNumber = normalizeAccessionNumber(raw.accession_number, raw.url);
+  const periodOfReport = stringOrEmpty(raw.period_of_report);
+  if (!cik || !accessionNumber || !periodOfReport) return null;
+  const submissionType = stringOrEmpty(raw.submission_type || raw.form_type);
+  return {
+    url: stringOrEmpty(raw.url),
+    accessionNumber,
+    submissionType,
+    periodOfReport,
+    filedAsOfDate: stringOrEmpty(raw.filed_as_of_date),
+    cik,
+    companyName: stringOrEmpty(raw.company_name),
+    tableValueTotal: finiteOrNull(raw.table_value_total),
+    tableEntryTotal: finiteOrNull(raw.table_entry_total),
+    isAmendment: boolOrFalse(raw.is_amendment) || submissionType.includes("/A"),
+    amendmentType: stringOrEmpty(raw.amendment_type) || undefined,
+    valueNote: stringOrEmpty(raw.value_note) || undefined,
+  };
+}
+
+function mapHolding(raw: any): ThirteenFHoldingRecord | null {
+  const accessionNumber = stringOrEmpty(raw.accession_number);
+  const cik = normalizeCik(stringOrEmpty(raw.cik));
+  const cusip = stringOrEmpty(raw.cusip);
+  if (!accessionNumber || !cik || !cusip) return null;
+  return {
+    accessionNumber,
+    cik,
+    issuer: stringOrEmpty(raw.name_of_issuer),
+    titleOfClass: stringOrEmpty(raw.title_of_class),
+    cusip,
+    ticker: stringOrEmpty(raw.ticker).toUpperCase(),
+    value: finiteOrNull(raw.value),
+    shares: finiteOrNull(raw.ssh_prnamt),
+    shareType: stringOrEmpty(raw.ssh_prnamt_type),
+    investmentDiscretion: stringOrEmpty(raw.investment_discretion),
+    votingAuthoritySole: finiteOrNull(raw.voting_authority_sole),
+    votingAuthorityShared: finiteOrNull(raw.voting_authority_shared),
+    votingAuthorityNone: finiteOrNull(raw.voting_authority_none),
+    putCall: stringOrEmpty(raw.put_call).toUpperCase(),
+  };
+}
+
+function mapTopFund(raw: any): ThirteenFTopFund | null {
+  const cik = normalizeCik(stringOrEmpty(raw.cik));
+  const name = stringOrEmpty(raw.name).trim();
+  const periodOfReport = stringOrEmpty(raw.period_of_report);
+  if (!cik || !name || !periodOfReport) return null;
+  return {
+    cik,
+    name,
+    periodOfReport,
+    pnl: finiteOrNull(raw.pnl),
+  };
+}
+
+function mapTickerInfo(raw: any): ThirteenFTickerInfo | null {
+  const cusip = stringOrEmpty(raw.cusip);
+  const ticker = stringOrEmpty(raw.ticker).toUpperCase();
+  if (!cusip || !ticker) return null;
+  return {
+    cusip,
+    ticker,
+    companyName: stringOrEmpty(raw.company_name),
+  };
+}
+
+export async function searchThirteenFFunds(
+  query: string,
+  limit = 50,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions & { offset?: number } = {},
+): Promise<ThirteenFFund[]> {
+  const raw = await fetchForms13F<unknown>("/funds", {
+    name: query,
+    offset: options.offset ?? 0,
+    limit,
+  }, { ...options, signal });
+  return arrayResponse(raw).map(mapFund).filter((fund): fund is ThirteenFFund => !!fund);
+}
+
+/** The most funds one page of the performance ranking holds; the source refuses more. */
+export const TOP_FUNDS_MAX_LIMIT = 100;
+
+export async function listTopThirteenFFunds(
+  quarter: string,
+  limit = 50,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions & { offset?: number } = {},
+): Promise<ThirteenFTopFund[]> {
+  const raw = await fetchForms13F<unknown>("/topfunds", {
+    quarter,
+    limit: Math.min(limit, TOP_FUNDS_MAX_LIMIT),
+    offset: options.offset ?? 0,
+  }, { ...options, signal });
+  return arrayResponse(raw).map(mapTopFund).filter((fund): fund is ThirteenFTopFund => !!fund);
+}
+
+export async function listThirteenFFilings(
+  from: string,
+  to: string,
+  limit = 100,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions & { offset?: number } = {},
+): Promise<ThirteenFFormSummary[]> {
+  const raw = await fetchForms13F<unknown>("/filings", {
+    from,
+    to,
+    limit,
+    offset: options.offset ?? 0,
+  }, { ...options, signal });
+  return arrayResponse(raw).map(mapForm).filter((form): form is ThirteenFFormSummary => !!form);
+}
+
+export async function listThirteenFForms(
+  cik: string,
+  from: string,
+  to: string,
+  limit = 12,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions & { offset?: number } = {},
+): Promise<ThirteenFFormSummary[]> {
+  const raw = await fetchForms13F<unknown>("/forms", {
+    cik: normalizeCik(cik),
+    from,
+    to,
+    limit,
+    offset: options.offset ?? 0,
+  }, { ...options, signal });
+  return arrayResponse(raw).map(mapForm).filter((form): form is ThirteenFFormSummary => !!form);
+}
+
+export async function listThirteenFFormHoldingsPage(
+  cik: string,
+  accessionNumber: string,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions & { offset?: number; limit?: number } = {},
+): Promise<{ rows: ThirteenFHoldingRecord[]; hasMore: boolean }> {
+  const offset = Math.max(0, options.offset ?? 0);
+  const limit = Math.max(1, options.limit ?? FORM_PAGE_LIMIT);
+  const raw = await fetchForms13F<unknown>("/form", {
+    cik: normalizeCik(cik),
+    accession_number: accessionNumber,
+    limit,
+    offset,
+  }, { ...options, signal });
+  const rows = arrayResponse(raw).map(mapHolding).filter((holding): holding is ThirteenFHoldingRecord => !!holding);
+  return { rows, hasMore: rows.length >= limit && offset + rows.length < MAX_FORM_ROWS };
+}
+
+function mapHoldings(raw: unknown): ThirteenFHoldingRecord[] {
+  return arrayResponse(raw).map(mapHolding).filter((holding): holding is ThirteenFHoldingRecord => !!holding);
+}
+
+/** A filing's whole information table as Gloom Cloud sends it in one answer. */
+function filingRows(raw: unknown): ThirteenFHoldingRecord[] {
+  const rows = asRecord(raw).rows;
+  if (!Array.isArray(rows)) throw new Error("13F filing answer has no rows");
+  return mapHoldings(rows);
+}
+
+export interface FilingHoldingsOptions extends Forms13FReadOptions {
+  /** The rows the filing's summary counts, when known: a large filing's first rows come first. */
+  entries?: number | null;
+  /** The filing's first rows, while a large filing the service has not read yet is still loading. */
+  onFirstRows?: (rows: ThirteenFHoldingRecord[]) => void;
+}
+
+/**
+ * A filing's whole information table: one request to Gloom Cloud, which
+ * reads the source's pages itself and keeps the filing. An older service
+ * without that answer (a 404, remembered for the session) or one that cannot
+ * be reached is read a page at a time, a few pages at once, as before; a page
+ * Gloom Cloud cannot send comes from the public source. A busy or failing
+ * service (429, 5xx) is the error: paging it would only ask it more.
+ */
+export async function listThirteenFFormHoldings(
+  cik: string,
+  accessionNumber: string,
+  signal?: AbortSignal,
+  options: FilingHoldingsOptions = {},
+): Promise<ThirteenFHoldingRecord[]> {
+  const { entries, onFirstRows, ...readOptions } = options;
+  if (wholeFilingsMissing) return listPagedHoldings(cik, accessionNumber, signal, readOptions);
+  // The count lets a filing the service has not stored yet be read in fewer requests.
+  const params = {
+    cik: normalizeCik(cik),
+    accession_number: accessionNumber,
+    ...(entries != null && entries > 0 ? { entries } : {}),
+  };
+  const whole = fetchForms13F<unknown>("/holdings", params, { ...readOptions, signal, cloudOnly: true });
+  let answered = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (onFirstRows && entries != null && entries > FIRST_ROWS) {
+    timer = setTimeout(() => {
+      if (answered) return;
+      void fetchForms13F<unknown>("/holdings", { ...params, limit: FIRST_ROWS }, { signal, cloudOnly: true, cache: false })
+        .then((raw) => { if (!answered) onFirstRows(filingRows(raw)); })
+        .catch(() => {
+          // Intentional ignore: the first rows only come ahead of the whole filing, which reports its own failure.
+        });
+    }, FIRST_ROWS_AFTER_MS);
+  }
+  try {
+    return filingRows(await whole);
+  } catch (error) {
+    signal?.throwIfAborted();
+    const missing = error instanceof ApiRequestError && error.status === 404;
+    if (!missing && !isNetworkFailure(error)) throw error;
+    if (missing) wholeFilingsMissing = true;
+    return listPagedHoldings(cik, accessionNumber, signal, readOptions);
+  } finally {
+    answered = true;
+    clearTimeout(timer);
+  }
+}
+
+/** A filing read a page at a time, a few pages at once, until a page comes back short. */
+async function listPagedHoldings(
+  cik: string,
+  accessionNumber: string,
+  signal: AbortSignal | undefined,
+  options: Forms13FReadOptions,
+): Promise<ThirteenFHoldingRecord[]> {
+  const pages: ThirteenFHoldingRecord[][] = [];
+  const maxPages = Math.ceil(MAX_FORM_ROWS / FILING_PAGE_ROWS);
+  let next = 0;
+  let last: number | null = null;
+  let failed = false;
+  async function readPage() {
+    signal?.throwIfAborted();
+    const index = next++;
+    const page = await listThirteenFFormHoldingsPage(cik, accessionNumber, signal, {
+      ...options,
+      offset: index * FILING_PAGE_ROWS,
+      limit: FILING_PAGE_ROWS,
+    });
+    pages[index] = page.rows;
+    if (page.rows.length < FILING_PAGE_ROWS && (last === null || index < last)) last = index;
+  }
+  async function worker() {
+    try {
+      while (!failed && next < maxPages && (last === null || next <= last)) await readPage();
+    } catch (error) {
+      failed = true;
+      throw error;
+    }
+  }
+  // The first page alone says whether there is more: most filings fit in it.
+  await readPage();
+  await Promise.all(Array.from({ length: FILING_PAGE_CONCURRENCY }, worker));
+  return pages.slice(0, (last ?? maxPages - 1) + 1).flat();
+}
+
+export async function lookupThirteenFTickers(
+  tickers: string[],
+  signal?: AbortSignal,
+  options: Forms13FReadOptions = {},
+): Promise<ThirteenFTickerInfo[]> {
+  const cleanTickers = tickers
+    .map((ticker) => ticker.trim().toUpperCase())
+    .filter(Boolean)
+    .join(",");
+  if (!cleanTickers) return [];
+  const raw = await fetchForms13F<unknown>("/tickers", {
+    cusips: "",
+    tickers: cleanTickers,
+  }, { ...options, signal });
+  return arrayResponse(raw).map(mapTickerInfo).filter((ticker): ticker is ThirteenFTickerInfo => !!ticker);
+}
+
+export async function lookupThirteenFHoldersByCusip(
+  cusip: string,
+  periodOfReport: string,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions = {},
+): Promise<ThirteenFTickerHolders> {
+  const raw = asRecord(await fetchForms13F<unknown>("/holders", {
+    cusip,
+    period_of_report: periodOfReport,
+  }, { ...options, signal }));
+  return {
+    cusip: stringOrEmpty(raw.cusip) || cusip,
+    periodOfReport: stringOrEmpty(raw.period_of_report) || periodOfReport,
+    ciks: Array.isArray(raw.ciks)
+      ? raw.ciks.map((cik: unknown) => normalizeCik(stringOrEmpty(cik))).filter(Boolean)
+      : [],
+  };
+}
+
+function mapEdgarFiling(raw: any): ThirteenFEdgarFiling | null {
+  const form = stringOrEmpty(raw?.form), period = stringOrEmpty(raw?.period), filed = stringOrEmpty(raw?.filed);
+  if (!form.startsWith("13F") || !period || !filed) return null;
+  const managers = Array.isArray(raw.otherManagers) ? raw.otherManagers : null;
+  return {
+    form,
+    period,
+    filed,
+    accession: stringOrEmpty(raw.accession),
+    url: stringOrEmpty(raw.url),
+    ...(managers ? {
+      otherManagers: managers
+        .map((manager: any) => ({
+          cik: stringOrEmpty(manager?.cik) ? normalizeCik(stringOrEmpty(manager.cik)) : null,
+          name: stringOrEmpty(manager?.name).trim(),
+          fileNumber: stringOrEmpty(manager?.fileNumber) || null,
+        }))
+        .filter((manager: { name: string }) => manager.name),
+    } : {}),
+  };
+}
+
+/**
+ * The fund's 13F filings as EDGAR lists them, 13F-NT notices included, from
+ * Gloom Cloud. A notice names the managers that reported its holdings.
+ */
+export async function loadThirteenFFilerStatus(
+  cik: string,
+  signal?: AbortSignal,
+  options: Forms13FReadOptions = {},
+): Promise<ThirteenFFilerStatus> {
+  const raw = asRecord(await fetchForms13F<unknown>("/filer", { cik: normalizeCik(cik) }, { ...options, signal, cloudOnly: true }));
+  return {
+    cik: normalizeCik(stringOrEmpty(raw.cik) || cik),
+    name: stringOrEmpty(raw.name),
+    source: stringOrEmpty(raw.source),
+    filings: arrayResponse(raw.filings).map(mapEdgarFiling).filter((filing): filing is ThirteenFEdgarFiling => !!filing),
+  };
+}

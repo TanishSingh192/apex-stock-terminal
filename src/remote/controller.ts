@@ -1,0 +1,736 @@
+import type { Dispatch } from "react";
+import {
+  dockPane,
+  floatPane,
+  getDockLeafLayouts,
+  insertAtRootEdge,
+  removeFloatingPanes,
+  tidyWindows,
+} from "../layout/pane-manager";
+import type { PluginRegistry } from "../plugins/registry";
+import type { AppAction, AppState } from "../state/app/context";
+import { PANE_LOCK_SETTING_KEY, setPaneSettings, updatePaneInstance } from "../pane-settings";
+import {
+  CUSTOM_VIEW_PANE_ID,
+  CUSTOM_VIEW_TEMPLATE_ID,
+  customViewCreateOptions,
+  customViewInstanceSettings,
+  parseViewSpecOr,
+  trialLoadViewSource,
+  UnknownViewKeysError,
+  type ViewSpec,
+} from "../plugins/builtin/custom-view";
+import { findPaneInstance, getPlacedPaneInstanceIds, type PaneInstanceConfig, resolvePaneInstance } from "../types/config";
+import type { DesktopWindowBridge } from "../types/desktop-window";
+import { settleTypedListingKey } from "../tickers/listing-venues";
+import { isSharedExchangeCode, parsePublicTickerKey, typedExchangeCode } from "../utils/exchanges";
+import { applyJsonPatch } from "./json-patch";
+import { revisionFor } from "./revision";
+import type {
+  RemoteCallContext,
+  RemoteChangePrompt,
+  RemoteControlRequest,
+  RemoteControlResponse,
+  RemoteJsonPatchOperation,
+  RemoteMarketDataRequest,
+  RemoteStateInclude,
+} from "./types";
+import type { RemoteUiRegistry } from "./semantic-tree";
+import { commandBarResultsFromNodes, isCommandBarInputNode } from "./command-bar";
+import { findCommandBarResult, findMatchingUiNode } from "./matching";
+import { REMOTE_AGENT_HELP, REMOTE_OPERATIONS, remoteControlSchema } from "./schema";
+import {
+  fail,
+  mutationSummary,
+  numberInput,
+  ok,
+  optionalNumber,
+  optionalString,
+  RemoteOperationError,
+  stringInput,
+} from "./controller-utils";
+import {
+  PANE_SCREENSHOT_MAX_BYTES,
+  PANE_SCREENSHOT_MAX_EDGE,
+  PANE_SCREENSHOT_MIN_WIDTH,
+  paneScreenshotScale,
+  type CapturePane,
+} from "./pane-screenshot";
+import {
+  buildGridDockRoot,
+  regionToDockPosition,
+  regionToRootEdge,
+  requirePaneInstance,
+} from "./layout-helpers";
+import { createRemoteResources } from "./resources";
+import { dismissTopmostDialog, isDialogOpen as isAnyDialogOpen } from "../ui/dialog-stack";
+import { asRecord } from "../utils/guards";
+import { SECURITY_DESCRIPTION_SEARCH } from "../core/state/app/command-bar-launch";
+import { runAutomated } from "../telemetry/usage-counts";
+import {
+  applyWatchlistChange,
+  declinedWatchlistResult,
+  describeWatchlistPlan,
+  planWatchlistChange,
+  unchangedWatchlistResult,
+  watchlistChangePrompt,
+} from "./watchlist";
+
+interface AppRemoteControllerOptions {
+  dispatch: Dispatch<AppAction>;
+  getState: () => AppState;
+  pluginRegistry: PluginRegistry;
+  uiRegistry: RemoteUiRegistry | null;
+  desktopWindowBridge?: DesktopWindowBridge;
+  afterMutation?: () => Promise<void> | void;
+  /** Whether a dialog (a form, a confirm, pane settings) is open now. */
+  isDialogOpen?: () => boolean;
+  /** Closes the dialog on top as Esc would; false when none is open. */
+  closeTopmostDialog?: () => boolean;
+  /**
+   * Asks the person in the app to approve a change to their data; false when
+   * they decline or `signal` aborts. Without it such operations refuse.
+   */
+  confirmChange?: (prompt: RemoteChangePrompt, signal?: AbortSignal) => Promise<boolean>;
+  /** Paints one pane of this window as a PNG; absent where there are no pixels (the TUI). */
+  capturePane?: CapturePane;
+}
+
+/** Operations whose dry run resolves what they would change instead of echoing the input. */
+const PLANNED_OPERATIONS = new Set(["watchlist.add", "watchlist.remove"]);
+/** Reads change nothing, so their answer carries no layout or command-bar state. */
+const READ_OPERATIONS = new Set(REMOTE_OPERATIONS.filter((entry) => entry.sideEffectLevel === "none").map((entry) => entry.id));
+
+// A command with a wizard closes the bar and opens its form, so every call says whether one is open.
+const DEFAULT_MUTATION_INCLUDE: RemoteStateInclude[] = ["app", "layout", "panes", "commandBar", "form"];
+const MAX_MARKET_DATA_SEARCH_RESULTS = 20;
+const MAX_MARKET_DATA_FILINGS = 20;
+const MAX_MARKET_DATA_EARNINGS_SYMBOLS = 25;
+const MAX_MARKET_DATA_HOLDERS = 25;
+const MAX_MARKET_DATA_EVENT_ROWS = 20;
+
+function requiredMarketDataText(value: string, field: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`Market data ${field} is required.`);
+  return normalized;
+}
+
+function normalizedMarketDataSymbol(symbol: string): string {
+  return requiredMarketDataText(symbol, "symbol").toUpperCase();
+}
+
+function normalizedOptionalExchange(exchange: string | undefined): string | undefined {
+  const normalized = exchange?.trim().toUpperCase();
+  return normalized || undefined;
+}
+
+export function createAppRemoteController({
+  dispatch,
+  getState,
+  pluginRegistry,
+  uiRegistry,
+  desktopWindowBridge,
+  afterMutation = () => {},
+  isDialogOpen = isAnyDialogOpen,
+  closeTopmostDialog = dismissTopmostDialog,
+  confirmChange,
+  capturePane,
+}: AppRemoteControllerOptions) {
+  const { buildIncludedState, getResource, patchTarget } = createRemoteResources({
+    dispatch,
+    getState,
+    pluginRegistry,
+    uiRegistry,
+    isDialogOpen,
+  });
+
+  const getAfterMutationSummary = async (extra?: Record<string, unknown>): Promise<unknown> => {
+    await afterMutation();
+    return mutationSummary(getState(), extra);
+  };
+
+  /**
+   * The listing a request names, a code that names several venues (7203:TSE,
+   * or 7203 with exchange TSE) read as the one its symbol trades on, as every
+   * command reads it.
+   */
+  const settledListing = async (rawSymbol: string, rawExchange: string | undefined) => {
+    const symbol = normalizedMarketDataSymbol(rawSymbol);
+    const exchange = normalizedOptionalExchange(rawExchange);
+    const typed = exchange && isSharedExchangeCode(exchange) && !parsePublicTickerKey(symbol).exchange ? `${symbol}:${exchange}` : symbol;
+    if (!isSharedExchangeCode(typedExchangeCode(typed))) return { symbol, exchange };
+    const settled = (await settleTypedListingKey(typed, {
+      store: pluginRegistry.tickerRepository,
+      dataProvider: pluginRegistry.marketData,
+    })).toUpperCase();
+    return settled === typed ? { symbol, exchange } : { symbol: settled, exchange: parsePublicTickerKey(settled).exchange };
+  };
+
+  const queryMarketData = async (named: RemoteMarketDataRequest): Promise<unknown> => {
+    const marketData = pluginRegistry.marketData;
+    const request = "symbol" in named ? { ...named, ...await settledListing(named.symbol, named.exchange) } : named;
+    switch (request.operation) {
+      case "search":
+        return (await marketData.search(requiredMarketDataText(request.query, "query")))
+          .slice(0, MAX_MARKET_DATA_SEARCH_RESULTS)
+          .map((result) => ({
+            providerId: result.providerId,
+            symbol: result.symbol,
+            name: result.name,
+            exchange: result.exchange,
+            primaryExchange: result.primaryExchange,
+            type: result.type,
+            currency: result.currency,
+          }));
+      case "quote":
+        return marketData.getQuote(
+          normalizedMarketDataSymbol(request.symbol),
+          normalizedOptionalExchange(request.exchange),
+        );
+      case "financials": {
+        const financials = await marketData.getTickerFinancials(
+          normalizedMarketDataSymbol(request.symbol),
+          normalizedOptionalExchange(request.exchange),
+        );
+        return {
+          financialCurrency: financials.financialCurrency,
+          statementHistory: financials.statementHistory,
+          quote: financials.quote,
+          quoteMetadata: financials.quoteMetadata,
+          fundamentals: financials.fundamentals,
+          profile: financials.profile,
+          annualStatements: financials.annualStatements.slice(0, 5),
+          quarterlyStatements: financials.quarterlyStatements.slice(0, 8),
+        };
+      }
+      case "secFilings": {
+        if (!marketData.getSecFilings) throw new Error("The configured market data sources do not provide SEC filings.");
+        const count = Math.max(1, Math.min(
+          MAX_MARKET_DATA_FILINGS,
+          Number.isFinite(request.count) ? Math.trunc(request.count!) : 10,
+        ));
+        return (await marketData.getSecFilings(
+          normalizedMarketDataSymbol(request.symbol),
+          count,
+          normalizedOptionalExchange(request.exchange),
+        )).slice(0, count);
+      }
+      case "holders": {
+        if (!marketData.getHolders) throw new Error("The configured market data sources do not provide holder data.");
+        const holders = await marketData.getHolders(
+          normalizedMarketDataSymbol(request.symbol),
+          normalizedOptionalExchange(request.exchange),
+        );
+        return {
+          ...holders,
+          holders: holders.holders.slice(0, MAX_MARKET_DATA_HOLDERS),
+        };
+      }
+      case "analystResearch": {
+        if (!marketData.getAnalystResearch) throw new Error("The configured market data sources do not provide analyst research.");
+        const research = await marketData.getAnalystResearch(
+          normalizedMarketDataSymbol(request.symbol),
+          normalizedOptionalExchange(request.exchange),
+        );
+        return {
+          ...research,
+          recommendations: research.recommendations.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+          ratings: research.ratings.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+          earningsEstimates: research.earningsEstimates.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+          revenueEstimates: research.revenueEstimates.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+        };
+      }
+      case "corporateActions": {
+        if (!marketData.getCorporateActions) throw new Error("The configured market data sources do not provide corporate actions.");
+        const actions = await marketData.getCorporateActions(
+          normalizedMarketDataSymbol(request.symbol),
+          normalizedOptionalExchange(request.exchange),
+        );
+        return {
+          ...actions,
+          dividends: actions.dividends.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+          splits: actions.splits.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+          earnings: actions.earnings.slice(0, MAX_MARKET_DATA_EVENT_ROWS),
+        };
+      }
+      case "earningsCalendar": {
+        if (!marketData.getEarningsCalendar) throw new Error("The configured market data sources do not provide an earnings calendar.");
+        const symbols = request.symbols
+          .map((symbol) => normalizedMarketDataSymbol(symbol))
+          .filter((symbol, index, all) => all.indexOf(symbol) === index)
+          .slice(0, MAX_MARKET_DATA_EARNINGS_SYMBOLS);
+        if (symbols.length === 0) throw new Error("Market data symbols are required.");
+        return marketData.getEarningsCalendar(symbols);
+      }
+      default:
+        throw new Error(
+          `Unknown market data operation "${String((request as { operation?: unknown }).operation)}".`,
+        );
+    }
+  };
+
+  const openCommandBar = async (input: Record<string, unknown>): Promise<unknown> => {
+    const mode = optionalString(input, "mode") ?? "command";
+    const query = optionalString(input, "query") ?? "";
+    // The bar would open over the dialog without its keys.
+    if (isDialogOpen()) throw new Error("A dialog is open. Close it first with app.closeDialog.");
+    if (getState().commandBarOpen) {
+      dispatch({ type: "SET_COMMAND_BAR", open: false });
+      await afterMutation();
+    }
+    if (mode === "ticker") {
+      // DES's search: a remote pick opens the ticker, it does not change the focused pane's.
+      dispatch({ type: "SET_COMMAND_BAR", open: true, launch: { kind: "ticker-search", query, payload: SECURITY_DESCRIPTION_SEARCH } });
+      await afterMutation();
+      return mutationSummary(getState(), { commandBar: getResource("app://command-bar") });
+    }
+    if (mode !== "command" && mode !== "default") {
+      throw new Error(`Unsupported command-bar mode "${mode}".`);
+    }
+    dispatch({ type: "SET_COMMAND_BAR", open: true, query });
+    await afterMutation();
+    return mutationSummary(getState(), { commandBar: getResource("app://command-bar") });
+  };
+
+  const setVisibleCommandBarQuery = async (query: string): Promise<void> => {
+    dispatch({ type: "SET_COMMAND_BAR_QUERY", query });
+    await afterMutation();
+    const inputNode = (uiRegistry?.snapshot() ?? [])
+      .find((node) => isCommandBarInputNode(node) && node.metadata?.focused === true && node.actions.includes("setValue"));
+    if (!inputNode) return;
+    if (inputNode.metadata?.value === query) return;
+    await uiRegistry?.invoke(inputNode.id, "setValue", { value: query });
+    await afterMutation();
+  };
+
+  const activateCommandBarResult = async (input: Record<string, unknown>): Promise<unknown> => {
+    const result = findCommandBarResult(commandBarResultsFromNodes(uiRegistry?.snapshot() ?? []), input);
+    if (!result) throw new Error("No matching command-bar result is visible.");
+    if (!result.actions.includes("activate")) {
+      throw new Error(`Command-bar result "${result.nodeId}" does not expose activate.`);
+    }
+    await uiRegistry?.invoke(result.nodeId, "activate", result.actionInput);
+    return getAfterMutationSummary({ activatedResult: result });
+  };
+
+  const invokeMatchingUiNode = async (input: Record<string, unknown>): Promise<unknown> => {
+    const action = optionalString(input, "action") ?? "press";
+    const node = findMatchingUiNode(uiRegistry?.snapshot() ?? [], input);
+    if (!node) throw new Error("No matching semantic UI node is visible.");
+    const result = await uiRegistry?.invoke(node.id, action, input.input);
+    return getAfterMutationSummary({ invokedNode: node, result });
+  };
+
+  /** The focused pane, or the one asked for, as the window draws it now. */
+  const screenshotPane = async (input: Record<string, unknown>): Promise<unknown> => {
+    if (!capturePane) {
+      throw new RemoteOperationError(
+        "unsupported",
+        "Pane screenshots need the Gloom desktop app: the terminal (TUI) app draws text, not pixels. Read the pane's content instead.",
+      );
+    }
+    const width = input.width;
+    if (width !== undefined && (
+      typeof width !== "number" || !Number.isInteger(width) || width < PANE_SCREENSHOT_MIN_WIDTH || width > PANE_SCREENSHOT_MAX_EDGE
+    )) {
+      throw new Error(`width must be a whole number of pixels from ${PANE_SCREENSHOT_MIN_WIDTH} to ${PANE_SCREENSHOT_MAX_EDGE}.`);
+    }
+    const state = getState();
+    const layout = state.config.layout;
+    const asked = optionalString(input, "paneId");
+    const instance = asked
+      ? resolvePaneInstance(layout, asked)
+      : state.focusedPaneId ? findPaneInstance(layout, state.focusedPaneId) : undefined;
+    if (!instance) {
+      throw new Error(asked ? `No pane "${asked}" is open in this layout. Read app://panes for the open ones.` : "No pane is focused. Pass paneId.");
+    }
+    if ((layout.detached ?? []).some((entry) => entry.instanceId === instance.instanceId)) {
+      throw new Error(`Pane "${instance.instanceId}" is in its own window; dock it to capture it.`);
+    }
+    const shot = await capturePane({
+      instanceId: instance.instanceId,
+      scaleFor: (screen) => paneScreenshotScale(screen, width as number | undefined),
+      maxBytes: PANE_SCREENSHOT_MAX_BYTES,
+      minWidth: PANE_SCREENSHOT_MIN_WIDTH,
+    });
+    return {
+      pane: {
+        instanceId: instance.instanceId,
+        paneId: instance.paneId,
+        ...(instance.title ? { title: instance.title } : {}),
+      },
+      image: { mimeType: "image/png", data: shot.pngBase64, width: shot.width, height: shot.height, bytes: shot.bytes },
+      screen: shot.screen,
+      ...(shot.reduced ? { reduced: true } : {}),
+    };
+  };
+
+  const workflowDeps = () => ({
+    dataProvider: pluginRegistry.marketData,
+    tickerRepository: pluginRegistry.tickerRepository,
+    pluginRegistry,
+    dispatch,
+    getState,
+  });
+
+  /**
+   * Adds or removes one ticker on a personal watchlist, after the person
+   * approves that exact change in the app. A caller that already showed them
+   * the dry run's summary and got a yes passes its confirmKey instead.
+   */
+  const changeWatchlist = async (
+    operation: string,
+    input: Record<string, unknown>,
+    dryRun: boolean | undefined,
+    context: RemoteCallContext,
+  ): Promise<unknown> => {
+    const action = operation === "watchlist.add" ? "add" : "remove";
+    const plan = await planWatchlistChange(action, {
+      symbol: stringInput(input, "symbol"),
+      exchange: optionalString(input, "exchange"),
+      watchlist: optionalString(input, "watchlist"),
+    }, workflowDeps());
+    if (dryRun) return describeWatchlistPlan(plan);
+    if (!plan.changes) return unchangedWatchlistResult(plan);
+    if (context.confirmed !== plan.confirmKey) {
+      if (!confirmChange) throw new Error("This window cannot ask for confirmation, so nothing changed.");
+      if (!await confirmChange(watchlistChangePrompt(plan), context.signal)) return declinedWatchlistResult(plan);
+    }
+    return runAutomated(() => applyWatchlistChange(plan, workflowDeps()));
+  };
+
+  // What remote control opens is automation, not the user opening a function.
+  // A watchlist change waits on the person, so only its write is automated.
+  const call = (operation: string, rawInput: unknown, dryRun: boolean | undefined, context: RemoteCallContext): Promise<unknown> => (
+    PLANNED_OPERATIONS.has(operation)
+      ? changeWatchlist(operation, asRecord(rawInput), dryRun, context)
+      : runAutomated(() => callOperation(operation, rawInput, dryRun, context))
+  );
+
+  /**
+   * A view's source loads once before the view is kept, so a function that
+   * does not exist or cannot read answers with its own error instead of
+   * leaving a pane that never fills, and a column, filter or sort on a key its
+   * rows never carry is answered with the keys they do carry. What the load
+   * noted comes back as warnings.
+   */
+  const checkViewSource = async (spec: ViewSpec, action: "create" | "update", signal?: AbortSignal): Promise<string[]> => {
+    try {
+      return await trialLoadViewSource(spec, getState().config, { registry: pluginRegistry, signal });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (error instanceof UnknownViewKeysError) {
+        throw new Error(`${action === "create" ? "No view was created" : "The view was left as it was"}. ${reason}`);
+      }
+      throw new Error(`The view's source did not load, so ${action === "create" ? "no view was created" : "the view was left as it was"}. ${reason}`);
+    }
+  };
+
+  const callOperation = async (operation: string, rawInput: unknown, dryRun?: boolean, context: RemoteCallContext = {}): Promise<unknown> => {
+    const input = asRecord(rawInput);
+    const dryRunResult = () => ({ operation, input, dryRun: true });
+    if (dryRun) return dryRunResult();
+
+    switch (operation) {
+      case "app.openCommandBar":
+        return openCommandBar(input);
+      case "app.closeCommandBar":
+        dispatch({ type: "SET_COMMAND_BAR", open: false });
+        return getAfterMutationSummary();
+      case "app.closeDialog":
+        if (!closeTopmostDialog()) throw new Error("No dialog is open.");
+        return getAfterMutationSummary();
+      case "app.setCommandBarQuery":
+        await setVisibleCommandBarQuery(stringInput(input, "query"));
+        return mutationSummary(getState(), { commandBar: getResource("app://command-bar") });
+      case "app.search":
+        return openCommandBar(input);
+      case "app.switchPanel":
+        pluginRegistry.switchPanel(input.panel === "right" ? "right" : "left");
+        return getAfterMutationSummary();
+      case "app.notify":
+        pluginRegistry.notify({ body: stringInput(input, "body"), type: input.type as never });
+        return null;
+      case "commandBar.activateResult":
+        return activateCommandBarResult(input);
+      case "pane.show":
+        pluginRegistry.showPane(stringInput(input, "paneId"));
+        return getAfterMutationSummary();
+      case "pane.focus":
+        pluginRegistry.focusPane(stringInput(input, "paneId"));
+        return getAfterMutationSummary();
+      case "pane.close": {
+        const paneId = stringInput(input, "paneId");
+        pluginRegistry.hidePane(paneId);
+        return getAfterMutationSummary({ affectedPaneIds: [paneId] });
+      }
+      case "pane.screenshot":
+        return screenshotPane(input);
+      case "pane.createFromTemplate":
+        await pluginRegistry.createPaneFromTemplateAsync(
+          stringInput(input, "templateId"),
+          asRecord(input.options),
+        );
+        return getAfterMutationSummary();
+      case "view.create": {
+        // ASKG and the local agent both land here, so one validator decides.
+        const parsed = parseViewSpecOr(input.spec);
+        if ("error" in parsed) throw new Error(parsed.error);
+        const loadWarnings = await checkViewSource(parsed.spec, "create", context.signal);
+        await pluginRegistry.createPaneFromTemplateAsync(
+          CUSTOM_VIEW_TEMPLATE_ID,
+          customViewCreateOptions(parsed.spec, optionalString(input, "name")),
+        );
+        const warnings = [...parsed.result.warnings.map((entry) => entry.message), ...loadWarnings];
+        return getAfterMutationSummary(warnings.length ? { warnings } : undefined);
+      }
+      case "view.update": {
+        const paneId = stringInput(input, "paneId");
+        const parsed = parseViewSpecOr(input.spec);
+        if ("error" in parsed) throw new Error(parsed.error);
+        const instanceId = resolvePaneInstance(getState().config.layout, paneId)?.instanceId ?? paneId;
+        const instance = findPaneInstance(getState().config.layout, instanceId);
+        if (!instance) throw new Error(`No pane instance "${paneId}".`);
+        if (instance.paneId !== CUSTOM_VIEW_PANE_ID) throw new Error(`Pane "${paneId}" is not a custom view.`);
+        const loadWarnings = await checkViewSource(parsed.spec, "update", context.signal);
+        // The load took time; write onto the view as it is now, if it is still there.
+        const current = findPaneInstance(getState().config.layout, instanceId);
+        if (!current) throw new Error(`The view "${paneId}" was closed while its source loaded.`);
+        let layout = setPaneSettings(getState().config.layout, instanceId, {
+          ...current.settings,
+          ...customViewInstanceSettings(parsed.spec),
+        });
+        const name = optionalString(input, "name");
+        if (name) layout = updatePaneInstance(layout, instanceId, (entry: PaneInstanceConfig) => ({ ...entry, title: name }));
+        pluginRegistry.updateLayout(layout);
+        const warnings = [...parsed.result.warnings.map((entry) => entry.message), ...loadWarnings];
+        return getAfterMutationSummary({ affectedPaneIds: [instanceId], ...(warnings.length ? { warnings } : {}) });
+      }
+      case "pane.setState":
+        dispatch({
+          type: "UPDATE_PANE_STATE",
+          paneId: stringInput(input, "paneId"),
+          patch: asRecord(input.patch),
+        });
+        return getAfterMutationSummary({ affectedPaneIds: [stringInput(input, "paneId")] });
+      case "pane.setSetting": {
+        const paneId = stringInput(input, "paneId");
+        const key = stringInput(input, "key");
+        const descriptor = pluginRegistry.resolvePaneSettings(paneId);
+        const field = descriptor?.settingsDef.fields.find((entry) => entry.key === key);
+        if (field) {
+          await pluginRegistry.applyPaneSettingValue(descriptor!.paneId, field, input.value);
+        } else {
+          const instanceId = descriptor?.paneId ?? paneId;
+          const current = pluginRegistry.resolvePaneSettings(instanceId)?.context.settings ?? {};
+          // The lock is resolved into the settings view but lives on the instance.
+          const { [PANE_LOCK_SETTING_KEY]: _locked, ...currentSettings } = current;
+          pluginRegistry.updateLayout(setPaneSettings(getState().config.layout, instanceId, {
+            ...currentSettings,
+            [key]: input.value,
+          }));
+        }
+        return getAfterMutationSummary({ affectedPaneIds: [paneId] });
+      }
+      case "ticker.navigate":
+        pluginRegistry.navigateTicker(stringInput(input, "symbol"), { sourcePaneId: optionalString(input, "sourcePaneId") });
+        return getAfterMutationSummary({ symbol: stringInput(input, "symbol") });
+      case "ticker.pin":
+        pluginRegistry.pinTicker(stringInput(input, "symbol"), {
+          floating: input.floating === true,
+          forceNewPane: input.forceNewPane === true,
+          paneType: optionalString(input, "paneType"),
+        });
+        return getAfterMutationSummary({ symbol: stringInput(input, "symbol") });
+      case "ticker.select":
+        pluginRegistry.selectTicker(stringInput(input, "symbol"), optionalString(input, "paneId"));
+        return getAfterMutationSummary({ symbol: stringInput(input, "symbol") });
+      case "ticker.switchTab":
+        pluginRegistry.switchTab(stringInput(input, "tabId"), optionalString(input, "paneId"));
+        return getAfterMutationSummary({ tabId: stringInput(input, "tabId") });
+      case "layout.switch":
+        dispatch({ type: "SWITCH_LAYOUT", index: numberInput(input, "index") });
+        return getAfterMutationSummary();
+      case "layout.new":
+        dispatch({ type: "NEW_LAYOUT", name: stringInput(input, "name") });
+        return getAfterMutationSummary();
+      case "layout.rename":
+        dispatch({ type: "RENAME_LAYOUT", index: numberInput(input, "index"), name: stringInput(input, "name") });
+        return getAfterMutationSummary();
+      case "layout.duplicate":
+        dispatch({ type: "DUPLICATE_LAYOUT", index: numberInput(input, "index") });
+        return getAfterMutationSummary();
+      case "layout.delete":
+        dispatch({ type: "DELETE_LAYOUT", index: numberInput(input, "index") });
+        return getAfterMutationSummary();
+      case "layout.undo":
+        dispatch({ type: "UNDO_LAYOUT" });
+        return getAfterMutationSummary();
+      case "layout.redo":
+        dispatch({ type: "REDO_LAYOUT" });
+        return getAfterMutationSummary();
+      case "layout.gridlock":
+        tidyWindows({
+          layout: getState().config.layout,
+          size: pluginRegistry.getTermSize(),
+          paneTypes: pluginRegistry.panes,
+          apply: pluginRegistry.updateLayout,
+        });
+        return getAfterMutationSummary();
+      case "layout.closeFloating": {
+        const floatingPaneIds = getState().config.layout.floating.map((entry) => entry.instanceId);
+        pluginRegistry.updateLayout(removeFloatingPanes(getState().config.layout));
+        return getAfterMutationSummary({ affectedPaneIds: floatingPaneIds });
+      }
+      case "layout.placePane": {
+        const pane = requirePaneInstance(getState().config.layout, stringInput(input, "paneId"));
+        const region = stringInput(input, "region");
+        const { width, height } = pluginRegistry.getTermSize();
+        const def = pluginRegistry.panes.get(pane.paneId);
+        const nextLayout = region === "floating"
+          ? floatPane(getState().config.layout, pane.instanceId, width, height, def)
+          : optionalString(input, "relativeTo")
+            ? dockPane(getState().config.layout, pane.instanceId, {
+              relativeTo: requirePaneInstance(getState().config.layout, optionalString(input, "relativeTo")!).instanceId,
+              position: regionToDockPosition(region),
+            })
+            : insertAtRootEdge(getState().config.layout, pane.instanceId, regionToRootEdge(region));
+        pluginRegistry.updateLayout(nextLayout);
+        return getAfterMutationSummary({ affectedPaneIds: [pane.instanceId] });
+      }
+      case "layout.focusRegion": {
+        const region = stringInput(input, "region");
+        const { width, height } = pluginRegistry.getTermSize();
+        const leaves = getDockLeafLayouts(getState().config.layout, { x: 0, y: 0, width, height });
+        if (leaves.length === 0) throw new Error("No docked panes are visible.");
+        const target = leaves
+          .map((leaf) => {
+            const centerX = leaf.rect.x + leaf.rect.width / 2;
+            const centerY = leaf.rect.y + leaf.rect.height / 2;
+            const score = region === "left" ? centerX
+              : region === "right" ? -centerX
+                : region === "top" ? centerY
+                  : region === "bottom" ? -centerY
+                    : Math.abs(centerX - width / 2) + Math.abs(centerY - height / 2);
+            return { leaf, score };
+          })
+          .sort((a, b) => a.score - b.score)[0]!.leaf;
+        dispatch({ type: "FOCUS_PANE", paneId: target.instanceId });
+        return getAfterMutationSummary({ affectedPaneIds: [target.instanceId] });
+      }
+      case "layout.setGrid": {
+        const rawPaneIds = Array.isArray(input.paneIds) ? input.paneIds : getPlacedPaneInstanceIds(getState().config.layout);
+        const paneIds = rawPaneIds.map((id) => requirePaneInstance(getState().config.layout, String(id)).instanceId);
+        const nextLayout = {
+          ...getState().config.layout,
+          dockRoot: buildGridDockRoot(paneIds, optionalNumber(input, "columns")),
+          floating: getState().config.layout.floating.filter((entry) => !paneIds.includes(entry.instanceId)),
+          detached: (getState().config.layout.detached ?? []).filter((entry) => !paneIds.includes(entry.instanceId)),
+        };
+        pluginRegistry.updateLayout(nextLayout);
+        return getAfterMutationSummary({ affectedPaneIds: paneIds });
+      }
+      case "desktop.popOutPane":
+        await desktopWindowBridge?.popOutPane?.(stringInput(input, "paneId"));
+        return getAfterMutationSummary({ affectedPaneIds: [stringInput(input, "paneId")] });
+      case "desktop.dockPane":
+        await desktopWindowBridge?.dockDetachedPane?.(stringInput(input, "paneId"));
+        return getAfterMutationSummary({ affectedPaneIds: [stringInput(input, "paneId")] });
+      case "desktop.closeDetachedPane":
+        await desktopWindowBridge?.closeDetachedPane?.(stringInput(input, "paneId"));
+        return getAfterMutationSummary({ affectedPaneIds: [stringInput(input, "paneId")] });
+      case "desktop.focusDetachedPane":
+        await desktopWindowBridge?.focusDetachedPane?.(stringInput(input, "paneId"));
+        return getAfterMutationSummary({ affectedPaneIds: [stringInput(input, "paneId")] });
+      case "capability.invoke":
+        return await pluginRegistry.capabilities.invoke(
+          stringInput(input, "capabilityId"),
+          stringInput(input, "operationId"),
+          input.payload ?? {},
+        );
+      case "ui.invoke": {
+        const result = await uiRegistry?.invoke(
+          stringInput(input, "nodeId"),
+          optionalString(input, "action") ?? "press",
+          input.input,
+        );
+        return getAfterMutationSummary({ result });
+      }
+      case "ui.invokeMatching":
+        return invokeMatchingUiNode(input);
+      default:
+        throw new Error(`Unknown remote operation "${operation}".`);
+    }
+  };
+
+  /** `context` comes from in-process callers only; the local endpoint never passes one. */
+  const handle = async (request: RemoteControlRequest, context: RemoteCallContext = {}): Promise<RemoteControlResponse> => {
+    try {
+      switch (request.type) {
+        case "help":
+          return ok(REMOTE_AGENT_HELP, revisionFor(REMOTE_AGENT_HELP));
+        case "schema":
+          return ok(remoteControlSchema());
+        case "get": {
+          const data = getResource(request.resource);
+          return ok(data, revisionFor(data), buildIncludedState(request.include));
+        }
+        case "data":
+          return ok(await queryMarketData(request));
+        case "call": {
+          const data = await call(request.operation, request.input, request.dryRun, context);
+          const defaults = request.dryRun || READ_OPERATIONS.has(request.operation) ? [] : DEFAULT_MUTATION_INCLUDE;
+          return ok(data, undefined, buildIncludedState(request.include, defaults));
+        }
+        case "patch": {
+          const target = patchTarget(request.resource);
+          const currentRev = revisionFor(target.value);
+          if (request.expectRev && request.expectRev !== currentRev) {
+            throw new Error(`Revision mismatch for ${request.resource}: expected ${request.expectRev}, got ${currentRev}.`);
+          }
+          const nextValue = applyJsonPatch(target.value, request.patch as RemoteJsonPatchOperation[]);
+          if (!request.dryRun) {
+            await target.apply(nextValue);
+            await afterMutation();
+          }
+          return ok(
+            nextValue,
+            revisionFor(nextValue),
+            buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE),
+          );
+        }
+        case "batch": {
+          const responses = [];
+          const haltOnError = request.haltOnError !== false;
+          let haltedAt: number | null = null;
+          for (const entry of request.requests) {
+            const entryRequest = request.dryRun && (entry.type === "call" || entry.type === "patch")
+              ? { ...entry, dryRun: true, include: entry.include ?? [] } as RemoteControlRequest
+              : (entry.type === "call" || entry.type === "patch")
+                ? { ...entry, include: entry.include ?? [] } as RemoteControlRequest
+                : entry;
+            const response = await handle(entryRequest);
+            responses.push(response);
+            if (request.settle === "afterEach") await afterMutation();
+            if (!response.ok && haltOnError) {
+              haltedAt = responses.length - 1;
+              break;
+            }
+          }
+          if (request.settle === "afterBatch") await afterMutation();
+          return ok({
+            ok: responses.every((response) => response.ok),
+            haltedAt,
+            responses,
+          }, undefined, buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE));
+        }
+        default:
+          throw new Error(`Unknown remote request type: ${(request as { type?: unknown }).type}`);
+      }
+    } catch (error) {
+      return fail("remote_error", error);
+    }
+  };
+
+  return { handle };
+}

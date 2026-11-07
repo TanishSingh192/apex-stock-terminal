@@ -1,0 +1,754 @@
+import { describe, expect, test } from "bun:test";
+import type { QuoteContributionMap } from "../../types/financials";
+import {
+  resolveCanonicalQuote,
+  resolveTickerFinancialsQuoteState,
+  upsertQuoteContributionMap,
+} from "./resolution";
+import { mergeQuoteContribution, normalizeQuoteContribution } from "./contributions";
+import { createTestFinancials } from "../../test-support/data-provider";
+
+describe("quote-resolution", () => {
+  test("keeps actual trade price and timestamp paired with the selected price provider", () => {
+    const now = Date.parse("2026-09-10T18:00:00Z");
+    const contributions: QuoteContributionMap = {
+      ibkr: { symbol: "PLTR", providerId: "ibkr", dataSource: "live", price: 166, mark: 166, lastTradePrice: 165.9,
+        currency: "USD", change: 1, changePercent: 1, lastUpdated: now, lastTradeTime: now - 2000 },
+      gloom: { symbol: "PLTR", providerId: "gloom", dataSource: "delayed", price: 165, lastTradePrice: 164.9,
+        currency: "USD", change: 0, changePercent: 0, lastUpdated: now - 900000, lastTradeTime: now - 900000 },
+    };
+    expect(resolveCanonicalQuote(contributions, now).quote).toMatchObject({ price: 166, lastTradePrice: 165.9, lastTradeTime: now - 2000 });
+    delete contributions.ibkr!.lastTradeTime;
+    expect(resolveCanonicalQuote(contributions, now).quote?.lastTradeTime).toBeUndefined();
+    delete contributions.ibkr!.lastTradePrice;
+    expect(resolveCanonicalQuote(contributions, now).quote?.lastTradePrice).toBeUndefined();
+  });
+  test("a listing that no longer trades stays so through merging and resolution, and drops it when it trades again", () => {
+    const now = Date.parse("2026-10-20T15:00:00Z");
+    const delisting = { status: "delisted" as const, lastTradeDate: "2022-10-27", historyStart: "2016-01-04" };
+    const last = { symbol: "TWTR", providerId: "gloomberb-cloud", dataSource: "delayed" as const, price: 53.86,
+      currency: "USD", change: 0.51, changePercent: 0.96, lastUpdated: Date.parse("2022-10-28T12:00:00Z") };
+    const merged = mergeQuoteContribution(normalizeQuoteContribution({ ...last, delisting })!, { ...last, delisting });
+    expect(resolveCanonicalQuote({ "gloomberb-cloud": merged }, now).quote?.delisting).toEqual(delisting);
+    const tradingAgain = mergeQuoteContribution(merged, { ...last, price: 12, lastUpdated: now });
+    expect(resolveCanonicalQuote({ "gloomberb-cloud": tradingAgain }, now).quote?.delisting).toBeUndefined();
+  });
+  test("resolves price, session, listing venue, and route from separate providers", () => {
+    const now = Date.parse("2026-04-08T11:00:00Z");
+    const contributions: QuoteContributionMap = {
+      ibkr: {
+        symbol: "AMD",
+        providerId: "ibkr",
+        dataSource: "live",
+        price: 100,
+        currency: "USD",
+        change: 1,
+        changePercent: 1,
+        lastUpdated: Date.parse("2026-04-08T10:59:00Z"),
+        listingExchangeName: "NASDAQ",
+        routingExchangeName: "SMART",
+        routingExchangeFullName: "SMART",
+        sessionConfidence: "unknown",
+      },
+      "gloomberb-cloud": {
+        symbol: "AMD",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 99.8,
+        currency: "USD",
+        change: 0.8,
+        changePercent: 0.81,
+        lastUpdated: Date.parse("2026-04-08T10:58:00Z"),
+        listingExchangeName: "NASDAQ",
+        listingExchangeFullName: "NASDAQ",
+        sessionConfidence: "unknown",
+      },
+      gloom: {
+        symbol: "AMD",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 99.7,
+        currency: "USD",
+        change: 0.7,
+        changePercent: 0.7,
+        lastUpdated: Date.parse("2026-04-08T10:57:00Z"),
+        listingExchangeName: "NMS",
+        listingExchangeFullName: "NASDAQ",
+        marketState: "PRE",
+        sessionConfidence: "derived",
+        preMarketPrice: 101,
+        preMarketChange: 2,
+        preMarketChangePercent: 2.02,
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.price).toBe(100);
+    expect(quote?.providerId).toBe("ibkr");
+    expect(quote?.marketState).toBe("PRE");
+    expect(quote?.preMarketPrice).toBe(101);
+    expect(quote?.listingExchangeName).toBe("NASDAQ");
+    expect(quote?.routingExchangeName).toBe("SMART");
+    expect(quote?.provenance?.price?.providerId).toBe("ibkr");
+    expect(quote?.provenance?.session?.providerId).toBe("gloom");
+
+    const streamed = upsertQuoteContributionMap({ gloom: contributions.gloom! }, contributions.ibkr!, { now });
+    expect(streamed.ibkr?.price).toBe(100);
+    expect(resolveCanonicalQuote(streamed, now).quote).toMatchObject({ price: 100, marketState: "PRE", preMarketPrice: 101 });
+  });
+
+  test("admits incomplete price contributions only from the current extended session", () => {
+    for (const [nowIso, marketState] of [["2026-09-14T11:00:00Z", "PRE"], ["2026-09-14T22:00:00Z", "POST"]] as const) {
+      const now = Date.parse(nowIso);
+      const gloom = { symbol: "AMD", providerId: "gloom", price: 99, currency: "USD", change: 0, changePercent: 0,
+        lastUpdated: now - 60_000, listingExchangeName: "NASDAQ", marketState,
+        ...(marketState === "PRE" ? { preMarketPrice: 101 } : { postMarketPrice: 102 }) };
+      const ibkr = { ...gloom, providerId: "ibkr", dataSource: "live" as const, price: 100,
+        marketState: undefined, preMarketPrice: undefined, postMarketPrice: undefined };
+      const good = resolveCanonicalQuote({ gloom, ibkr }, now).quote;
+      expect(good).toMatchObject({ price: 100, marketState });
+      for (const overrides of [
+        { stale: true }, { lastUpdated: now - 86_400_000 }, { lastUpdated: NaN }, { lastUpdated: Infinity },
+        { lastUpdated: 0 }, { lastUpdated: now + 60_000 },
+        { lastUpdated: Date.parse(marketState === "PRE" ? "2026-09-14T07:59:00Z" : "2026-09-14T11:00:00Z") },
+        { marketState: marketState === "PRE" ? "POST" as const : "PRE" as const, preMarketPrice: 101, postMarketPrice: 102 },
+      ]) {
+        const rejected = { ...ibkr, ...overrides };
+        expect(resolveCanonicalQuote({ gloom, ibkr: rejected }, now).quote?.price).toBe(99);
+        expect(upsertQuoteContributionMap({ gloom }, rejected, { now }).ibkr).toBeUndefined();
+      }
+      // Price-only contributions remain useful as retained data; they cannot
+      // establish a complete current-session quote without session metadata.
+      expect(resolveCanonicalQuote({ ibkr }, now).quote?.marketState).toBeUndefined();
+    }
+  });
+
+  test("uses provider previous close with the live broker price for daily change", () => {
+    const now = Date.parse("2026-07-06T14:05:00Z");
+    const contributions: QuoteContributionMap = {
+      ibkr: {
+        symbol: "VICR",
+        providerId: "ibkr",
+        dataSource: "live",
+        price: 299.8,
+        currency: "USD",
+        change: -80.3,
+        changePercent: -21.12,
+        previousClose: 380.1,
+        lastUpdated: Date.parse("2026-07-06T14:04:58Z"),
+        receivedAt: Date.parse("2026-07-06T14:04:59Z"),
+        listingExchangeName: "NASDAQ",
+        routingExchangeName: "SMART",
+        sessionConfidence: "unknown",
+      },
+      gloom: {
+        symbol: "VICR",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 299.74,
+        currency: "USD",
+        change: 16.79,
+        changePercent: 5.93,
+        previousClose: 282.95,
+        lastUpdated: Date.parse("2026-07-06T14:04:00Z"),
+        listingExchangeName: "NMS",
+        marketState: "REGULAR",
+        sessionConfidence: "derived",
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.providerId).toBe("ibkr");
+    expect(quote?.price).toBe(299.8);
+    expect(quote?.previousClose).toBe(282.95);
+    expect(quote?.change).toBeCloseTo(16.85, 10);
+    expect(quote?.changePercent).toBeCloseTo((16.85 / 282.95) * 100, 10);
+    expect(quote?.provenance?.price?.providerId).toBe("ibkr");
+    expect(quote?.provenance?.fields?.previousClose?.providerId).toBe("gloom");
+  });
+
+  test("prefers fresher/provider-ranked non-live price candidates", () => {
+    const now = Date.parse("2026-07-07T11:25:00Z");
+    const cases: Array<{
+      contributions: QuoteContributionMap;
+      expectedPrice: number;
+      expectedProvider: string;
+      expectedChangePercent?: number;
+      expectedRoute?: string;
+    }> = [
+      {
+        contributions: {
+          ibkr: {
+            symbol: "LPK",
+            providerId: "ibkr",
+            dataSource: "delayed",
+            price: 17.75,
+            currency: "EUR",
+            change: -1.85,
+            changePercent: -9.44,
+            previousClose: 19.6,
+            lastUpdated: Date.parse("2026-07-07T11:02:00Z"),
+            receivedAt: Date.parse("2026-07-07T11:02:01Z"),
+            listingExchangeName: "IBIS",
+            routingExchangeName: "SMART",
+            sessionConfidence: "unknown",
+          },
+          gloom: {
+            symbol: "LPK.DE",
+            providerId: "gloom",
+            dataSource: "delayed",
+            price: 17.85,
+            currency: "EUR",
+            change: -1.75,
+            changePercent: -8.93,
+            previousClose: 19.6,
+            lastUpdated: Date.parse("2026-07-07T11:24:00Z"),
+            listingExchangeName: "GER",
+            marketState: "REGULAR",
+            sessionConfidence: "derived",
+          },
+        },
+        expectedProvider: "gloom",
+        expectedPrice: 17.85,
+        expectedChangePercent: ((17.85 - 19.6) / 19.6) * 100,
+        expectedRoute: "SMART",
+      },
+      {
+        contributions: {
+          "gloomberb-cloud": {
+            symbol: "3HNX",
+            providerId: "gloomberb-cloud",
+            dataSource: "delayed",
+            price: 5.81,
+            currency: "GBP",
+            change: -1.58,
+            changePercent: -21.42,
+            previousClose: 7.39,
+            lastUpdated: Date.parse("2026-07-07T11:18:00Z"),
+            listingExchangeName: "LSE",
+            marketState: "REGULAR",
+            sessionConfidence: "derived",
+          },
+          gloom: {
+            symbol: "3HNX.L",
+            providerId: "gloom",
+            dataSource: "delayed",
+            price: 5.9775,
+            currency: "GBP",
+            change: -1.4125,
+            changePercent: -19.09,
+            previousClose: 7.39,
+            lastUpdated: Date.parse("2026-07-07T11:24:00Z"),
+            listingExchangeName: "LSE",
+            marketState: "REGULAR",
+            sessionConfidence: "derived",
+          },
+        },
+        expectedProvider: "gloom",
+        expectedPrice: 5.9775,
+      },
+    ];
+
+    for (const scenario of cases) {
+      const quote = resolveCanonicalQuote(scenario.contributions, now).quote;
+      expect(quote?.providerId).toBe(scenario.expectedProvider);
+      expect(quote?.price).toBe(scenario.expectedPrice);
+      expect(quote?.provenance?.price?.providerId).toBe(scenario.expectedProvider);
+      if (scenario.expectedChangePercent != null) {
+        expect(quote?.changePercent).toBeCloseTo(scenario.expectedChangePercent, 10);
+      }
+      if (scenario.expectedRoute) {
+        expect(quote?.routingExchangeName).toBe(scenario.expectedRoute);
+      }
+    }
+  });
+
+  test("prefers gloom day reference fields over stale cloud previous close data", () => {
+    const now = Date.parse("2026-07-06T15:45:00Z");
+    const contributions: QuoteContributionMap = {
+      "gloomberb-cloud": {
+        symbol: "VICR",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 299.8,
+        currency: "USD",
+        change: -80.27,
+        changePercent: -21.12,
+        previousClose: 380.07,
+        lastUpdated: Date.parse("2026-07-06T15:44:00Z"),
+        listingExchangeName: "NASDAQ",
+        marketState: "REGULAR",
+        sessionConfidence: "derived",
+      },
+      gloom: {
+        symbol: "VICR",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 297.9,
+        currency: "USD",
+        change: 14.95,
+        changePercent: 5.28,
+        previousClose: 282.95,
+        lastUpdated: Date.parse("2026-07-06T15:41:00Z"),
+        listingExchangeName: "NMS",
+        marketState: "REGULAR",
+        sessionConfidence: "derived",
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.providerId).toBe("gloomberb-cloud");
+    expect(quote?.price).toBe(299.8);
+    expect(quote?.previousClose).toBe(282.95);
+    expect(quote?.change).toBeCloseTo(16.85, 10);
+    expect(quote?.changePercent).toBeCloseTo((16.85 / 282.95) * 100, 10);
+    expect(quote?.provenance?.price?.providerId).toBe("gloomberb-cloud");
+    expect(quote?.provenance?.fields?.previousClose?.providerId).toBe("gloom");
+  });
+
+  test("prefers cloud session data over gloom when confidence is tied", () => {
+    const now = Date.parse("2026-04-08T11:00:00Z");
+    const contributions: QuoteContributionMap = {
+      "gloomberb-cloud": {
+        symbol: "ELF",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 88,
+        currency: "USD",
+        change: 0,
+        changePercent: 0,
+        lastUpdated: Date.parse("2026-04-08T10:58:00Z"),
+        listingExchangeName: "NYSE",
+        marketState: "PRE",
+        sessionConfidence: "derived",
+        preMarketPrice: 89,
+      },
+      gloom: {
+        symbol: "ELF",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 87.5,
+        currency: "USD",
+        change: 0,
+        changePercent: 0,
+        lastUpdated: Date.parse("2026-04-08T10:57:00Z"),
+        listingExchangeName: "NYQ",
+        marketState: "PRE",
+        sessionConfidence: "derived",
+        preMarketPrice: 87.8,
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.marketState).toBe("PRE");
+    expect(quote?.preMarketPrice).toBe(89);
+    expect(quote?.provenance?.session?.providerId).toBe("gloomberb-cloud");
+  });
+
+  test("prefers gloom extended-hours session data when cloud premarket lacks an active-session price", () => {
+    const now = Date.parse("2026-04-08T11:00:00Z");
+    const contributions: QuoteContributionMap = {
+      "gloomberb-cloud": {
+        symbol: "AMD",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 221.53,
+        currency: "USD",
+        change: 1.35,
+        changePercent: 0.61,
+        lastUpdated: Date.parse("2026-04-08T10:58:00Z"),
+        listingExchangeName: "NASDAQ",
+        marketState: "PRE",
+        sessionConfidence: "derived",
+      },
+      gloom: {
+        symbol: "AMD",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 221.53,
+        currency: "USD",
+        change: 1.35,
+        changePercent: 0.61,
+        lastUpdated: Date.parse("2026-04-08T10:57:00Z"),
+        listingExchangeName: "NMS",
+        marketState: "PRE",
+        sessionConfidence: "derived",
+        preMarketPrice: 231.7,
+        preMarketChange: 10.17,
+        preMarketChangePercent: 4.59,
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.marketState).toBe("PRE");
+    expect(quote?.preMarketPrice).toBe(231.7);
+    expect(quote?.preMarketChangePercent).toBe(4.59);
+    expect(quote?.provenance?.session?.providerId).toBe("gloom");
+    expect(quote?.provenance?.fields?.preMarketPrice?.providerId).toBe("gloom");
+  });
+
+  test("does not fabricate delayed derived premarket prices from the regular last trade", () => {
+    const quote = resolveTickerFinancialsQuoteState(createTestFinancials({
+      quote: {
+        symbol: "AMD",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 221.53,
+        currency: "USD",
+        change: 1.35,
+        changePercent: 0.61,
+        lastUpdated: 1,
+        marketState: "PRE",
+        sessionConfidence: "derived",
+      },
+    }))?.quote;
+
+    expect(quote?.marketState).toBe("PRE");
+    expect(quote?.preMarketPrice).toBeUndefined();
+    expect(quote?.preMarketChange).toBeUndefined();
+    expect(quote?.preMarketChangePercent).toBeUndefined();
+  });
+
+  test("explicit session state does not turn a delayed or unclassified regular close into extended-hours trades", () => {
+    for (const marketState of ["PRE", "POST"] as const) {
+      for (const dataSource of ["delayed", undefined] as const) {
+        const contribution = normalizeQuoteContribution({
+          symbol: "ASML", providerId: "gloomberb-cloud", listingExchangeName: "AMS",
+          price: 1472.8, currency: "EUR", previousClose: 1497.6,
+          change: -24.8, changePercent: -1.65598,
+          lastUpdated: Date.parse("2026-09-10T15:29:00Z"),
+          marketState, sessionConfidence: "explicit", dataSource,
+        })!;
+        const canonical = resolveCanonicalQuote({ "gloomberb-cloud": contribution }, contribution.lastUpdated).quote;
+        for (const quote of [contribution, canonical]) {
+          expect(quote?.price).toBe(1472.8);
+          expect(quote?.marketState).toBe(marketState);
+          expect(quote?.preMarketPrice).toBeUndefined();
+          expect(quote?.preMarketChange).toBeUndefined();
+          expect(quote?.preMarketChangePercent).toBeUndefined();
+          expect(quote?.postMarketPrice).toBeUndefined();
+          expect(quote?.postMarketChange).toBeUndefined();
+          expect(quote?.postMarketChangePercent).toBeUndefined();
+        }
+      }
+    }
+  });
+
+  test("preserves reported delayed after-hours fields without filling missing changes from the daily move", () => {
+    const base = {
+      symbol: "ASML", providerId: "gloomberb-cloud", listingExchangeName: "AMS",
+      price: 1472.8, currency: "EUR", previousClose: 1497.6,
+      change: -24.8, changePercent: -1.65598, lastUpdated: Date.parse("2026-09-10T16:00:00Z"),
+      marketState: "POST" as const, sessionConfidence: "explicit" as const, dataSource: "delayed" as const,
+      postMarketPrice: 1475,
+    };
+    const priceOnly = normalizeQuoteContribution(base)!;
+    expect(priceOnly.postMarketPrice).toBe(1475);
+    expect(priceOnly.postMarketChange).toBeUndefined();
+    expect(priceOnly.postMarketChangePercent).toBeUndefined();
+    const reported = normalizeQuoteContribution({ ...base, postMarketChange: 2.2, postMarketChangePercent: 0.1494 })!;
+    expect(resolveCanonicalQuote({ "gloomberb-cloud": reported }, reported.lastUpdated).quote).toMatchObject({
+      postMarketPrice: 1475, postMarketChange: 2.2, postMarketChangePercent: 0.1494,
+    });
+  });
+
+  test("ignores stale cloud price contributions when a fresh gloom quote exists", () => {
+    const now = Date.parse("2026-04-08T10:30:00Z");
+    const contributions: QuoteContributionMap = {
+      "gloomberb-cloud": {
+        symbol: "HY9H",
+        providerId: "gloomberb-cloud",
+        dataSource: "delayed",
+        price: 528,
+        currency: "EUR",
+        change: 4,
+        changePercent: 0.76,
+        lastUpdated: Date.parse("2026-04-07T17:55:00Z"),
+        listingExchangeName: "FWB2",
+        marketState: "REGULAR",
+        sessionConfidence: "explicit",
+      },
+      gloom: {
+        symbol: "HY9H",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 598,
+        currency: "EUR",
+        change: 6,
+        changePercent: 1.01,
+        lastUpdated: Date.parse("2026-04-08T10:25:00Z"),
+        listingExchangeName: "FWB2",
+        marketState: "REGULAR",
+        sessionConfidence: "derived",
+      },
+    };
+
+    const quote = resolveCanonicalQuote(contributions, now).quote;
+
+    expect(quote?.price).toBe(598);
+    expect(quote?.providerId).toBe("gloom");
+    expect(quote?.provenance?.price?.providerId).toBe("gloom");
+  });
+
+  test("rejects an incoming stale cloud contribution when a fresh quote already exists", () => {
+    const now = Date.parse("2026-04-08T10:30:00Z");
+    const current: QuoteContributionMap = {
+      gloom: {
+        symbol: "HY9H",
+        providerId: "gloom",
+        dataSource: "delayed",
+        price: 598,
+        currency: "EUR",
+        change: 6,
+        changePercent: 1.01,
+        lastUpdated: Date.parse("2026-04-08T10:25:00Z"),
+        listingExchangeName: "FWB2",
+        marketState: "REGULAR",
+        sessionConfidence: "derived",
+      },
+    };
+
+    const next = upsertQuoteContributionMap(current, {
+      symbol: "HY9H",
+      providerId: "gloomberb-cloud",
+      dataSource: "delayed",
+      price: 528,
+      currency: "EUR",
+      change: 4,
+      changePercent: 0.76,
+      lastUpdated: Date.parse("2026-04-07T17:55:00Z"),
+      listingExchangeName: "FWB2",
+      marketState: "REGULAR",
+      sessionConfidence: "explicit",
+    }, { now });
+
+    expect(next).toEqual(current);
+  });
+
+  test("keeps broker-only SMART quotes as unknown session while preserving the route", () => {
+    const financials = resolveTickerFinancialsQuoteState(createTestFinancials({
+      quote: {
+        symbol: "MU",
+        providerId: "ibkr",
+        dataSource: "live",
+        price: 120,
+        currency: "USD",
+        change: 1,
+        changePercent: 0.84,
+        lastUpdated: 1,
+        listingExchangeName: "NASDAQ",
+        routingExchangeName: "SMART",
+        sessionConfidence: "unknown",
+      },
+    }));
+
+    expect(financials?.quote?.listingExchangeName).toBe("NASDAQ");
+    expect(financials?.quote?.routingExchangeName).toBe("SMART");
+    expect(financials?.quote?.marketState).toBeUndefined();
+    expect(financials?.quote?.provenance?.price?.providerId).toBe("ibkr");
+  });
+});
+
+
+test("live after-hours prices never inherit the daily loss as their session return", () => {
+  const base = { symbol: "NVDA", providerId: "gloomberb-cloud", dataSource: "live" as const,
+    marketState: "POST" as const, price: 218.47, currency: "USD", previousClose: 223.67,
+    change: -5.2, changePercent: -2.324853578933245,
+    exchangeName: "NASDAQ", lastUpdated: Date.parse("2026-09-10T20:30:00Z") };
+  const noClose = normalizeQuoteContribution(base)!;
+  expect(noClose.postMarketPrice).toBe(218.47);
+  expect(noClose.postMarketChange).toBeUndefined();
+  expect(noClose.postMarketChangePercent).toBeUndefined();
+  const reported = normalizeQuoteContribution({ ...base, regularClose: 218.36, regularCloseSessionDate: "2026-09-10",
+    postMarketPrice: 218.47, postMarketChange: 0.11, postMarketChangePercent: 0.0503755266532 })!;
+  const canonical = resolveCanonicalQuote({ cloud: reported }, base.lastUpdated).quote!;
+  expect(canonical.change).toBeCloseTo(-5.2, 8);
+  expect(canonical.postMarketChange).toBe(0.11);
+  expect(canonical.regularClose).toBe(218.36);
+  for (const change of [{}, { currency: "EUR" }, { symbol: "ASML", exchangeName: "AMS" },
+    { lastUpdated: base.lastUpdated + 86400000 }]) {
+    const next = mergeQuoteContribution(reported, { ...base, ...change, marketState: undefined, price: 219 });
+    expect(next.postMarketPrice).toBe(219);
+    expect(next.postMarketChange).toBeUndefined();
+    expect(next.postMarketChangePercent).toBeUndefined();
+    expect(next.regularClose).toBeUndefined();
+    expect(next.regularCloseSessionDate).toBeUndefined();
+  }
+});
+
+test("the last session's move travels with its close and is never carried from another observation", () => {
+  const now = Date.parse("2026-10-09T12:01:00Z");
+  const base = { symbol: "SPCX", providerId: "gloomberb-cloud", dataSource: "delayed" as const, marketState: "PRE" as const,
+    price: 166.95, currency: "USD", previousClose: 160.57, change: 6.38, changePercent: 3.9733,
+    changeSessionDate: "2026-10-09", listingExchangeName: "NASDAQ", lastUpdated: now };
+  const snapshot = normalizeQuoteContribution({ ...base, regularClose: 160.57, regularCloseSessionDate: "2026-10-08",
+    regularChange: -7.03, regularChangePercent: -4.1945 })!;
+  expect(resolveCanonicalQuote({ cloud: snapshot }, now).quote).toMatchObject({
+    regularClose: 160.57, regularChange: -7.03, regularChangePercent: -4.1945 });
+
+  // A frame that leaves the close out takes its move with it; the old one is not kept next to a new price.
+  const bare = mergeQuoteContribution(snapshot, { ...base, price: 167 });
+  expect([bare.regularClose, bare.regularChange, bare.regularChangePercent]).toEqual([undefined, undefined, undefined]);
+  // A new close arrives with its own move, or none.
+  const newer = mergeQuoteContribution(snapshot, { ...base, regularClose: 170, regularCloseSessionDate: "2026-10-09" });
+  expect([newer.regularClose, newer.regularChange, newer.regularChangePercent]).toEqual([170, undefined, undefined]);
+  // A move reported without a close does not reach the canonical quote.
+  expect(resolveCanonicalQuote({ cloud: { ...snapshot, regularClose: undefined } }, now).quote)
+    .toMatchObject({ regularChange: undefined, regularChangePercent: undefined });
+
+  // Another price provider's quote gets neither the close nor its move.
+  const live = { symbol: "SPCX", providerId: "ibkr", dataSource: "live" as const, price: 167, currency: "USD",
+    change: 6.43, changePercent: 4, lastUpdated: now + 1000 };
+  expect(resolveCanonicalQuote({ cloud: snapshot, ibkr: live }, now + 1000).quote).toMatchObject({
+    price: 167, regularClose: undefined, regularChange: undefined, regularChangePercent: undefined });
+});
+
+test("whether the open session has printed travels with the price it describes, and only through that session", () => {
+  const now = Date.parse("2026-10-08T23:00:00Z");
+  const base = { symbol: "NVDA", providerId: "gloomberb-cloud", dataSource: "live" as const, marketState: "POST" as const,
+    price: 230.48, currency: "USD", previousClose: 237.47, change: -6.99, changePercent: -2.9435,
+    listingExchangeName: "NASDAQ", lastUpdated: now, extendedSessionPrint: false };
+  const quiet = normalizeQuoteContribution(base)!;
+  expect(resolveCanonicalQuote({ cloud: quiet }, now).quote).toMatchObject({ marketState: "POST", extendedSessionPrint: false });
+  // A tick that does not say leaves it unknown; one that does replaces it.
+  expect(mergeQuoteContribution(quiet, { ...base, extendedSessionPrint: undefined, price: 231 }).extendedSessionPrint).toBeUndefined();
+  expect(mergeQuoteContribution(quiet, { ...base, extendedSessionPrint: true, price: 231 }).extendedSessionPrint).toBe(true);
+  // Another provider's price is not described by it.
+  const live = { symbol: "NVDA", providerId: "ibkr", dataSource: "live" as const, price: 231, currency: "USD",
+    change: 0.52, changePercent: 0.2, lastUpdated: now + 1000 };
+  expect(resolveCanonicalQuote({ cloud: quiet, ibkr: live }, now + 1000).quote).toMatchObject({ price: 231, extendedSessionPrint: undefined });
+  // Outside the pre-market and after hours there is nothing to say.
+  expect(normalizeQuoteContribution({ ...base, marketState: "CLOSED" })!.extendedSessionPrint).toBeUndefined();
+});
+
+test("the board Gloom Cloud read a saved listing on travels with the price it gave, into a pane's quote", () => {
+  // Thursday 8 Oct 2026 after the Seoul close: a row saved as 247540:KRX, quoted from KOSDAQ and named KRX.
+  const now = Date.parse("2026-10-08T08:00:00Z");
+  const base = { symbol: "247540", providerId: "gloomberb-cloud", dataSource: "delayed" as const, marketState: "CLOSED" as const,
+    price: 128_800, currency: "KRW", previousClose: 124_500, change: 4_300, changePercent: 3.45,
+    listingExchangeName: "KRX", exchangeName: "KRX", lastUpdated: Date.parse("2026-10-08T06:30:00Z"), stale: false };
+  const read = resolveTickerFinancialsQuoteState(null, { ...base, tradingExchangeName: "KOSDAQ" })!;
+  expect(read.quote).toMatchObject({ price: 128_800, listingExchangeName: "KRX", tradingExchangeName: "KOSDAQ" });
+  // An answer from the KRX line itself (the service could not read the board list) names no board.
+  const krxLine = resolveTickerFinancialsQuoteState(read, { ...base, price: 128_900, lastUpdated: now })!;
+  expect(krxLine.quote).toMatchObject({ price: 128_900, listingExchangeName: "KRX" });
+  expect(krxLine.quote?.tradingExchangeName).toBeUndefined();
+  // A broker's price for the same row was not read on that board.
+  const broker = { symbol: "247540", providerId: "ibkr", dataSource: "live" as const, price: 129_000, currency: "KRW",
+    change: 4_500, changePercent: 3.6, lastUpdated: now, listingExchangeName: "KRX" };
+  expect(resolveCanonicalQuote({ cloud: normalizeQuoteContribution({ ...base, tradingExchangeName: "KOSDAQ" })!, ibkr: broker }, now).quote)
+    .toMatchObject({ price: 129_000, tradingExchangeName: undefined });
+});
+
+test("a different price provider cannot inherit a closing-price anchor", () => {
+  const now = Date.parse("2026-09-10T20:30:00Z");
+  const result = resolveCanonicalQuote({
+    cloud: { symbol: "NVDA", providerId: "gloomberb-cloud", dataSource: "delayed", price: 218.47, currency: "USD",
+      change: -5.2, changePercent: -2.32, lastUpdated: now - 900000, regularClose: 218.36, regularCloseSessionDate: "2026-09-10" },
+    ibkr: { symbol: "NVDA", providerId: "ibkr", dataSource: "live", price: 219, currency: "USD",
+      change: -4.67, changePercent: -2.08, lastUpdated: now },
+  }, now).quote!;
+  expect(result.price).toBe(219);
+  expect(result.regularClose).toBeUndefined();
+  expect(result.regularCloseSessionDate).toBeUndefined();
+});
+
+test("canonical quote preserves unavailable day changes while retaining zero and a legitimate prior-close derivation", () => {
+  const base = { symbol: "SCANNER", price: 12, currency: "USD", lastUpdated: Date.now(), marketState: "CLOSED" };
+  const missing = resolveCanonicalQuote({ quote: base }).quote!;
+  expect(missing.change).toBeNaN();
+  expect(missing.changePercent).toBeNaN();
+  expect(resolveCanonicalQuote({ quote: { ...base, change: 0, changePercent: 0 } }).quote).toMatchObject({ change: 0, changePercent: 0 });
+  expect(resolveCanonicalQuote({ quote: { ...base, previousClose: 10 } }).quote).toMatchObject({ change: 2, changePercent: 20 });
+});
+
+// Toncoin as Gloom Cloud served it on 18 Oct 2026: its
+// reported close was weeks old, so the move ran over the board's 24 hours.
+test("a coin's 24-hour move keeps its basis through merging and resolution, and loses it with its next close", () => {
+  const now = Date.parse("2026-10-18T13:50:00Z");
+  const base = { symbol: "TON-USD", providerId: "gloomberb-cloud", dataSource: "delayed" as const,
+    instrumentType: "CRYPTOCURRENCY", listingExchangeName: "CCC", currency: "USD", lastUpdated: now };
+  const closeDay = { ...base, price: 1.34, previousClose: 1.753636, change: -0.413636, changePercent: -23.59 };
+  const day = { ...base, price: 1.3395, change: -0.0018, changePercent: -0.134, changeBasis: "24h" as const };
+  const resolved = resolveTickerFinancialsQuoteState(null, day)!.quote!;
+  expect(resolved).toMatchObject({ change: -0.0018, changePercent: -0.134, changeBasis: "24h", previousClose: undefined });
+
+  // A 24-hour quote replaces the stale close it no longer moves from, so the close cannot restate its move.
+  const merged = mergeQuoteContribution(normalizeQuoteContribution(closeDay)!, day);
+  expect(merged.changeBasis).toBe("24h");
+  expect(merged.previousClose).toBeUndefined();
+  expect(resolveCanonicalQuote({ cloud: merged }, now).quote).toMatchObject({ changePercent: -0.134, changeBasis: "24h" });
+  // A later quote back on a dated close drops the "24h".
+  const back = mergeQuoteContribution(merged, { ...closeDay, previousClose: 1.341, change: -0.001, changePercent: -0.0746 });
+  expect(back.changeBasis).toBeUndefined();
+  const backQuote = resolveCanonicalQuote({ cloud: back }, now).quote!;
+  expect(backQuote.previousClose).toBe(1.341);
+  expect(backQuote.changeBasis).toBeUndefined();
+  // A coin with no move says so.
+  const none = resolveTickerFinancialsQuoteState(null, { ...day, change: Number.NaN, changePercent: Number.NaN, changeBasis: "none" })!.quote!;
+  expect(none.changeBasis).toBe("none");
+  expect(none.changePercent).toBeNaN();
+});
+
+test("a previous close's day travels with that close through ticks and resolution, a broker's price included, and not to the next close", () => {
+  const now = Date.parse("2026-10-23T14:00:00Z");
+  const base = { symbol: "SHEL.L", currency: "GBP", listingExchangeName: "LSE", changeSessionDate: "2026-10-23", lastUpdated: now };
+  const cloud = { ...base, providerId: "gloomberb-cloud", dataSource: "delayed" as const, price: 40.3, change: 1.415,
+    changePercent: 3.64, previousClose: 38.885, previousCloseDate: "2026-10-22" };
+  // A tick that does not restate the day keeps it while the close is the same.
+  const ticked = mergeQuoteContribution(normalizeQuoteContribution(cloud)!, { ...cloud, previousCloseDate: undefined, price: 40.33 });
+  expect(ticked.previousCloseDate).toBe("2026-10-22");
+  // A broker's live price is measured from the cloud's close, and so carries its day.
+  const broker = { ...base, providerId: "ibkr", dataSource: "live" as const, price: 40.35, change: 1.5, changePercent: 3.8, previousClose: 38.85 };
+  expect(resolveCanonicalQuote({ "gloomberb-cloud": ticked, ibkr: broker }, now).quote)
+    .toMatchObject({ price: 40.35, previousClose: 38.885, previousCloseDate: "2026-10-22" });
+  // Monday's quote moves from Friday's close, which no day was read for yet.
+  const monday = mergeQuoteContribution(ticked, { ...cloud, previousCloseDate: undefined, previousClose: 40.33,
+    changeSessionDate: "2026-10-26", lastUpdated: Date.parse("2026-10-26T09:00:00Z") });
+  expect(monday.previousCloseDate).toBeUndefined();
+  // A flat Friday: Monday moves from the same close, and a source that names no session still starts a new day.
+  const { changeSessionDate: _session, ...undeclared } = ticked;
+  const flat = mergeQuoteContribution(undeclared, { ...cloud, changeSessionDate: undefined, previousCloseDate: undefined,
+    lastUpdated: Date.parse("2026-10-26T09:00:00Z") });
+  expect(flat.previousClose).toBe(38.885);
+  expect(flat.previousCloseDate).toBeUndefined();
+});
+
+test("crypto stays open when the tape omits the session or copies an equity close", () => {
+  const now = Date.parse("2026-10-09T14:45:00Z");
+  const tape = {
+    symbol: "BTC-USD", providerId: "gloomberb-cloud", dataSource: "live" as const,
+    instrumentType: "CRYPTOCURRENCY", listingExchangeName: "CCC",
+    price: 83000, currency: "USD", change: 1, changePercent: 1, lastUpdated: now,
+  };
+  expect(normalizeQuoteContribution(tape)).toMatchObject({ marketState: "REGULAR", sessionConfidence: "derived" });
+  expect(normalizeQuoteContribution({ ...tape, marketState: "CLOSED", sessionConfidence: "explicit" }))
+    .toMatchObject({ marketState: "REGULAR", sessionConfidence: "derived" });
+  expect(normalizeQuoteContribution({ ...tape, symbol: "ETH-USD", marketState: "REGULAR", sessionConfidence: "explicit" }))
+    .toMatchObject({ marketState: "REGULAR", sessionConfidence: "explicit" });
+  expect(normalizeQuoteContribution({
+    ...tape, symbol: "MAGS", instrumentType: undefined, listingExchangeName: "CBOE",
+  })?.marketState).toBeUndefined();
+  expect(normalizeQuoteContribution({
+    ...tape, symbol: "EURUSD=X", instrumentType: "CURRENCY", listingExchangeName: "CCY", marketState: "CLOSED",
+  })?.marketState).toBe("CLOSED");
+  expect(resolveTickerFinancialsQuoteState(null, tape)?.quote?.marketState).toBe("REGULAR");
+});
+
+test("a current live price outranks a delayed one stamped later, but a stale live price does not", () => {
+  const now = Date.parse("2026-09-14T18:00:00Z");
+  const common = { symbol: "AAPL", currency: "USD", change: 0, changePercent: 0, listingExchangeName: "NASDAQ", marketState: "REGULAR" as const };
+  const contributions: QuoteContributionMap = {
+    "gloomberb-cloud": { ...common, providerId: "gloomberb-cloud", dataSource: "live", price: 231.4, lastUpdated: now - 30_000 },
+    gloom: { ...common, providerId: "gloom", dataSource: "delayed", price: 229.9, lastUpdated: now - 5_000 },
+  };
+  expect(resolveCanonicalQuote(contributions, now).quote?.price).toBe(231.4);
+
+  contributions["gloomberb-cloud"] = { ...contributions["gloomberb-cloud"]!, stale: true };
+  expect(resolveCanonicalQuote(contributions, now).quote?.price).toBe(229.9);
+});

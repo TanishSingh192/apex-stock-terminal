@@ -1,0 +1,848 @@
+import { describe, expect, setSystemTime, test } from "bun:test";
+import type { CollectionSortPreference } from "../../../state/app/context";
+import { createDefaultConfig, type ColumnConfig } from "../../../types/config";
+import type { Quote, TickerFinancials } from "../../../types/financials";
+import type { TickerRecord } from "../../../types/ticker";
+import { blendHex, colors } from "../../../theme/colors";
+import { buildPortfolioSummaryNotices, buildPortfolioSummarySegments } from "./summary";
+import { adoptHeldPortfolioCurrencies } from "../../../portfolio/mutations";
+import {
+  calculatePortfolioSummaryTotals,
+  getColumnValue,
+  getSortValue,
+  resolveCollectionSortPreference,
+  resolvePortfolioPriceValue,
+  resolvePortfolioTotalsCurrency,
+  type ColumnContext,
+} from "./metrics";
+import { createTestTicker } from "../../../test-support/ticker";
+import { createTestFinancials, createTestQuote } from "../../../test-support/data-provider";
+
+const createTicker = (overrides: Partial<TickerRecord["metadata"]> = {}) => createTestTicker("AAPL", "Apple Inc.", overrides);
+
+function createFinancials(
+  overrides: Omit<Partial<TickerFinancials>, "quote"> & { quote?: Partial<Quote> } = {},
+): TickerFinancials {
+  const { quote: quoteOverrides, ...financialOverrides } = overrides;
+  return createTestFinancials({
+    ...financialOverrides,
+    quote: createTestQuote({
+      price: 120, change: 5, changePercent: 4.35, previousClose: 115, lastUpdated: 1_700_000_000_000, ...quoteOverrides,
+    }),
+  });
+}
+
+const defaultColumnContext: ColumnContext = {
+  activeTab: "main",
+  baseCurrency: "USD",
+  exchangeRates: new Map([["USD", 1]]),
+  now: 1_700_000_010_000,
+};
+
+describe("portfolio-metrics", () => {
+  test("withholds future holding age without changing the source date or same-day holdings", () => {
+    const context = { ...defaultColumnContext, now: Date.UTC(2026, 8, 12, 12) };
+    const column: ColumnConfig = { id: "held", label: "HELD", width: 8, align: "right" };
+    for (const [dateAcquired, text, sort] of [
+      ["2026-09-20", "—", null],
+      ["2026-09-13T01:00:00+02:00", "0d", 0],
+      ["2026-09-12T23:59:59Z", "0d", 0],
+      ["2026-09-11", "1d", 1],
+      ["not-a-date", "—", null],
+    ] as const) {
+      const ticker = createTicker({ positions: [
+        { portfolio: "main", shares: 10, avgCost: 100, broker: "manual", dateAcquired },
+        { portfolio: "other", shares: 1, avgCost: 1, broker: "manual", dateAcquired: "2020-01-02" },
+      ] });
+      expect(getColumnValue(column, ticker, undefined, context).text).toBe(text);
+      expect(getSortValue(column, ticker, undefined, context)).toBe(sort);
+      expect(ticker.metadata.positions[0]!.dateAcquired).toBe(dateAcquired);
+    }
+  });
+
+  test("withholds mixed-currency totals until FX is known, then restores complete values", () => {
+    const us = createTicker({ positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }] });
+    const eur = createTicker({ ticker: "SAP", currency: "EUR", positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual", currency: "EUR" }] });
+    const financials = new Map([
+      ["AAPL", createFinancials()],
+      ["SAP", createFinancials({ quote: { symbol: "SAP", currency: "EUR" } })],
+    ]);
+    const unavailable = calculatePortfolioSummaryTotals([us, eur], financials, "USD", new Map(), true, "main");
+    expect(unavailable.totalMktValue).toBeNaN();
+    expect(unavailable.unrealizedPnl).toBeNaN();
+    expect(unavailable.unavailableConversions).toEqual(["EUR/USD"]);
+    const segments = buildPortfolioSummarySegments({ totals: unavailable, accountState: null });
+    const rendered = segments.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+    expect(buildPortfolioSummaryNotices({ totals: unavailable, accountState: null, baseCurrency: "USD" }))
+      .toEqual(["FX unavailable: EUR/USD", "Market value unavailable: SAP"]);
+    expect(rendered).toContain("Val —");
+    expect(rendered).not.toContain("NaN");
+    expect(rendered).not.toContain("2.4k");
+
+    const restored = calculatePortfolioSummaryTotals([us, eur], financials, "USD", new Map([["EUR", 1.2]]), true, "main");
+    expect(restored.totalMktValue).toBe(2640);
+    expect(restored.unrealizedPnl).toBe(440);
+    expect(restored.unavailableConversions).toBeUndefined();
+  });
+
+  test("totals a manual portfolio in the currency its holdings gave it, whatever it holds later", () => {
+    const bhp = createTestTicker("BHP", "BHP Group", { currency: "AUD", positions: [
+      { portfolio: "asx", shares: 1000, avgCost: 40, broker: "manual", currency: "AUD" },
+    ] });
+    const aapl = createTicker({ positions: [{ portfolio: "asx", shares: 10, avgCost: 100, broker: "manual", currency: "USD" }] });
+    const financials = new Map([
+      ["BHP", createFinancials({ quote: { symbol: "BHP", currency: "AUD", price: 60, change: 1, changePercent: 1.69, previousClose: 59 } })],
+      ["AAPL", createFinancials()],
+    ]);
+    const summary = (totals: ReturnType<typeof calculatePortfolioSummaryTotals>, currency: string, baseCurrency = "USD") =>
+      buildPortfolioSummarySegments({ totals, accountState: null, currency, baseCurrency })
+        .flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+    // A manual portfolio is created in the base currency; the AUD lives only in its positions.
+    const defaults = createDefaultConfig("/tmp/gloomberb-portfolio-currency");
+    const config = { ...defaults, portfolios: [...defaults.portfolios, { id: "asx", name: "ASX", currency: "USD" }] };
+
+    const adopted = adoptHeldPortfolioCurrencies(config, [bhp]);
+    const portfolio = adopted.portfolios.find((entry) => entry.id === "asx")!;
+    expect(portfolio.currency).toBe("AUD");
+    const aud = resolvePortfolioTotalsCurrency(portfolio, adopted.baseCurrency);
+    expect(aud).toBe("AUD");
+    const audTotals = calculatePortfolioSummaryTotals([bhp], financials, aud, new Map(), true, "asx");
+    expect(audTotals).toMatchObject({ totalMktValue: 60_000, totalCostBasis: 40_000, unrealizedPnl: 20_000, dailyPnl: 1000 });
+    expect(audTotals.unavailableConversions).toBeUndefined();
+    expect(summary(audTotals, aud)).toBe("Val A$60.0k Day +A$1.0k (+1.69%) vs prev close P&L +A$20.0k (+50.00%)");
+    const audContext = { ...defaultColumnContext, activeTab: "asx", baseCurrency: aud, exchangeRates: new Map() };
+    const mktValue: ColumnConfig = { id: "mkt_value", label: "MKT VAL", width: 10, align: "right" };
+    expect(getColumnValue(mktValue, bhp, financials.get("BHP"), audContext).text).toBe("60.0k");
+
+    // A USD holding added later converts into AUD; the totals stay in AUD and name the pair when the rate is missing.
+    const withUsd = calculatePortfolioSummaryTotals([bhp, aapl], financials, aud, new Map([["AUD", 0.65]]), true, "asx");
+    expect(withUsd.totalMktValue).toBeCloseTo(60_000 + 1200 / 0.65);
+    const missing = calculatePortfolioSummaryTotals([bhp, aapl], financials, aud, new Map(), true, "asx");
+    expect(missing.unavailableConversions).toEqual(["USD/AUD"]);
+    expect(buildPortfolioSummaryNotices({ totals: missing, accountState: null, baseCurrency: aud })[0]).toBe("FX unavailable: USD/AUD");
+
+    // It runs once: holdings that change afterwards never move a portfolio's currency.
+    expect(adoptHeldPortfolioCurrencies(adopted, [aapl])).toBe(adopted);
+    const later = { ...config, portfolioCurrenciesAdopted: true };
+    expect(adoptHeldPortfolioCurrencies(later, [bhp])).toBe(later);
+    // Mixed holdings, or a portfolio already in another currency, keep what they have.
+    expect(adoptHeldPortfolioCurrencies(config, [bhp, aapl]).portfolios.find((entry) => entry.id === "asx")!.currency).toBe("USD");
+    const usdPortfolio = { id: "asx", name: "ASX", currency: "USD" };
+    expect(summary(calculatePortfolioSummaryTotals([aapl], financials, "USD", new Map(), true, "asx"), resolvePortfolioTotalsCurrency(usdPortfolio, "USD")))
+      .toBe("Val 1.2k Day +50.00 (+4.35%) vs prev close P&L +200.00 (+20.00%)");
+
+    // A broker portfolio stays in its account currency; a watchlist uses the base currency.
+    expect(resolvePortfolioTotalsCurrency({ ...usdPortfolio, brokerId: "ibkr", brokerInstanceId: "ibkr-live" }, "USD")).toBe("USD");
+    expect(resolvePortfolioTotalsCurrency(null, "EUR")).toBe("EUR");
+  });
+
+  test("totals manual portfolios in a chosen base currency and marks USD totals beside it", () => {
+    const eurConfig = { ...createDefaultConfig("/tmp/gloomberb-portfolio-currency"), baseCurrency: "EUR" };
+    const aapl = createTicker({ positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual", currency: "USD" }] });
+    const sap = createTestTicker("SAP", "SAP SE", { currency: "EUR", positions: [
+      { portfolio: "main", shares: 10, avgCost: 150, broker: "manual", currency: "EUR" },
+    ] });
+    // Main Portfolio is seeded in USD; a base the user chose is what it totals in, whatever it holds.
+    const main = adoptHeldPortfolioCurrencies(eurConfig, [aapl]).portfolios[0]!;
+    expect(main.currency).toBe("USD");
+    expect(resolvePortfolioTotalsCurrency(main, eurConfig.baseCurrency)).toBe("EUR");
+    expect(resolvePortfolioTotalsCurrency(adoptHeldPortfolioCurrencies(eurConfig, [aapl, sap]).portfolios[0], "EUR")).toBe("EUR");
+    expect(resolvePortfolioTotalsCurrency({ id: "uk", name: "UK", currency: "GBP" }, "EUR")).toBe("EUR");
+
+    const financials = new Map([
+      ["AAPL", createFinancials()],
+      ["SAP", createFinancials({ quote: { symbol: "SAP", currency: "EUR", price: 200, change: 2, changePercent: 1.01, previousClose: 198 } })],
+    ]);
+    const totals = calculatePortfolioSummaryTotals([aapl, sap], financials, "EUR", new Map([["EUR", 1.1]]), true, "main");
+    const text = (currency: string, value: typeof totals) =>
+      buildPortfolioSummarySegments({ totals: value, accountState: null, currency, baseCurrency: "EUR" })
+        .flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+    expect(text("EUR", totals)).toStartWith("Val €3.1k");
+    // A USD broker account in a EUR app shows its symbol, so it never reads as euros.
+    const usdBroker = { id: "broker:ibkr", name: "IBKR", currency: "USD", brokerId: "ibkr", brokerInstanceId: "ibkr-live" };
+    expect(resolvePortfolioTotalsCurrency(usdBroker, "EUR")).toBe("USD");
+    const usdTotals = calculatePortfolioSummaryTotals([aapl], financials, "USD", new Map(), true, "main");
+    expect(text("USD", usdTotals)).toBe("Val $1.2k Day +$50.00 (+4.35%) vs prev close P&L +$200.00 (+20.00%)");
+  });
+
+  test("leaves watchlists unsorted by default and respects persisted overrides", () => {
+    expect(resolveCollectionSortPreference("watchlist", false, {})).toEqual({
+      columnId: null,
+      direction: "asc",
+    } satisfies CollectionSortPreference);
+    expect(resolveCollectionSortPreference("main", true, {
+      main: { columnId: "pnl", direction: "asc" },
+    })).toEqual({
+      columnId: "pnl",
+      direction: "asc",
+    } satisfies CollectionSortPreference);
+  });
+
+  test("shows broker mark price when no live quote is available", () => {
+    expect(resolvePortfolioPriceValue(null, 382.5)).toEqual({
+      text: "382.5",
+    });
+  });
+
+  test("mutes completed-session prices and changes without discarding their direction", () => {
+    const ticker = createTicker({
+      positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }],
+    });
+    const priceColumn: ColumnConfig = { id: "price", label: "LAST", width: 10, align: "right" };
+    const changeColumn: ColumnConfig = { id: "change", label: "CHG", width: 8, align: "right" };
+    const changePctColumn: ColumnConfig = { id: "change_pct", label: "CHG%", width: 8, align: "right" };
+    const financials = createFinancials({ quote: { marketState: "CLOSED" } });
+    const mutedPositive = blendHex(colors.positive, colors.textDim, 0.55);
+
+    expect(getColumnValue(priceColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "120.00",
+      color: colors.textDim,
+    });
+    expect(getColumnValue(changeColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "+5.00",
+      color: mutedPositive,
+    });
+    expect(getColumnValue(changePctColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "+4.35%",
+      color: mutedPositive,
+    });
+    const unchanged = createFinancials({ quote: { change: 0, changePercent: 0, previousClose: 120, marketState: "CLOSED" } });
+    expect(getColumnValue(changePctColumn, ticker, unchanged, defaultColumnContext)).toEqual({
+      text: "0.00%",
+      color: colors.neutral,
+    });
+
+    const open = createFinancials({ quote: { marketState: "REGULAR" } });
+    expect(getColumnValue(priceColumn, ticker, open, defaultColumnContext).color).toBe(colors.positive);
+    expect(getColumnValue(changePctColumn, ticker, open, defaultColumnContext).color).toBe(colors.positive);
+  });
+
+  test("calculates portfolio totals from live quotes", () => {
+    const ticker = createTicker({
+      positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }],
+    });
+    const financialsMap = new Map([["AAPL", createFinancials()]]);
+
+    expect(calculatePortfolioSummaryTotals(
+      [ticker],
+      financialsMap,
+      "USD",
+      new Map([["USD", 1]]),
+      true,
+      "main",
+    )).toMatchObject({
+      totalMktValue: 1200,
+      totalCostBasis: 1000,
+      dailyPnl: 50,
+      unrealizedPnl: 200,
+      hasPositions: true,
+    });
+  });
+
+  test("falls back to broker values when no quote is available", () => {
+    const ticker = createTicker({
+      positions: [{
+        portfolio: "main",
+        shares: 10,
+        avgCost: 100,
+        broker: "ibkr",
+        marketValue: 1250,
+        unrealizedPnl: 250,
+      }],
+    });
+    const financialsMap = new Map<string, TickerFinancials>();
+
+    expect(calculatePortfolioSummaryTotals(
+      [ticker],
+      financialsMap,
+      "USD",
+      new Map([["USD", 1]]),
+      true,
+      "main",
+    )).toMatchObject({
+      totalMktValue: 1250,
+      totalCostBasis: 1000,
+      dailyPnl: Number.NaN,
+      unrealizedPnl: 250,
+      hasPositions: true,
+    });
+  });
+
+  test("does not double-apply IBKR option multipliers when avgCost is already contract-scaled", () => {
+    const ticker = createTicker({
+      ticker: "AMD   270917C00230000",
+      assetCategory: "OPT",
+      positions: [{
+        portfolio: "main",
+        shares: 10,
+        avgCost: 5095.07295,
+        broker: "ibkr",
+        currency: "USD",
+        marketValue: 58803.06,
+        unrealizedPnl: 7852.33,
+        multiplier: 100,
+        markPrice: 58.8030586,
+      }],
+    });
+    const financialsMap = new Map<string, TickerFinancials>();
+
+    const totals = calculatePortfolioSummaryTotals(
+      [ticker],
+      financialsMap,
+      "USD",
+      new Map([["USD", 1]]),
+      true,
+      "main",
+    );
+
+    expect(totals.totalMktValue).toBeCloseTo(58803.06, 2);
+    expect(totals.totalCostBasis).toBeCloseTo(50950.7295, 4);
+    expect(totals.unrealizedPnl).toBeCloseTo(7852.33, 4);
+    expect(totals.hasPositions).toBe(true);
+  });
+
+  test("keeps option avg cost display contract-scaled while using the correct cost basis", () => {
+    const ticker = createTicker({
+      ticker: "AMD   270917C00230000",
+      assetCategory: "OPT",
+      positions: [{
+        portfolio: "main",
+        shares: 10,
+        avgCost: 5095.07295,
+        broker: "ibkr",
+        currency: "USD",
+        marketValue: 58803.06,
+        unrealizedPnl: 7852.33,
+        multiplier: 100,
+        markPrice: 58.8030586,
+      }],
+    });
+    const financials = createFinancials({
+      quote: {
+        symbol: "AMD   270917C00230000",
+        price: 58.8030586,
+        currency: "USD",
+        change: 0,
+        changePercent: 0,
+        previousClose: 58.8030586,
+      },
+    });
+    const avgCostColumn: ColumnConfig = { id: "avg_cost", label: "AVG COST", width: 10, align: "right", format: "currency" };
+    const pnlColumn: ColumnConfig = { id: "pnl", label: "P&L", width: 10, align: "right", format: "compact" };
+
+    expect(getColumnValue(avgCostColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "5,095.073",
+    });
+    expect(getColumnValue(pnlColumn, ticker, financials, defaultColumnContext)).toEqual({
+      pnlBasis: "quote-and-cost",
+      text: "+7.9k",
+      color: expect.any(String),
+    });
+  });
+
+  test("values listed options at the two-sided mark while LAST shows the print", () => {
+    const option = (assetCategory: string) => createTicker({
+      ticker: "SPY  260619C00500000",
+      assetCategory,
+      positions: [{ portfolio: "main", shares: 2, avgCost: 4.25, broker: "ibkr", currency: "USD", multiplier: 100 }],
+    });
+    let ticker = option("OPT");
+    const column = (id: string): ColumnConfig => ({ id, label: id, width: 10, align: "right" });
+    const valueAt = (quote: Partial<Quote>) => {
+      const financials = createFinancials({
+        quote: { symbol: ticker.metadata.ticker, price: 5, change: 0.5, changePercent: 11.11, previousClose: 4.5, ...quote },
+      });
+      const read = (id: string) => Math.round(Number(getSortValue(column(id), ticker, financials, defaultColumnContext)) * 100) / 100;
+      return { last: read("price"), value: read("mkt_value"), day: read("day_pnl") };
+    };
+
+    // A print inside the market, or one older than the quote, yields to the midpoint.
+    expect(valueAt({ bid: 4.9, ask: 5.3 })).toEqual({ last: 5, value: 1_020, day: 120 });
+    expect(valueAt({ bid: 1, ask: 1.2, lastTradeTime: 1_699_999_000_000 })).toEqual({ last: 5, value: 220, day: -680 });
+    // Without a timestamp, a print outside the market may be the fresher side.
+    expect(valueAt({ bid: 1, ask: 1.2 })).toEqual({ last: 5, value: 1_000, day: 100 });
+    expect(valueAt({ bid: undefined, ask: 1.2 })).toEqual({ last: 5, value: 1_000, day: 100 });
+    // Options on futures are marked the same way.
+    ticker = option("FOP");
+    expect(valueAt({ bid: 4.9, ask: 5.3 })).toEqual({ last: 5, value: 1_020, day: 120 });
+  });
+
+  test("formats equity average cost with tighter precision than quote prices", () => {
+    const ticker = createTicker({
+      assetCategory: "STK",
+      positions: [{ portfolio: "main", shares: 10, avgCost: 119.3687, broker: "manual", currency: "HKD" }],
+    });
+    const avgCostColumn: ColumnConfig = { id: "avg_cost", label: "AVG COST", width: 10, align: "right", format: "currency" };
+
+    expect(getColumnValue(avgCostColumn, ticker, undefined, defaultColumnContext)).toEqual({
+      text: "119.37",
+    });
+  });
+
+  test("formats portfolio-only column values and sort keys consistently", () => {
+    const ticker = createTicker({
+      positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }],
+    });
+    const financials = createFinancials();
+    const dayPnlColumn: ColumnConfig = { id: "day_pnl", label: "DAY", width: 10, align: "right", format: "compact" };
+    const pnlColumn: ColumnConfig = { id: "pnl", label: "P&L", width: 10, align: "right", format: "compact" };
+    const latencyColumn: ColumnConfig = { id: "latency", label: "AGE", width: 6, align: "right" };
+
+    expect(getColumnValue(dayPnlColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "+50.00",
+      color: expect.any(String),
+    });
+    expect(getSortValue(dayPnlColumn, ticker, financials, defaultColumnContext)).toBe(50);
+    expect(getColumnValue(pnlColumn, ticker, financials, defaultColumnContext)).toEqual({
+      pnlBasis: "quote-and-cost",
+      text: "+200.00",
+      color: expect.any(String),
+    });
+    expect(getSortValue(pnlColumn, ticker, financials, defaultColumnContext)).toBe(200);
+    expect(getColumnValue(latencyColumn, ticker, financials, defaultColumnContext)).toEqual({
+      text: "10s",
+    });
+  });
+
+  test("signs short unrealized P&L from a live quote", () => {
+    const ticker = createTicker({
+      positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "ibkr", side: "short" }],
+    });
+    const financials = createFinancials({
+      quote: { price: 80, change: -20, changePercent: -20, previousClose: 100 },
+    });
+    const dayPnlColumn: ColumnConfig = { id: "day_pnl", label: "DAY", width: 10, align: "right", format: "compact" };
+    const pnlColumn: ColumnConfig = { id: "pnl", label: "P&L", width: 10, align: "right", format: "compact" };
+
+    expect(getSortValue(dayPnlColumn, ticker, financials, defaultColumnContext)).toBe(200);
+    expect(getSortValue(pnlColumn, ticker, financials, defaultColumnContext)).toBe(200);
+    expect(getColumnValue(pnlColumn, ticker, financials, defaultColumnContext)).toEqual({
+      pnlBasis: "quote-and-cost",
+      text: "+200.00",
+      color: expect.any(String),
+    });
+    expect(calculatePortfolioSummaryTotals(
+      [ticker],
+      new Map([["AAPL", financials]]),
+      "USD",
+      new Map([["USD", 1]]),
+      true,
+      "main",
+    )).toMatchObject({
+      totalMktValue: 800,
+      dailyPnl: 200,
+      unrealizedPnl: 200,
+    });
+  });
+
+  test("formats derived quote and position columns", () => {
+    const ticker = createTicker({
+      sector: "Technology",
+      industry: "Consumer Electronics",
+      assetCategory: "STK",
+      tags: ["core", "mega"],
+      positions: [{
+        portfolio: "main",
+        shares: 10,
+        avgCost: 100,
+        broker: "manual",
+        currency: "USD",
+        dateAcquired: "2024-01-01",
+        markPrice: 121.2,
+      }],
+    });
+    const financials = createFinancials({
+      quote: {
+        symbol: "AAPL",
+        price: 120,
+        currency: "USD",
+        change: 5,
+        changePercent: 4.35,
+        previousClose: 115,
+        bid: 119.5,
+        ask: 120.5,
+        bidSize: 100,
+        askSize: 150,
+        high52w: 160,
+        low52w: 80,
+        volume: 12_500_000,
+      },
+    });
+    const context: ColumnContext = {
+      ...defaultColumnContext,
+      portfolioWeightBase: 2_400,
+      now: Date.UTC(2026, 0, 1),
+    };
+
+    expect(getColumnValue({ id: "weight", label: "WEIGHT", width: 8, align: "right" }, ticker, financials, context).text).toBe("50.0%");
+    expect(getSortValue({ id: "weight", label: "WEIGHT", width: 8, align: "right" }, ticker, financials, context)).toBe(50);
+    expect(getColumnValue({ id: "range_52w", label: "52W%", width: 7, align: "right" }, ticker, financials, context).text).toBe("+50.00%");
+    expect(getColumnValue({ id: "dollar_volume", label: "$VOL", width: 9, align: "right" }, ticker, financials, context).text).toBe("1.50B");
+    expect(getColumnValue({ id: "spread_pct", label: "SPR%", width: 7, align: "right" }, ticker, financials, context).text).toBe("+0.83%");
+    expect(getColumnValue({ id: "bid_ask_size", label: "B/A SZ", width: 9, align: "right" }, ticker, financials, context).text).toBe("100/150");
+    expect(getColumnValue({ id: "mark_delta", label: "MARK%", width: 8, align: "right" }, ticker, financials, context).text).toBe("+1.00%");
+    expect(getColumnValue({ id: "held", label: "HELD", width: 6, align: "right" }, ticker, financials, context).text).toBe("2.0y");
+    expect(getColumnValue({ id: "tags", label: "TAGS", width: 14, align: "left" }, ticker, financials, context).text).toBe("core,mega");
+  });
+
+  test("formats supplemental analyst and corporate action columns", () => {
+    const ticker = createTicker();
+    const financials = createFinancials();
+    const context: ColumnContext = {
+      ...defaultColumnContext,
+      analystResearch: new Map([["AAPL", {
+        symbol: "AAPL",
+        currency: "USD",
+        priceTarget: { average: 150, current: 120, currency: "USD" },
+        recommendationRating: 8.4,
+        recommendations: [],
+        ratings: [],
+        earningsEstimates: [],
+        revenueEstimates: [],
+      }]]),
+      corporateActions: new Map([["AAPL", {
+        symbol: "AAPL",
+        dividends: [{ exDate: "2026-02-15", amount: 0.25 }],
+        splits: [],
+        earnings: [{ date: "2026-01-30", epsEstimate: 1.2 }],
+      }]]),
+      earningsEvents: new Map([["AAPL", {
+        symbol: "AAPL",
+        name: "Apple Inc.",
+        earningsDate: new Date(Date.UTC(2026, 0, 29)),
+        earningsCallDate: null,
+        epsEstimate: 1.2,
+        epsActual: null,
+        revenueEstimate: null,
+        revenueActual: null,
+        surprise: null,
+        timing: "AMC",
+      }]]),
+    };
+
+    expect(getColumnValue({ id: "target", label: "TARGET", width: 10, align: "right" }, ticker, financials, context).text).toBe("$150");
+    expect(getColumnValue({ id: "target_pct", label: "TARGET%", width: 8, align: "right" }, ticker, financials, context).text).toBe("+25.00%");
+    expect(getColumnValue({ id: "rating", label: "RATING", width: 7, align: "right" }, ticker, financials, context).text).toBe("8.4");
+    expect(getColumnValue({ id: "ex_div", label: "EX-DIV", width: 7, align: "right" }, ticker, financials, context).text).toBe("Feb 15");
+    expect(getColumnValue({ id: "next_earn", label: "ERN", width: 7, align: "right" }, ticker, financials, context).text).toBe("Jan 29");
+    expect(getSortValue({ id: "target_pct", label: "TARGET%", width: 8, align: "right" }, ticker, financials, context)).toBe(25);
+  });
+
+  test("a target in pounds under a quote in pence reads in pounds", () => {
+    const ticker = createTestTicker("VOD.L", "Vodafone", { exchange: "LSE", currency: "GBp" });
+    const financials = createFinancials({ quote: { symbol: "VOD.L", currency: "GBp", price: 120.6, previousClose: 120 } });
+    const target = (research: { currency?: string; priceTarget: Record<string, number | string> }) => getColumnValue(
+      { id: "target", label: "TARGET", width: 10, align: "right" }, ticker, financials,
+      { ...defaultColumnContext, analystResearch: new Map([["VOD.L", {
+        symbol: "VOD.L", recommendations: [], ratings: [], earningsEstimates: [], revenueEstimates: [], ...research,
+      }]]) },
+    ).text;
+    expect(target({ priceTarget: { average: 1.2145, current: 1.206, currency: "GBP" } })).toBe("£1.21");
+    expect(target({ currency: "GBP", priceTarget: { average: 1.2145, current: 1.206, currency: "" } })).toBe("£1.21");
+    // A target naming no currency is the quote's, in pounds when it reads a hundred times under the pence price.
+    expect(target({ priceTarget: { average: 1.2145, current: 1.206 } })).toBe("£1.21");
+    expect(target({ priceTarget: { average: 121.45, current: 120.6 } })).toBe("121.45p");
+  });
+});
+
+
+describe("position aggregation across sides, currencies and broker coverage", () => {
+  const column = (id: string): ColumnConfig => ({ id, label: id, width: 12, align: "right" });
+  test("offsetting long/short lots net to zero in cells and sorts, with gross, long and short in the summary", () => {
+    const ticker = createTicker({ positions: [
+      { portfolio: "main", shares: 100, avgCost: 100, broker: "manual", side: "long" },
+      { portfolio: "main", shares: 100, avgCost: 110, broker: "manual", side: "short" },
+    ] });
+    const financials = createFinancials();
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", financials]]), "USD", new Map(), true, "main");
+    expect(totals).toMatchObject({ hasPositions: true, hasShorts: true, totalMktValue: 24000, netMktValue: 0, totalCostBasis: 21000, unrealizedPnl: 1000, dailyPnl: 0 });
+    expect(getSortValue(column("mkt_value"), ticker, financials, defaultColumnContext)).toBe(0);
+    // Signed cost: 10,000 paid for the long, 11,000 received for the short.
+    expect(getSortValue(column("cost_basis"), ticker, financials, defaultColumnContext)).toBe(-1000);
+    expect(getSortValue(column("pnl"), ticker, financials, defaultColumnContext)).toBe(1000);
+    expect(getSortValue(column("pnl_pct"), ticker, financials, defaultColumnContext)).toBeCloseTo(1000 / 21000 * 100);
+    expect(getColumnValue(column("shares"), ticker, financials, defaultColumnContext).text).toBe("0");
+    expect(getColumnValue(column("pnl"), ticker, financials, defaultColumnContext).text).toBe("+1.0k");
+    const header = buildPortfolioSummarySegments({ totals, accountState: null }).map(segment => segment.parts.map(part => part.text).join(" ")).join(" ");
+    expect(header).toContain("Gross 24.0k Net 0.00");
+    expect(header).toContain("Long 12.0k Short -12.0k");
+  });
+
+  test("converts each cost basis before summing and withholds averages across native currencies", () => {
+    const ticker = createTicker({ positions: [
+      { portfolio: "main", shares: 10, avgCost: 100, currency: "USD", broker: "manual" },
+      { portfolio: "main", shares: 10, avgCost: 80, currency: "EUR", broker: "manual" },
+    ] });
+    const financials = createFinancials();
+    const context = { ...defaultColumnContext, exchangeRates: new Map([["USD", 1], ["EUR", 1.25]]) };
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", financials]]), "USD", context.exchangeRates, true, "main");
+    expect(totals.totalCostBasis).toBe(2000);
+    expect(totals.unrealizedPnl).toBe(400);
+    expect(getSortValue(column("cost_basis"), ticker, financials, context)).toBe(2000);
+    expect(getSortValue(column("pnl"), ticker, financials, context)).toBe(400);
+    expect(getColumnValue(column("avg_cost"), ticker, financials, context).text).toBe("—");
+    const unavailable = calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", financials]]), "USD", new Map(), true, "main");
+    expect(unavailable.unrealizedPnl).toBeNaN();
+    expect(unavailable.unavailableConversions).toEqual(["EUR/USD"]);
+  });
+
+  test("reconciles signed short broker values and contract-scaled costs without inventing daily P&L", () => {
+    const ticker = createTicker({ positions: [{ portfolio: "main", shares: -10, avgCost: 500, multiplier: 100, currency: "USD", broker: "ibkr", marketValue: -4000, unrealizedPnl: 1000 }] });
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map(), "USD", new Map(), true, "main");
+    expect(totals).toMatchObject({ totalMktValue: 4000, netMktValue: -4000, totalCostBasis: 5000, unrealizedPnl: 1000 });
+    expect(totals.dailyPnl).toBeNaN();
+    expect(getColumnValue(column("side"), ticker, undefined, defaultColumnContext).text).toBe("SHORT");
+    ticker.metadata.positions[0]!.marketValue = undefined;
+    const fromPnl = calculatePortfolioSummaryTotals([createTicker({ positions: [{ portfolio: "main", shares: -10, avgCost: 100, broker: "ibkr", unrealizedPnl: 100 }] })], new Map(), "USD", new Map(), true, "main");
+    expect(fromPnl).toMatchObject({ totalMktValue: 900, netMktValue: -900, unrealizedPnl: 100 });
+  });
+
+  test("does not pass off one broker lot or one ticker as a complete portfolio valuation", () => {
+    const ticker = createTicker({ positions: [
+      { portfolio: "main", shares: 10, avgCost: 100, broker: "ibkr", marketValue: 1200, unrealizedPnl: 200 },
+      { portfolio: "main", shares: 10, avgCost: 110, broker: "manual" },
+    ] });
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map(), "USD", new Map(), true, "main");
+    expect(totals.hasPositions).toBe(true);
+    expect(totals.totalCostBasis).toBe(2100);
+    expect(totals.totalMktValue).toBeNaN();
+    expect(totals.unrealizedPnl).toBeNaN();
+    expect(totals.unavailableSymbols).toEqual(["AAPL"]);
+    expect(getSortValue(column("mkt_value"), ticker, undefined, defaultColumnContext)).toBeNull();
+    expect(getSortValue(column("pnl"), ticker, undefined, defaultColumnContext)).toBeNull();
+  });
+});
+
+
+test("portfolio daily P&L and extended-hours returns use distinct reference closes", () => {
+  const ticker = createTicker({ positions: [{ portfolio: "main", shares: 10, avgCost: 200, broker: "manual" }] });
+  const financials = createFinancials({ quote: { price: 218.36, previousClose: 223.67,
+    change: -5.31, changePercent: -2.374, marketState: "POST", postMarketPrice: 218.47,
+    postMarketChange: 0.11, postMarketChangePercent: 0.0503755266532 } });
+  const column = (id: string): ColumnConfig => ({ id, label: id, width: 15, align: "right" });
+  expect(getSortValue(column("day_pnl"), ticker, financials, defaultColumnContext)).toBeCloseTo(-52, 8);
+  // CHG% is the regular session (close taken from the after-hours move here); EXT% is the print against that close.
+  expect(getColumnValue(column("change_pct"), ticker, financials, defaultColumnContext).text).toBe("-2.37%");
+  expect(getColumnValue(column("ext_hours"), ticker, financials, defaultColumnContext).text).toBe("+0.05%");
+  expect(calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", financials]]), "USD", new Map([["USD", 1]]), true, "main").dailyPnl).toBeCloseTo(-52, 8);
+  delete financials.quote!.previousClose;
+  expect(getColumnValue(column("day_pnl"), ticker, financials, defaultColumnContext).text).toBe("—");
+  expect(getSortValue(column("day_pnl"), ticker, financials, defaultColumnContext)).toBeNull();
+  expect(calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", financials]]), "USD", new Map([["USD", 1]]), true, "main").dailyPnl).toBeNaN();
+  // The after-hours move alone still gives its percent; without it there is no close to measure from.
+  delete financials.quote!.postMarketChangePercent;
+  expect(getColumnValue(column("ext_hours"), ticker, financials, defaultColumnContext).text).toBe("+0.05%");
+  delete financials.quote!.postMarketChange;
+  expect(getColumnValue(column("ext_hours"), ticker, financials, defaultColumnContext).text).toBe("—");
+  expect(getSortValue(column("ext_hours"), ticker, financials, defaultColumnContext)).toBeNull();
+});
+
+describe("watchlist and portfolio LAST, CHG and CHG% around the close", () => {
+  const column = (id: string): ColumnConfig => ({ id, label: id, width: 10, align: "right" });
+  const ticker = createTicker({ positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }] });
+  const shown = (financials: TickerFinancials, ...ids: string[]) =>
+    ids.map((id) => getColumnValue(column(id), ticker, financials, defaultColumnContext).text);
+  const sorted = (financials: TickerFinancials, ...ids: string[]) =>
+    ids.map((id) => getSortValue(column(id), ticker, financials, defaultColumnContext));
+  // SPCX after the 2026-10-08 close: the quote's price and change are the after-hours print against the day before's close.
+  const afterHours = {
+    price: 165.39, change: -2.21, changePercent: -1.3186, previousClose: 167.6, regularClose: 160.57,
+    regularCloseSessionDate: "2026-10-08", marketState: "POST" as const, postMarketPrice: 165.39,
+    postMarketChange: 4.82, postMarketChangePercent: 3.0017, listingExchangeName: "NASDAQ",
+    lastUpdated: Date.parse("2026-10-08T22:22:00Z"),
+  };
+
+  test("after the close the row holds the regular close and its move while EXT% follows the extended print", () => {
+    const posted = createFinancials({ quote: afterHours });
+    expect(shown(posted, "price", "change", "change_pct", "ext_hours")).toEqual(["160.57", "-7.03", "-4.19%", "+3.00%"]);
+    const [price, change, changePercent, extended] = sorted(posted, "price", "change", "change_pct", "ext_hours");
+    expect(price).toBe(160.57);
+    expect(change).toBeCloseTo(-7.03, 8);
+    expect(changePercent).toBeCloseTo(-4.1945, 3);
+    expect(extended).toBeCloseTo(3.0017, 3);
+    // Holdings stay valued on the live print against the previous close.
+    expect(sorted(posted, "day_pnl")[0]).toBeCloseTo(-22.1, 8);
+    expect(sorted(posted, "mkt_value")[0]).toBeCloseTo(1653.9, 8);
+
+    // The extended print moves; the headline does not.
+    const ticked = createFinancials({ quote: { ...afterHours, price: 167, postMarketPrice: 167, postMarketChange: 6.43, postMarketChangePercent: 4.0044 } });
+    expect(shown(ticked, "price", "change_pct", "ext_hours")).toEqual(["160.57", "-4.19%", "+4.00%"]);
+
+    // Overnight and over a weekend the quote keeps that day's close and the last extended print.
+    for (const marketState of ["POSTPOST", "CLOSED"] as const) {
+      const overnight = createFinancials({ quote: { ...afterHours, marketState, price: 164.35, change: -3.25, changePercent: -1.939,
+        postMarketPrice: undefined, postMarketChange: undefined, postMarketChangePercent: undefined } });
+      expect(shown(overnight, "price", "change_pct", "ext_hours")).toEqual(["160.57", "-4.19%", "+2.35%"]);
+      expect(sorted(overnight, "price", "ext_hours")).toEqual([160.57, expect.closeTo(2.3541, 3)]);
+    }
+  });
+
+  test("without a reported close the row falls back as the headline does, the pre-market holds the last session only when the quote reports it, and closed venues are unchanged", () => {
+    // No reported close and no after-hours move: nothing to take the close from, so the live print stays.
+    const unknownClose = createFinancials({ quote: { ...afterHours, regularClose: undefined, regularCloseSessionDate: undefined,
+      postMarketChange: undefined, postMarketChangePercent: undefined } });
+    expect(shown(unknownClose, "price", "change", "change_pct", "ext_hours")).toEqual(["165.39", "-2.21", "-1.32%", "—"]);
+    expect(sorted(unknownClose, "price", "change_pct")[0]).toBe(165.39);
+
+    // A pre-market quote that does not carry the last session's close and move: LAST is the pre-market print against the previous close, as EXT% is.
+    const pre = createFinancials({ quote: { price: 160.57, change: 0, changePercent: 0, previousClose: 160.57, marketState: "PRE",
+      preMarketPrice: 162, preMarketChange: 1.43, preMarketChangePercent: 0.8906, listingExchangeName: "NASDAQ" } });
+    expect(shown(pre, "price", "change", "change_pct", "ext_hours")).toEqual(["162.00", "+1.43", "+0.89%", "+0.89%"]);
+    expect(sorted(pre, "price", "change_pct")).toEqual([162, 0.8906]);
+
+    // With them the row holds the last session as after the close, and EXT% is the only pre-market figure; holdings stay live.
+    const reported = createFinancials({ quote: { ...pre.quote!, price: 166.95, change: 6.38, changePercent: 3.9733, previousClose: 160.57,
+      regularClose: 160.57, regularCloseSessionDate: "2026-10-08", regularChange: -7.03, regularChangePercent: -4.1945,
+      changeSessionDate: "2026-10-09", preMarketPrice: 166.95, preMarketChange: 6.38, preMarketChangePercent: 3.9733 } });
+    expect(shown(reported, "price", "change", "change_pct", "ext_hours")).toEqual(["160.57", "-7.03", "-4.19%", "+3.97%"]);
+    expect(sorted(reported, "price", "change_pct")).toEqual([160.57, -4.1945]);
+    expect(sorted(reported, "day_pnl")[0]).toBeCloseTo(63.8, 8);
+
+    // A venue without extended hours reports no close beside its move.
+    const closed = createFinancials({ quote: { symbol: "7203.T", currency: "JPY", price: 2800, change: 12, changePercent: 0.43,
+      previousClose: 2788, marketState: "CLOSED", listingExchangeName: "JPX", lastUpdated: Date.parse("2026-10-08T06:30:00Z") } });
+    expect(shown(closed, "price", "change", "change_pct", "ext_hours")).toEqual(["2,800", "+12", "+0.43%", "—"]);
+    expect(sorted(closed, "price", "change_pct")).toEqual([2800, 0.43]);
+  });
+
+  test("valued at the regular close, MKT VAL, P&L, DAY and the totals follow LAST, and AS OF UTC dates each row by the price it uses", () => {
+    const posted = createFinancials({ quote: afterHours });
+    const latest: ColumnContext = { ...defaultColumnContext, now: Date.parse("2026-10-09T01:00:00Z") };
+    const atClose: ColumnContext = { ...latest, valuationBasis: "regular-close" };
+    const value = (context: ColumnContext, id: string) => getSortValue(column(id), ticker, posted, context);
+    const text = (context: ColumnContext, id: string) => getColumnValue(column(id), ticker, posted, context).text;
+    expect(value(latest, "mkt_value")).toBeCloseTo(1653.9, 8);
+    expect(text(latest, "as_of")).toBe("Thu 22:22");
+    // At the close: LAST times the shares, the session's move, and the venue's close (16:00 New York).
+    expect(value(atClose, "mkt_value")).toBe(10 * 160.57);
+    expect(value(atClose, "pnl")).toBeCloseTo(605.7, 8);
+    expect(value(atClose, "day_pnl")).toBeCloseTo(-70.3, 8);
+    expect(text(atClose, "as_of")).toBe("Thu 20:00");
+    expect(value(atClose, "as_of")).toBe(Date.parse("2026-10-08T20:00:00Z"));
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", posted]]), "USD", new Map([["USD", 1]]), true, "main", "regular-close");
+    expect(totals.totalMktValue).toBe(10 * 160.57);
+    expect(totals.dailyPnl).toBeCloseTo(-70.3, 8);
+  });
+
+  test("the watchlist Avg Day is the mean of the CHG% column after the close, while portfolio DAY stays live", () => {
+    const watchContext: ColumnContext = { ...defaultColumnContext, activeTab: "watch" };
+    const rows = [
+      { ticker: createTestTicker("SPCX"), quote: afterHours },
+      // Up 2% in the session, then down after hours.
+      { ticker: createTestTicker("RISE"), quote: { ...afterHours, price: 99.5, change: -0.5, changePercent: -0.5, previousClose: 100,
+        regularClose: 102, postMarketPrice: 99.5, postMarketChange: -2.5, postMarketChangePercent: -2.451 } },
+      { ticker: createTestTicker("7203.T"), quote: { symbol: "7203.T", currency: "JPY", price: 2800, change: 12, changePercent: 0.43,
+        previousClose: 2788, marketState: "CLOSED" as const, listingExchangeName: "JPX", lastUpdated: Date.parse("2026-10-08T06:30:00Z") } },
+    ].map(({ ticker, quote }) => ({ ticker, financials: createFinancials({ quote: { symbol: ticker.metadata.ticker, ...quote } }) }));
+    const financialsMap = new Map(rows.map(({ ticker, financials }) => [ticker.metadata.ticker, financials]));
+    const watchlist = calculatePortfolioSummaryTotals(rows.map(({ ticker }) => ticker), financialsMap, "USD", new Map([["USD", 1]]), false, "watch");
+
+    const column = rows.map(({ ticker, financials }) => getSortValue({ id: "change_pct", label: "CHG%", width: 10, align: "right" }, ticker, financials, watchContext) as number);
+    expect(column[0]).toBeCloseTo(-4.1945, 3);
+    expect(column[1]).toBeCloseTo(2, 8);
+    expect(watchlist.watchlistCount).toBe(3);
+    expect(watchlist.avgWatchlistChange).toBeCloseTo(column.reduce((sum, value) => sum + value, 0) / column.length, 8);
+    expect(watchlist.avgWatchlistChange).toBeCloseTo((-4.1945 + 2 + 0.43) / 3, 3);
+
+    // Portfolio DAY keeps the live print against the previous close.
+    const held = createTicker({ positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual" }] });
+    const portfolio = calculatePortfolioSummaryTotals([held], new Map([["AAPL", createFinancials({ quote: afterHours })]]), "USD", new Map([["USD", 1]]), true, "main");
+    expect(portfolio.dailyPnl).toBeCloseTo(-22.1, 8);
+  });
+});
+
+describe("a hedge in the PF pane: long shares and short gold futures", () => {
+  const column = (id: string): ColumnConfig => ({ id, label: id, width: 9, align: "right" });
+  const spy = createTestTicker("SPY", "SPDR S&P 500", { assetCategory: "ETF", portfolios: ["main"],
+    positions: [{ portfolio: "main", shares: 600, avgCost: 660, currency: "USD", broker: "manual" }] });
+  const gold = createTestTicker("GC=F", "Gold Dec 26", { exchange: "CMX", assetCategory: "FUTURE", portfolios: ["main"],
+    positions: [{ portfolio: "main", shares: -10, avgCost: 4216.30, currency: "USD", broker: "manual", multiplier: 100 }] });
+  const financials = new Map([
+    ["SPY", createFinancials({ quote: { symbol: "SPY", price: 700, change: 7, changePercent: 1, previousClose: 693 } })],
+    ["GC=F", createFinancials({ quote: { symbol: "GC=F", price: 4198, change: 16.9, changePercent: 0.4, previousClose: 4181.10 } })],
+  ]);
+  const futuresTerms = new Map([["GC=F", {
+    size: { multiplier: 100, size: "100 oz" },
+    settlement: { price: 4181.10, date: "2026-10-16", previous: 4170.10 },
+  }]]);
+  const context: ColumnContext = { ...defaultColumnContext, futuresTerms, futuresTermsVersion: 1 };
+
+  test("rows count contracts at their size with signed value and cost, and the header splits long and short", () => {
+    expect(getColumnValue(column("shares"), gold, financials.get("GC=F"), context).text).toBe("-10 × 100 oz");
+    expect(getSortValue(column("mkt_value"), gold, financials.get("GC=F"), context)).toBe(-4_198_000);
+    expect(getSortValue(column("cost_basis"), gold, financials.get("GC=F"), context)).toBe(-4_216_300);
+    expect(getSortValue(column("pnl"), gold, financials.get("GC=F"), context)).toBeCloseTo(18_300, 6);
+    expect(getColumnValue(column("mkt_value"), spy, financials.get("SPY"), context).text).toBe("420.0k");
+
+    const totals = calculatePortfolioSummaryTotals([spy, gold], financials, "USD", new Map(), true, "main", "latest-print", futuresTerms);
+    expect(totals).toMatchObject({ totalMktValue: 4_618_000, netMktValue: -3_778_000, longMktValue: 420_000, shortMktValue: -4_198_000, hasFutures: true });
+    const header = buildPortfolioSummarySegments({ totals, accountState: null }).map(segment => segment.parts.map(part => part.text).join(" ")).join("  ");
+    expect(header).toContain("Gross 4.62M  Net -3.78M");
+    expect(header).toContain("Long 420.0k  Short -4.20M");
+  });
+
+  test("at the close a future's LAST, value, day and as-of are its settlement, and a future without a size says so", () => {
+    const close: ColumnContext = { ...context, valuationBasis: "regular-close" };
+    expect(getSortValue(column("price"), gold, financials.get("GC=F"), close)).toBe(4181.10);
+    expect(getSortValue(column("change"), gold, financials.get("GC=F"), close)).toBeCloseTo(11, 6);
+    expect(getSortValue(column("mkt_value"), gold, financials.get("GC=F"), close)).toBeCloseTo(-4_181_100, 6);
+    expect(getSortValue(column("day_pnl"), gold, financials.get("GC=F"), close)).toBeCloseTo(-11_000, 6);
+    expect(getSortValue(column("as_of"), gold, financials.get("GC=F"), close)).toBe(Date.UTC(2026, 9, 16));
+    const totals = calculatePortfolioSummaryTotals([spy, gold], financials, "USD", new Map(), true, "main", "regular-close", futuresTerms);
+    expect(buildPortfolioSummarySegments({ totals, accountState: null, valuationBasis: "regular-close" })[0]!.parts.map((part) => part.text))
+      .toContain("(regular close, futures settle)");
+
+    // Without a contract size the row is not valued at one unit a contract, and the notice names it once.
+    const unsized = { ...gold, metadata: { ...gold.metadata, positions: [{ ...gold.metadata.positions[0]!, multiplier: undefined }] } };
+    expect(getSortValue(column("mkt_value"), unsized, financials.get("GC=F"), defaultColumnContext)).toBeNull();
+    const gap = calculatePortfolioSummaryTotals([spy, unsized], financials, "USD", new Map(), true, "main");
+    expect(buildPortfolioSummaryNotices({ totals: gap, accountState: null, baseCurrency: "USD" })).toEqual(["No contract size, so not valued: GC=F"]);
+    // Only the future is left out: the rest of the book still totals, as `portfolio show` totals it.
+    expect(gap).toMatchObject({ totalMktValue: 420_000, netMktValue: 420_000, totalCostBasis: 396_000, unrealizedPnl: 24_000, dailyPnl: 4_200,
+      unknownContractSizeSymbols: ["GC=F"] });
+    expect(gap.unavailableSymbols).toBeUndefined();
+  });
+
+  test("a future's move is measured as FUT and quote measure it: again from the session before's settlement of the same contract only", () => {
+    // Mon 19 Oct 2026 in the day session, the source measuring gold's move from Friday's last trade, 4,178, not its 4,181.10 settlement.
+    setSystemTime(new Date("2026-10-19T15:00:00Z"));
+    try {
+      const quote = { symbol: "GC=F", name: "Gold Dec 26", instrumentType: "FUTURE", listingExchangeName: "COMEX", exchangeName: "COMEX", marketState: "REGULAR" as const,
+        price: 4198, change: 20, changePercent: 0.48, previousClose: 4178, changeSessionDate: "2026-10-19", lastUpdated: Date.parse("2026-10-19T14:59:00Z") };
+      const moved = new Map([...financials, ["GC=F", createFinancials({ quote })]]);
+      const terms = (deliveryMonth: string) => new Map([["GC=F", { ...futuresTerms.get("GC=F")!, spec: { tick: 0.1 }, deliveryMonth }]]);
+      const read = (deliveryMonth: string) => {
+        const ctx: ColumnContext = { ...context, futuresTerms: terms(deliveryMonth) };
+        const totals = calculatePortfolioSummaryTotals([spy, gold], moved, "USD", new Map(), true, "main", "latest-print", terms(deliveryMonth));
+        return { change: getSortValue(column("change"), gold, moved.get("GC=F"), ctx), dayPnl: getSortValue(column("day_pnl"), gold, moved.get("GC=F"), ctx), totals };
+      };
+      // December's settlement: the move is +16.90 from it, -$16,900 for the short, in the row and the header alike.
+      const december = read("2026-12");
+      expect(december.change as number).toBeCloseTo(16.9, 6);
+      expect(december.dayPnl as number).toBeCloseTo(-16_900, 6);
+      expect(december.totals.dailyPnl).toBeCloseTo(4_200 - 16_900, 6);
+      expect(december.totals.dayChangeBasis).toBe("vs mixed closes");
+      // Terms still naming February's contract: the source's +20 stands, two sessions never read as one.
+      const february = read("2027-02");
+      expect(february.change).toBe(20);
+      expect(february.totals.dailyPnl).toBeCloseTo(4_200 - 20_000, 6);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a grain future quoting in US cents is valued in dollars, in its row and in the header", () => {
+    const corn = createTestTicker("ZC=F", "Corn Dec 26", { exchange: "CBT", assetCategory: "FUTURE", portfolios: ["main"],
+      positions: [{ portfolio: "main", shares: 2, avgCost: 430, currency: "USX", broker: "manual", multiplier: 5000 }] });
+    const quote = createFinancials({ quote: { symbol: "ZC=F", price: 473.25, currency: "USX", change: -1, changePercent: -0.21, previousClose: 474.25 } });
+    // Two contracts of 5,000 bushels at 473.25 cents: $47,325, bought at 430 cents for $43,000.
+    expect(getSortValue(column("mkt_value"), corn, quote, defaultColumnContext)).toBeCloseTo(47_325, 6);
+    expect(getSortValue(column("cost_basis"), corn, quote, defaultColumnContext)).toBeCloseTo(43_000, 6);
+    expect(getSortValue(column("pnl"), corn, quote, defaultColumnContext)).toBeCloseTo(4_325, 6);
+    const totals = calculatePortfolioSummaryTotals([corn], new Map([["ZC=F", quote]]), "USD", new Map(), true, "main");
+    expect(totals.totalMktValue).toBeCloseTo(47_325, 6);
+    // A cent down on 10,000 bushels is $100.
+    expect(totals.dailyPnl).toBeCloseTo(-100, 6);
+    expect(totals.unavailableConversions).toBeUndefined();
+  });
+});

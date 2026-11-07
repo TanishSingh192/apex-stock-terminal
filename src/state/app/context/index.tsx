@@ -1,0 +1,670 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useSyncExternalStore,
+  type Dispatch,
+  type SetStateAction,
+  type ReactNode,
+} from "react";
+import type { AppSessionStorePort } from "../../../core/app-service-ports";
+import { ThemeProvider } from "../../../theme/theme-context";
+import { syncFontScale } from "../../../theme/font-scale";
+import {
+  findPaneInstance,
+  materializeDetachedPanesAsFloating,
+  type AppConfig,
+  type PaneInstanceConfig,
+} from "../../../types/config";
+import type { DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "../../../types/desktop-window";
+import { setPaneSetting, setPaneSettings, updatePaneInstance } from "../../../pane-settings";
+import { useTickerFinancials } from "../../../market-data/hooks";
+import { hasAmbiguousTickerContracts, resolveInstrumentForPane, resolveListingForPane, tickerForInstrument } from "../../../core/state/app/instrument";
+import { materializeDetachedLayouts } from "../../../core/state/app/layout";
+import {
+  APP_SESSION_ID,
+  APP_SESSION_SCHEMA_VERSION,
+  type AppSessionSnapshot,
+} from "../../../core/state/session-persistence";
+import { usePersistSessionSnapshot } from "../../hooks/session-snapshot";
+import {
+  appReducer,
+  createInitialState,
+  getEffectiveThemeId,
+  type PaneRuntimeState,
+  resolveCollectionForPane,
+  resolveTickerForPane,
+  syncConfigActiveLayoutState,
+} from "../../../core/state/app/state";
+import type { AppAction, AppState } from "../../../core/state/app/state";
+import { scheduleConfigSave } from "../../config-save-scheduler";
+import { LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS } from "../../persist-scheduler";
+import { fireAndForget } from "../../../utils/fire-and-forget";
+
+export {
+  appReducer,
+  createInitialState,
+  getEffectiveThemeId,
+  getFocusedCollectionId,
+  getFocusedTickerSymbol,
+  linkedSourceIds,
+  resolveCollectionForPane,
+  syncConfigActiveLayoutState,
+  resolveTickerForPane,
+} from "../../../core/state/app/state";
+export type {
+  AppAction,
+  AppState,
+  CollectionSortPreference,
+  PaneRuntimeState,
+} from "../../../core/state/app/state";
+
+/** What AppProvider puts in AppContext: the current state and a change feed. */
+export interface AppContextStoreValue {
+  dispatch: Dispatch<AppAction>;
+  getState: () => AppState;
+  subscribe: (listener: () => void) => () => void;
+}
+
+/**
+ * @deprecated Provide a store instead: `createStaticAppStore(state, dispatch)`
+ * from `gloomberb/test-support`. The hooks still read this shape.
+ */
+interface AppContextLegacyValue {
+  /** @deprecated Wrap the state with `createStaticAppStore(state, dispatch)`. */
+  state: AppState;
+  dispatch: Dispatch<AppAction>;
+}
+
+type AppContextValue = AppContextStoreValue | AppContextLegacyValue;
+
+export const AppContext = createContext<AppContextValue | null>(null);
+const PaneContext = createContext<string | null>(null);
+
+/** False only for the deprecated `{ state, dispatch }` value, which the hooks below still read. */
+function isAppStoreContextValue(context: AppContextValue): context is AppContextStoreValue {
+  return "getState" in context && "subscribe" in context;
+}
+
+function useRequiredAppContext(): AppContextValue {
+  const context = useContext(AppContext);
+  if (!context) throw new Error("useAppState must be used within AppProvider");
+  return context;
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+export function useAppStateRef() {
+  const context = useRequiredAppContext();
+  const stateRef = useRef(isAppStoreContextValue(context) ? context.getState() : context.state);
+
+  useLayoutEffect(() => {
+    if (!isAppStoreContextValue(context)) {
+      stateRef.current = context.state;
+      return;
+    }
+
+    stateRef.current = context.getState();
+    return context.subscribe(() => {
+      stateRef.current = context.getState();
+    });
+  }, [context]);
+
+  return stateRef;
+}
+
+/**
+ * Reads the store at the moment of the call. Unlike `useAppStateRef`, it stays
+ * current after the component unmounts, for work that outlives it: a confirm
+ * the command bar opened and then closed behind.
+ */
+export function useAppGetState(): () => AppState {
+  const context = useRequiredAppContext();
+  return useMemo(
+    () => isAppStoreContextValue(context) ? () => context.getState() : () => context.state,
+    [context],
+  );
+}
+
+export function useAppDispatch(): Dispatch<AppAction> {
+  return useRequiredAppContext().dispatch;
+}
+
+export function useAppSelector<T>(selector: (state: AppState) => T): T {
+  const context = useRequiredAppContext();
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const lastSnapshotRef = useRef<{ selection: T } | undefined>(undefined);
+
+  if (!isAppStoreContextValue(context)) {
+    return selector(context.state);
+  }
+
+  const snapshot = useSyncExternalStore(
+    context.subscribe,
+    () => {
+      const state = context.getState();
+      const selection = selectorRef.current(state);
+      const previous = lastSnapshotRef.current;
+      if (previous && Object.is(previous.selection, selection)) {
+        return previous;
+      }
+      const nextSnapshot = { selection };
+      lastSnapshotRef.current = nextSnapshot;
+      return nextSnapshot;
+    },
+    () => {
+      const state = context.getState();
+      return {
+        selection: selectorRef.current(state),
+      };
+    },
+  );
+  return snapshot.selection;
+}
+
+export function useOptionalAppSelector<T>(selector: (state: AppState) => T, fallback: T): T {
+  const context = useContext(AppContext);
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const lastSnapshotRef = useRef<{ selection: T } | undefined>(undefined);
+
+  const readSelection = useCallback(() => {
+    if (!context) return fallback;
+    const state = isAppStoreContextValue(context) ? context.getState() : context.state;
+    return selectorRef.current(state);
+  }, [context, fallback]);
+
+  const snapshot = useSyncExternalStore(
+    useCallback((listener) => {
+      if (!context || !isAppStoreContextValue(context)) return () => {};
+      return context.subscribe(listener);
+    }, [context]),
+    () => {
+      const selection = readSelection();
+      const previous = lastSnapshotRef.current;
+      if (previous && Object.is(previous.selection, selection)) {
+        return previous;
+      }
+      const nextSnapshot = { selection };
+      lastSnapshotRef.current = nextSnapshot;
+      return nextSnapshot;
+    },
+    () => ({ selection: fallback }),
+  );
+
+  return snapshot.selection;
+}
+
+export function PaneInstanceProvider({ paneId, children }: { paneId: string; children: ReactNode }) {
+  return <PaneContext.Provider value={paneId}>{children}</PaneContext.Provider>;
+}
+
+export function usePaneInstanceId(): string {
+  const paneId = useContext(PaneContext);
+  if (!paneId) throw new Error("Pane hooks require a pane instance context");
+  return paneId;
+}
+
+export function useOptionalPaneInstanceId(): string | null {
+  return useContext(PaneContext);
+}
+
+export function usePaneInstance(): PaneInstanceConfig | null {
+  const paneId = useContext(PaneContext);
+  return useAppSelector((state) => (paneId ? findPaneInstance(state.config.layout, paneId) ?? null : null));
+}
+
+function sameConfigOutsideLayoutMirror(previous: AppConfig, next: AppConfig): boolean {
+  const previousKeys = Object.keys(previous) as Array<keyof AppConfig>;
+  if (previousKeys.length !== Object.keys(next).length) return false;
+  for (const key of previousKeys) {
+    if (key === "layouts" || key === "activeLayoutIndex") continue;
+    if (!Object.is(previous[key], next[key])) return false;
+  }
+  return true;
+}
+
+/**
+ * The config for panes that read settings and collections but never the saved
+ * layouts. Every pane-state update mirrors the live pane state into
+ * `config.layouts`, which replaces the config object; a pane subscribed to the
+ * whole config re-renders on every cursor move in every other pane. This
+ * keeps the previous reference while nothing outside that mirror changed.
+ * Anything that writes config back must read the live `state.config` instead,
+ * because `SET_CONFIG` reapplies the saved pane state it carries.
+ */
+export function usePaneAppConfig(): AppConfig {
+  const lastRef = useRef<AppConfig | null>(null);
+  return useAppSelector((state) => {
+    const next = state.config;
+    const previous = lastRef.current;
+    if (previous && (previous === next || sameConfigOutsideLayoutMirror(previous, next))) return previous;
+    lastRef.current = next;
+    return next;
+  });
+}
+
+export function usePaneTicker(paneId?: string) {
+  const paneContextId = useContext(PaneContext);
+  const needsFocusedPane = paneId == null && paneContextId == null;
+  const focusedPaneId = useAppSelector((state) => (needsFocusedPane ? state.focusedPaneId : null));
+  const scopedPaneId = paneId ?? paneContextId ?? focusedPaneId;
+  return useScopedTicker(scopedPaneId);
+}
+
+function useScopedTicker(scopedPaneId: string | null) {
+  const symbol = useAppSelector((state) => (
+    scopedPaneId ? resolveTickerForPane(state, scopedPaneId) : null
+  ));
+  const savedTicker = useAppSelector((state) => (
+    symbol ? state.tickers.get(symbol) ?? null : null
+  ));
+  const contract = useAppSelector((state) => (
+    scopedPaneId ? resolveInstrumentForPane(state, scopedPaneId)?.instrument : undefined
+  ));
+  const listing = useAppSelector((state) => scopedPaneId ? resolveListingForPane(state, scopedPaneId) : undefined);
+  const ticker = useMemo(() => tickerForInstrument(savedTicker, contract, listing), [savedTicker, contract, listing]);
+  const cachedFinancials = useAppSelector((state) => (
+    symbol ? state.financials.get(symbol) ?? null : null
+  ));
+  const marketFinancials = useTickerFinancials(contract === undefined ? null : symbol, contract === undefined ? null : ticker);
+
+  return useMemo(() => {
+    if (!scopedPaneId) return { symbol: null, ticker: null, financials: null, error: undefined };
+    return {
+      symbol,
+      ticker,
+      error: contract === undefined && hasAmbiguousTickerContracts(savedTicker) ? "Choose a contract in search." : undefined,
+      financials: marketFinancials ?? (cachedFinancials && (contract || contract === undefined || savedTicker?.metadata.broker_contracts?.length)
+        ? { ...cachedFinancials, quote: undefined, quoteContributions: undefined, quoteMetadata: undefined, priceHistory: [] }
+        : cachedFinancials),
+    };
+  }, [cachedFinancials, contract, marketFinancials, savedTicker, scopedPaneId, symbol, ticker]);
+}
+
+export function useFocusedTicker() {
+  const paneId = useAppSelector((state) => state.focusedPaneId);
+  return useScopedTicker(paneId);
+}
+
+export function usePaneCollection(paneId?: string) {
+  const paneContextId = useContext(PaneContext);
+  const needsFocusedPane = paneId == null && paneContextId == null;
+  const focusedPaneId = useAppSelector((state) => (needsFocusedPane ? state.focusedPaneId : null));
+  const scopedPaneId = paneId ?? paneContextId ?? focusedPaneId;
+  const collectionId = useAppSelector((state) => (
+    scopedPaneId ? resolveCollectionForPane(state, scopedPaneId) : null
+  ));
+  const portfolio = useAppSelector((state) => (
+    collectionId ? state.config.portfolios.find((entry) => entry.id === collectionId) ?? null : null
+  ));
+  const watchlist = useAppSelector((state) => (
+    collectionId ? state.config.watchlists.find((entry) => entry.id === collectionId) ?? null : null
+  ));
+  return useMemo(() => (
+    { collectionId, portfolio, watchlist }
+  ), [collectionId, portfolio, watchlist]);
+}
+
+export function usePaneStateValue<T>(key: string, fallback: T, paneId?: string): [T, (value: SetStateAction<T>) => void] {
+  const dispatch = useAppDispatch();
+  const stateRef = useAppStateRef();
+  const fallbackRef = useRef(fallback);
+  const scopedPaneId = useScopedPaneId(paneId);
+  const value = useAppSelector((state) => (
+    (state.paneState[scopedPaneId]?.[key] as T | undefined) ?? fallback
+  ));
+
+  useLayoutEffect(() => {
+    fallbackRef.current = fallback;
+  }, [fallback]);
+
+  const setValue = useCallback((nextValue: SetStateAction<T>) => {
+    const currentValue = (stateRef.current.paneState[scopedPaneId]?.[key] as T | undefined) ?? fallbackRef.current;
+    const resolved = typeof nextValue === "function"
+      ? (nextValue as (previousValue: T) => T)(currentValue)
+      : nextValue;
+    if (Object.is(currentValue, resolved)) return;
+    dispatch({ type: "UPDATE_PANE_STATE", paneId: scopedPaneId, patch: { [key]: resolved } });
+  }, [dispatch, key, scopedPaneId, stateRef]);
+  return [value, setValue];
+}
+
+export function usePaneSettingValue<T>(
+  key: string,
+  fallback: T,
+  paneId?: string,
+): [T, (value: SetStateAction<T>) => void] {
+  const stateRef = useAppStateRef();
+  const scopedPaneId = useScopedPaneId(paneId);
+  const updateLayout = useUpdatePaneLayout();
+  const instance = useAppSelector((state) => findPaneInstance(state.config.layout, scopedPaneId) ?? null);
+  const value = (instance?.settings?.[key] as T | undefined) ?? fallback;
+
+  const setValue = useCallback((nextValue: SetStateAction<T>) => {
+    const currentState = stateRef.current;
+    const currentValue = (findPaneInstance(currentState.config.layout, scopedPaneId)?.settings?.[key] as T | undefined) ?? fallback;
+    const resolved = typeof nextValue === "function"
+      ? (nextValue as (previousValue: T) => T)(currentValue)
+      : nextValue;
+    if (Object.is(currentValue, resolved)) return;
+    updateLayout((layout) => setPaneSetting(layout, scopedPaneId, key, resolved));
+  }, [fallback, key, scopedPaneId, stateRef, updateLayout]);
+
+  return [value, setValue];
+}
+
+/** Persist related pane settings in one layout update. */
+export function useUpdatePaneSettings(paneId?: string) {
+  const scopedPaneId = useScopedPaneId(paneId);
+  const updateLayout = useUpdatePaneLayout();
+  return useCallback((patch: Record<string, unknown>) => {
+    updateLayout((layout) => {
+      const pane = findPaneInstance(layout, scopedPaneId);
+      if (!pane || Object.entries(patch).every(([key, value]) => Object.is(pane.settings?.[key], value))) return layout;
+      return setPaneSettings(layout, scopedPaneId, { ...pane.settings, ...patch });
+    });
+  }, [scopedPaneId, updateLayout]);
+}
+
+function useScopedPaneId(paneId?: string): string {
+  const contextId = useOptionalPaneInstanceId();
+  const id = paneId ?? contextId;
+  if (!id) throw new Error("A pane ID or PaneInstanceProvider is required.");
+  return id;
+}
+
+function useUpdatePaneLayout(options: { saveDelayMs?: number } = {}) {
+  const dispatch = useAppDispatch();
+  const stateRef = useAppStateRef();
+  const { saveDelayMs } = options;
+  return useCallback((update: (layout: AppConfig["layout"]) => AppConfig["layout"]) => {
+    const state = stateRef.current;
+    const layout = update(state.config.layout);
+    if (layout === state.config.layout) return;
+    const config = syncConfigActiveLayoutState(
+      { ...state.config, layout }, state.paneState, state.focusedPaneId,
+    );
+    dispatch({ type: "SET_CONFIG", config });
+    scheduleConfigSave(config, { delayMs: saveDelayMs });
+  }, [dispatch, saveDelayMs, stateRef]);
+}
+
+/** Keep a content-derived pane title in its saved layout, without exposing config writes. Null leaves the title alone. */
+export function usePaneTitle(title: string | null, paneId?: string): void {
+  const id = useScopedPaneId(paneId);
+  // A follower's title changes with every cursor move in its source; that is
+  // not worth a config write per step.
+  const updateLayout = useUpdatePaneLayout({ saveDelayMs: LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS });
+  useEffect(() => {
+    if (title == null) return;
+    updateLayout((layout) => {
+      const pane = findPaneInstance(layout, id);
+      return !pane || pane.title === title ? layout
+        : updatePaneInstance(layout, id, (instance) => ({ ...instance, title }));
+    });
+  }, [id, title, updateLayout]);
+}
+
+export function AppProvider({
+  config,
+  children,
+  sessionStore,
+  sessionSnapshot = null,
+  desktopBridge,
+  desktopSnapshot = null,
+  initialThemePreview = null,
+}: {
+  config: AppConfig;
+  children: ReactNode;
+  sessionStore?: AppSessionStorePort;
+  sessionSnapshot?: AppSessionSnapshot | null;
+  desktopBridge?: DesktopWindowBridge;
+  desktopSnapshot?: DesktopSharedStateSnapshot | null;
+  initialThemePreview?: DesktopThemePreviewState | null;
+}) {
+  const [state, rawDispatch] = useReducer(
+    appReducer,
+    { config, sessionSnapshot, desktopSnapshot, initialThemePreview },
+    (initialState: {
+      config: AppConfig;
+      sessionSnapshot?: AppSessionSnapshot | null;
+      desktopSnapshot?: DesktopSharedStateSnapshot | null;
+      initialThemePreview?: DesktopThemePreviewState | null;
+    }) => {
+      const {
+        config: initialConfig,
+        sessionSnapshot: initialSessionSnapshot,
+        desktopSnapshot: initialDesktopSnapshot,
+        initialThemePreview: initialDesktopThemePreview,
+      } = initialState;
+      const baseState = createInitialState(initialConfig, initialSessionSnapshot);
+      const nextState = initialDesktopSnapshot
+        ? appReducer(baseState, { type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot: initialDesktopSnapshot })
+        : baseState;
+      return initialDesktopThemePreview
+        ? appReducer(nextState, { type: "PREVIEW_THEME", theme: initialDesktopThemePreview.theme })
+        : nextState;
+    },
+  );
+  const effectiveThemeId = getEffectiveThemeId(state);
+  const previousRecentTickers = useRef(state.recentTickers);
+  const previousRecentCommands = useRef(state.config.recentCommands);
+  const previousCommandBarOpens = useRef(state.config.commandBarOpens);
+  const stateRef = useRef(state);
+  const listenersRef = useRef(new Set<() => void>());
+  const storeRef = useRef<AppContextStoreValue | null>(null);
+  const lastMainSyncRef = useRef<string | null>(null);
+  const latestMainStateRevisionRef = useRef(desktopSnapshot?.mainStateRevision ?? 0);
+  // The last state this window took from the desktop process. Its syncs name
+  // it, so what another window changed since is not undone by this one.
+  const lastTakenStateSeqRef = useRef<number | null>(desktopSnapshot?.stateSeq ?? null);
+  const lastDetachedPaneSyncRef = useRef<string | null>(null);
+  const lastThemePreviewSyncRef = useRef<string | null | undefined>(undefined);
+
+  stateRef.current = state;
+
+  const dispatch = useCallback((action: AppAction) => {
+    const dispatchedAction = desktopBridge
+      ? action
+      : action.type === "SET_CONFIG"
+        ? {
+          ...action,
+          config: materializeDetachedLayouts(action.config),
+        } as AppAction
+        : action.type === "UPDATE_LAYOUT"
+          ? {
+            ...action,
+            layout: materializeDetachedPanesAsFloating(action.layout),
+          } as AppAction
+          : action;
+    stateRef.current = appReducer(stateRef.current, dispatchedAction);
+    for (const listener of listenersRef.current) {
+      listener();
+    }
+    rawDispatch(dispatchedAction);
+  }, [desktopBridge, rawDispatch]);
+
+  // The linked tickers go back as they came, so the desktop process knows
+  // this window holds them; it never reads them from a window.
+  const buildDesktopSnapshot = useCallback((currentState: AppState): DesktopSharedStateSnapshot => ({
+    config: currentState.config,
+    paneState: currentState.paneState,
+    focusedPaneId: currentState.focusedPaneId,
+    statusBarVisible: currentState.statusBarVisible,
+    brokerSyncErrors: currentState.brokerSyncErrors,
+    ...(currentState.linkedTickers ? { linkedTickers: currentState.linkedTickers } : {}),
+  }), []);
+
+  const serializeDesktopSnapshot = useCallback((snapshot: DesktopSharedStateSnapshot): string => JSON.stringify({
+    config: snapshot.config,
+    paneState: snapshot.paneState,
+    focusedPaneId: snapshot.focusedPaneId,
+    statusBarVisible: snapshot.statusBarVisible,
+    brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
+    linkedTickers: snapshot.linkedTickers ?? {},
+  }), []);
+
+  const serializePaneState = useCallback((paneState: PaneRuntimeState | undefined): string => JSON.stringify(paneState ?? {}), []);
+
+  if (!storeRef.current) {
+    storeRef.current = {
+      dispatch,
+      getState: () => stateRef.current,
+      subscribe: (listener: () => void) => {
+        listenersRef.current.add(listener);
+        return () => {
+          listenersRef.current.delete(listener);
+        };
+      },
+    };
+  } else {
+    storeRef.current.dispatch = dispatch;
+  }
+
+  useEffect(() => {
+    if (sameStringList(previousRecentTickers.current, state.recentTickers)) return;
+    previousRecentTickers.current = state.recentTickers;
+    // Assembled when the write fires so it carries whatever config and recent
+    // tickers are current by then, not the ones from this cursor move.
+    scheduleConfigSave(
+      () => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }),
+      { delayMs: LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS },
+    );
+  }, [state.config, state.recentTickers]);
+
+  // A recent pane run changes only config.recentCommands; nothing else saves it.
+  useEffect(() => {
+    if (previousRecentCommands.current === state.config.recentCommands) return;
+    previousRecentCommands.current = state.config.recentCommands;
+    scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
+  }, [state.config.recentCommands]);
+
+  // Opening the empty bar changes only config.commandBarOpens, until it stops
+  // counting; nothing else saves it.
+  useEffect(() => {
+    if (previousCommandBarOpens.current === state.config.commandBarOpens) return;
+    previousCommandBarOpens.current = state.config.commandBarOpens;
+    scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
+  }, [state.config.commandBarOpens]);
+
+  useEffect(() => {
+    if (!desktopBridge) return;
+    return desktopBridge.subscribeState((snapshot) => {
+      if (desktopBridge.kind === "main" && typeof snapshot.mainStateRevision === "number") {
+        if (snapshot.mainStateRevision < latestMainStateRevisionRef.current) return;
+        latestMainStateRevisionRef.current = Math.max(
+          latestMainStateRevisionRef.current,
+          snapshot.mainStateRevision,
+        );
+      }
+      if (typeof snapshot.stateSeq === "number") lastTakenStateSeqRef.current = snapshot.stateSeq;
+      const currentSignature = serializeDesktopSnapshot(buildDesktopSnapshot(stateRef.current));
+      const nextSignature = serializeDesktopSnapshot(snapshot);
+      if (currentSignature === nextSignature) return;
+      if (desktopBridge.kind === "main") {
+        lastMainSyncRef.current = nextSignature;
+      } else if (desktopBridge.paneId) {
+        lastDetachedPaneSyncRef.current = serializePaneState(snapshot.paneState[desktopBridge.paneId] as PaneRuntimeState | undefined);
+      }
+      dispatch({ type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot });
+    });
+  }, [buildDesktopSnapshot, desktopBridge, serializeDesktopSnapshot, serializePaneState]);
+
+  useEffect(() => {
+    if (desktopBridge?.kind !== "main" || !desktopBridge.syncMainState) return;
+    const snapshot = buildDesktopSnapshot(stateRef.current);
+    const signature = serializeDesktopSnapshot(snapshot);
+    if (signature === lastMainSyncRef.current) return;
+    lastMainSyncRef.current = signature;
+    latestMainStateRevisionRef.current += 1;
+    // A snapshot that did not arrive must not count as sent. Forget it, unless
+    // a newer one has replaced it, so the next effect run sends it again. The
+    // two syncs below dedupe the same way.
+    fireAndForget(
+      desktopBridge.syncMainState(
+        { ...snapshot, mainStateRevision: latestMainStateRevisionRef.current },
+        lastTakenStateSeqRef.current,
+      ),
+      "desktop.syncMainState",
+      () => {
+        if (lastMainSyncRef.current === signature) lastMainSyncRef.current = null;
+      },
+    );
+  }, [
+    buildDesktopSnapshot,
+    desktopBridge,
+    serializeDesktopSnapshot,
+    state.config,
+    state.focusedPaneId,
+    state.paneState,
+    state.statusBarVisible,
+    state.brokerSyncErrors,
+  ]);
+
+  useEffect(() => {
+    if (desktopBridge?.kind !== "main" || !desktopBridge.syncThemePreview) return;
+    const theme = state.themePreview;
+    if (lastThemePreviewSyncRef.current === theme) return;
+    lastThemePreviewSyncRef.current = theme;
+    fireAndForget(desktopBridge.syncThemePreview({ theme }), "desktop.setThemePreview", () => {
+      if (lastThemePreviewSyncRef.current === theme) lastThemePreviewSyncRef.current = undefined;
+    });
+  }, [desktopBridge, state.themePreview]);
+
+  // Every window previews the theme Settings is trying out in another one.
+  useEffect(() => {
+    if (!desktopBridge?.subscribeThemePreview) return;
+    return desktopBridge.subscribeThemePreview((preview) => {
+      lastThemePreviewSyncRef.current = preview.theme;
+      dispatch({ type: "PREVIEW_THEME", theme: preview.theme });
+    });
+  }, [desktopBridge, dispatch]);
+
+  useEffect(() => {
+    if (desktopBridge?.kind !== "detached" || !desktopBridge.replaceDetachedPaneState || !desktopBridge.paneId) return;
+    const paneSignature = serializePaneState(state.paneState[desktopBridge.paneId]);
+    if (paneSignature === lastDetachedPaneSyncRef.current) return;
+    lastDetachedPaneSyncRef.current = paneSignature;
+    fireAndForget(
+      desktopBridge.replaceDetachedPaneState(desktopBridge.paneId, state.paneState[desktopBridge.paneId] ?? {}),
+      "desktop.replaceDetachedPaneState",
+      () => {
+        if (lastDetachedPaneSyncRef.current === paneSignature) lastDetachedPaneSyncRef.current = null;
+      },
+    );
+  }, [desktopBridge, serializePaneState, state.paneState]);
+
+  useLayoutEffect(() => {
+    // The DOM renderer measures everything in grid cells, so resizing the cell
+    // is what actually scales panes and windows. A resize notification makes
+    // viewport-derived measurements re-read the new grid immediately.
+    if (syncFontScale(state.config.fontSize) && typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+      window.dispatchEvent(new Event("resize"));
+    }
+  }, [state.config.fontSize]);
+
+  useLayoutEffect(() => {
+    stateRef.current = state;
+    for (const listener of listenersRef.current) {
+      listener();
+    }
+  }, [state]);
+
+  usePersistSessionSnapshot(sessionStore, state, APP_SESSION_ID, APP_SESSION_SCHEMA_VERSION);
+
+  return (
+    <ThemeProvider themeId={effectiveThemeId}>
+      <AppContext.Provider value={storeRef.current}>{children}</AppContext.Provider>
+    </ThemeProvider>
+  );
+}

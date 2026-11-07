@@ -1,0 +1,100 @@
+import { readIntradayBar, readStaleReason } from "../market-data/quotes/intraday-bar";
+import type { QuoteIntradayBar } from "../types/financials";
+import type { ExchangeRateSnapshot } from "../types/exchange-rate";
+import { fixedUsdRate } from "./currency-units";
+import { fxFreshUntil, fxPreCloseRefetchAt } from "./fx-market-hours";
+
+export const MAX_FX_OBSERVATION_AGE_MS = 7 * 24 * 60 * 60_000;
+const FX_FRESH_MS = 60 * 60_000;
+/** The longest a source's FX runs behind the market, and what a rate that states no delay is taken to: Gloom Cloud's 15 minutes. */
+const MAX_FX_DELAY_MINUTES = 15;
+
+/** When a rate read at `fetchedAt` is read again for its week's close (fxPreCloseRefetchAt); a rate with no stated delay may be up to 15 minutes behind. */
+function preCloseRefetchAt(fetchedAt: number | undefined, asOf: number | undefined, delayMinutes: number | undefined): number {
+  return fxPreCloseRefetchAt(fetchedAt, asOf, Math.min(delayMinutes ?? MAX_FX_DELAY_MINUTES, MAX_FX_DELAY_MINUTES) * 60_000);
+}
+
+/**
+ * Whether a cached rate is past the point it is read again for its FX week's
+ * close: shown while it is read again, it would stand in for a close it is
+ * not, so a caller that revalidates in the background waits for this one.
+ */
+export function isPastPreCloseRefetch(result: { fetchedAt: number; asOf?: number; delayMinutes?: number }, now = Date.now()): boolean {
+  return preCloseRefetchAt(result.fetchedAt, result.asOf, result.delayMinutes) <= now;
+}
+
+interface FxRateMetadata {
+  fetchedAt?: number;
+  asOf?: number;
+  staleAt?: number;
+  expiresAt?: number;
+  source?: string;
+  /** How far the snapshot runs behind the market, as the source states it; 0 is real-time. */
+  delayMinutes?: number;
+  /** The rate is the close of this bar of the pair's, not a print. */
+  intradayBar?: QuoteIntradayBar;
+  /** Why the rate stands when it reads stale, as the data service states it. */
+  staleReason?: string;
+}
+
+export function isUsableCachedExchangeRate(rate: number | null, currency: string,
+  timing: { asOf?: number; fetchedAt?: number | null }, now = Date.now()): boolean {
+  try {
+    exchangeRateMetadata({ rate, asOf: timing.asOf === undefined ? undefined : new Date(timing.asOf).toISOString() },
+      currency, now, timing.fetchedAt ?? undefined);
+    return true;
+  } catch {
+    // Intentional ignore: Invalid or expired cache entries are rejected by this boolean validator.
+    return false;
+  }
+}
+
+/** Validate before numeric decoding, including persisted and legacy snapshots. */
+export function exchangeRateMetadata(value: unknown, currency: string, now = Date.now(), fallbackFetchedAt?: number): FxRateMetadata {
+  const data = typeof value === "number" ? { rate: value } : value as Partial<ExchangeRateSnapshot> | null;
+  const fail = () => { throw new Error(`Invalid or expired exchange rate for ${currency}/USD`); };
+  if (!data || typeof data !== "object" || !Number.isFinite(data.rate) || data.rate! <= 0
+    || (data.fromCurrency !== undefined && data.fromCurrency !== currency)
+    || (data.toCurrency !== undefined && data.toCurrency !== "USD")) return fail();
+  // The numeraire identity, and US cents as its fixed hundredth, need no market observation or upstream request.
+  const fixedRate = fixedUsdRate(currency);
+  if (fixedRate !== undefined) {
+    if (data.rate !== fixedRate) return fail();
+    return { staleAt: Infinity, expiresAt: Infinity, source: "identity" };
+  }
+  const timestamp = (input: unknown): number | undefined => {
+    if (input === undefined) return undefined;
+    if (typeof input !== "string" || !Number.isFinite(Date.parse(input))) return fail();
+    return Date.parse(input);
+  };
+  const asOf = timestamp(data.asOf);
+  const fetchedAt = timestamp(data.fetchedAt) ?? fallbackFetchedAt;
+  const declaredStaleAt = timestamp(data.staleAt);
+  const observation = asOf ?? fetchedAt;
+  if ([asOf, fetchedAt].some((time) => time !== undefined && (!Number.isFinite(time) || time > now + 60_000))
+    || (observation !== undefined && now - observation >= MAX_FX_OBSERVATION_AGE_MS)) return fail();
+  const expiresAt = Math.min(fetchedAt === undefined ? Infinity : fetchedAt + MAX_FX_OBSERVATION_AGE_MS,
+    asOf === undefined ? Infinity : asOf + MAX_FX_OBSERVATION_AGE_MS);
+  if (expiresAt <= now) return fail();
+  const delayMinutes = typeof data.delayMinutes === "number" && Number.isFinite(data.delayMinutes) && data.delayMinutes >= 0
+    ? data.delayMinutes : undefined;
+  const delay = Math.min(delayMinutes ?? 0, MAX_FX_DELAY_MINUTES) * 60_000;
+  const intradayBar = readIntradayBar(data.intradayBar);
+  const staleReason = readStaleReason(data.staleReason);
+  const staleAt = Math.min(declaredStaleAt ?? Infinity,
+    fetchedAt === undefined ? Infinity : fxFreshUntil(fetchedAt, FX_FRESH_MS),
+    asOf === undefined ? Infinity : fxFreshUntil(asOf, FX_FRESH_MS + delay),
+    // A rate this app read before the week closed is read again once the close is out: when it read it, not the source.
+    preCloseRefetchAt(fallbackFetchedAt ?? fetchedAt, asOf, delayMinutes),
+    data.stale === true ? now : Infinity);
+  return {
+    ...(fetchedAt !== undefined ? { fetchedAt } : {}),
+    asOf,
+    ...(Number.isFinite(expiresAt) ? { expiresAt } : {}),
+    ...(Number.isFinite(staleAt) ? { staleAt } : {}),
+    ...(typeof data.source === "string" ? { source: data.source } : {}),
+    ...(delayMinutes !== undefined ? { delayMinutes } : {}),
+    ...(intradayBar ? { intradayBar } : {}),
+    ...(staleReason ? { staleReason } : {}),
+  };
+}

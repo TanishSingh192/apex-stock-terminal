@@ -1,0 +1,204 @@
+import { SHELL_DRAG_Z, type DockDividerLayout, type FloatingRect, type LayoutBounds } from "../../../../layout/pane-manager";
+import type { NativeOccluder, NativePaneLayer } from "../../../chart/native/surface/manager";
+import { DEFAULT_HEADER_HEIGHT } from "../chrome";
+import type { DragPreview } from "../drag";
+import { MENU_Z_INDEX } from "../menu";
+import type { WindowEditDockMovePreview } from "../../window-edit/presentation";
+
+export interface FloatingPreviewRect {
+  paneId: string;
+  rect: FloatingRect;
+}
+
+export interface DividerPreviewState {
+  pathKey: string;
+  rect: LayoutBounds;
+  ratio: number;
+}
+
+export interface NativeFloatingPaneState {
+  paneId: string;
+  rect: FloatingRect;
+  zIndex: number;
+}
+
+export interface NativeTransientOccluder {
+  id: string;
+  rect: LayoutBounds;
+  zIndex: number;
+}
+
+/**
+ * The cells an outline drawn with nothing filled in covers: its four sides,
+ * one cell thick, so an image under it shows inside.
+ */
+function outlineOccluders(id: string, rect: LayoutBounds, zIndex: number): NativeTransientOccluder[] {
+  if (rect.width <= 2 || rect.height <= 2) return [{ id, rect, zIndex }];
+  const right = rect.x + rect.width - 1;
+  const bottom = rect.y + rect.height - 1;
+  return [
+    { id: `${id}:top`, rect: { x: rect.x, y: rect.y, width: rect.width, height: 1 }, zIndex },
+    { id: `${id}:bottom`, rect: { x: rect.x, y: bottom, width: rect.width, height: 1 }, zIndex },
+    { id: `${id}:left`, rect: { x: rect.x, y: rect.y + 1, width: 1, height: rect.height - 2 }, zIndex },
+    { id: `${id}:right`, rect: { x: right, y: rect.y + 1, width: 1, height: rect.height - 2 }, zIndex },
+  ];
+}
+
+export function buildNativeTransientOccluders({
+  activePaneDrag,
+  commandBarNativeOccluder,
+  dragFloatingRect,
+  dockPreview,
+  menu,
+  nativeWindowModePanelRect,
+  windowModeDockMovePreview,
+}: {
+  activePaneDrag: { paneId: string; mode: "docked" | "floating" | "tab" } | null;
+  commandBarNativeOccluder: LayoutBounds | null;
+  dragFloatingRect: FloatingPreviewRect | null;
+  dockPreview: DragPreview | null;
+  menu: { paneId: string; x: number; y: number; width: number; itemCount: number } | null;
+  nativeWindowModePanelRect: LayoutBounds | null;
+  windowModeDockMovePreview: WindowEditDockMovePreview | null;
+}): NativeTransientOccluder[] {
+  const occluders: NativeTransientOccluder[] = [];
+
+  if (activePaneDrag
+    && activePaneDrag.mode !== "floating"
+    && dragFloatingRect?.paneId === activePaneDrag.paneId
+    && !dockPreview) {
+    occluders.push({
+      id: `drag-preview:${activePaneDrag.paneId}`,
+      rect: dragFloatingRect.rect,
+      zIndex: SHELL_DRAG_Z.under,
+    });
+  }
+
+  if (dockPreview) {
+    occluders.push(...outlineOccluders(`dock-preview:${dockPreview.kind}`, dockPreview.rect, SHELL_DRAG_Z.over));
+  }
+
+  if (windowModeDockMovePreview) {
+    occluders.push(...outlineOccluders("window-mode:drop-preview", windowModeDockMovePreview.rect, MENU_Z_INDEX - 2));
+  }
+
+  if (menu) {
+    occluders.push({
+      id: `pane-menu:${menu.paneId}`,
+      rect: {
+        x: menu.x,
+        y: menu.y,
+        width: menu.width,
+        height: menu.itemCount + 2,
+      },
+      zIndex: MENU_Z_INDEX,
+    });
+  }
+
+  if (nativeWindowModePanelRect) {
+    occluders.push({
+      id: "window-mode:status",
+      rect: nativeWindowModePanelRect,
+      zIndex: MENU_Z_INDEX - 1,
+    });
+  }
+
+  if (commandBarNativeOccluder) {
+    occluders.push({
+      id: "command-bar:panel",
+      rect: commandBarNativeOccluder,
+      zIndex: Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  return occluders;
+}
+
+export function buildNativeWindowState(
+  dockedPaneIds: readonly string[],
+  floatingPanes: readonly NativeFloatingPaneState[],
+  dragFloatingRect: FloatingPreviewRect | null,
+  overlay: { open: boolean; width: number; contentHeight: number },
+  transientOccluders: readonly NativeTransientOccluder[] = [],
+  dockDividers: readonly DockDividerLayout[] = [],
+  appHeaderHeight: number = DEFAULT_HEADER_HEIGHT,
+): { paneLayers: NativePaneLayer[]; occluders: NativeOccluder[] } {
+  const previewedFloatingPanes = floatingPanes.map((pane) => (
+    dragFloatingRect?.paneId === pane.paneId
+      ? { ...pane, rect: dragFloatingRect.rect }
+      : pane
+  ));
+
+  const paneLayers: NativePaneLayer[] = [
+    ...dockedPaneIds.map((paneId) => ({ paneId, zIndex: 0 })),
+    ...previewedFloatingPanes.map((pane) => ({ paneId: pane.paneId, zIndex: pane.zIndex })),
+  ];
+
+  const occluders: NativeOccluder[] = previewedFloatingPanes.map((pane) => ({
+    id: pane.paneId,
+    paneId: pane.paneId,
+    rect: {
+      x: pane.rect.x,
+      y: pane.rect.y + appHeaderHeight,
+      width: pane.rect.width,
+      height: pane.rect.height,
+    },
+    zIndex: pane.zIndex,
+  }));
+
+  for (const divider of dockDividers) {
+    occluders.push({
+      id: `dock-divider:${divider.path.length > 0 ? divider.path.join(".") : "root"}`,
+      paneId: null,
+      rect: {
+        x: divider.rect.x,
+        y: divider.rect.y + appHeaderHeight,
+        width: divider.rect.width,
+        height: divider.rect.height,
+      },
+      zIndex: 1,
+    });
+  }
+
+  for (const occluder of transientOccluders) {
+    occluders.push({
+      id: occluder.id,
+      paneId: null,
+      rect: {
+        x: occluder.rect.x,
+        y: occluder.rect.y + appHeaderHeight,
+        width: occluder.rect.width,
+        height: occluder.rect.height,
+      },
+      zIndex: occluder.zIndex,
+    });
+  }
+
+  if (overlay.open) {
+    occluders.push({
+      id: "overlay:global",
+      paneId: null,
+      rect: {
+        x: 0,
+        y: appHeaderHeight,
+        width: overlay.width,
+        height: overlay.contentHeight,
+      },
+      zIndex: Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  return { paneLayers, occluders };
+}
+
+export function resolveNativeDockDividers(
+  dockDividers: readonly DockDividerLayout[],
+  dividerPreview: DividerPreviewState | null,
+): DockDividerLayout[] {
+  if (!dividerPreview) return [...dockDividers];
+  return dockDividers.map((divider) => (
+    divider.path.join(".") === dividerPreview.pathKey
+      ? { ...divider, rect: dividerPreview.rect, ratio: dividerPreview.ratio }
+      : divider
+  ));
+}

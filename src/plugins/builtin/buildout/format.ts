@@ -1,0 +1,255 @@
+import { colors, priceColor } from "../../../theme/colors";
+import { collectUniqueTickerSymbols } from "../../../tickers/tokenizer";
+import { isKnownExchangeCode } from "../../../utils/exchanges";
+import { formatDetailDate as sharedFormatDetailDate, parseDisplayDate } from "../../../utils/datetime-format";
+import type { BuildoutSource, BuildoutUpdate } from "./model/types";
+
+export function text(value: unknown, fallback = "-") {
+  if (value == null) return fallback;
+  const stringValue = String(value).trim();
+  return stringValue || fallback;
+}
+
+export function textOrNull(value: unknown): string | null {
+  if (value == null) return null;
+  const stringValue = String(value).trim();
+  return stringValue || null;
+}
+
+export function metricNumber(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value !== "string") return null;
+
+  const raw = value.trim();
+  if (!raw || raw === "-" || /^n\/a$/i.test(raw)) return null;
+  const negative = raw.startsWith("(") && raw.endsWith(")");
+  const suffixMatch = raw.match(/([KMBT])\s*%?\)?$/i);
+  const suffix = suffixMatch?.[1]?.toUpperCase() ?? "";
+  const multiplier = suffix === "K"
+    ? 1_000
+    : suffix === "M"
+      ? 1_000_000
+      : suffix === "B"
+        ? 1_000_000_000
+        : suffix === "T"
+          ? 1_000_000_000_000
+          : 1;
+  const numeric = raw
+    .replace(/[,$%+]/g, "")
+    .replace(/[()]/g, "")
+    .replace(/[KMBT]\s*$/i, "")
+    .trim();
+  const parsed = Number(numeric.match(/^-?\d+(?:\.\d+)?/)?.[0]);
+  if (!Number.isFinite(parsed)) return null;
+  return (negative ? -parsed : parsed) * multiplier;
+}
+
+/** A dollar figure as the service prints it ("$5094.1B", "$-4.9B"); anything else is not money to reformat. */
+const DOLLAR_STRING = /^-?\$-?[\d,]*\.?\d+\s*[KMBT]?$/i;
+
+/** The dollars in a string the service prints as money, or null for anything else. */
+export function moneyAmount(value: unknown): number | null {
+  return typeof value === "string" && DOLLAR_STRING.test(value.trim()) ? metricNumber(value) : null;
+}
+
+const MONEY_UNITS = [
+  { divisor: 1e12, suffix: "T" },
+  { divisor: 1e9, suffix: "B" },
+  { divisor: 1e6, suffix: "M" },
+  { divisor: 1e3, suffix: "K" },
+] as const;
+
+/**
+ * Dollars in the one compact form every TheBuildout table uses: "$5.1T",
+ * "$356.4B", "-$4.9B". The unit is picked after rounding, so $999.96B is
+ * "$1.0T" and not "$1000.0B".
+ */
+export function formatCompactMoney(amount: number): string {
+  const abs = Math.abs(amount);
+  let index = MONEY_UNITS.findIndex((unit) => abs >= unit.divisor);
+  let digits = index < 0 ? abs.toFixed(0) : (abs / MONEY_UNITS[index]!.divisor).toFixed(1);
+  if (index > 0 && Number(digits) >= 1000) {
+    index -= 1;
+    digits = (abs / MONEY_UNITS[index]!.divisor).toFixed(1);
+  }
+  const sign = amount < 0 && /[1-9]/.test(digits) ? "-" : "";
+  return `${sign}$${digits}${index < 0 ? "" : MONEY_UNITS[index]!.suffix}`;
+}
+
+/** A table cell's text for a dollar figure: compact when it is money, the service's own text otherwise, "-" when absent. */
+export function moneyText(value: string | null | undefined): string {
+  const amount = moneyAmount(value);
+  return amount == null ? text(value) : formatCompactMoney(amount);
+}
+
+export function dateShort(value: string | null | undefined) {
+  const date = parseDisplayDate(value);
+  if (!date) return "-";
+  return date.toISOString().slice(5, 10);
+}
+
+export function dateDetail(value: string | null | undefined) {
+  const formatted = sharedFormatDetailDate(value, "");
+  return formatted || null;
+}
+
+export function activityLabel(value: number | null | undefined) {
+  if (value == null) return "-";
+  if (value >= 2) return "High";
+  if (value >= 1) return "Low";
+  return "None";
+}
+
+export function activityColor(value: number | null | undefined) {
+  if (value == null || value <= 0) return colors.textMuted;
+  return value >= 2 ? colors.warning : colors.neutral;
+}
+
+export function metricColor(value: unknown) {
+  const parsed = metricNumber(value);
+  return parsed == null ? colors.textDim : priceColor(parsed);
+}
+
+export function criticalityColor(value: string | null | undefined) {
+  switch ((value ?? "").trim().toUpperCase()) {
+    case "CORE":
+      return colors.negative;
+    case "CRITICAL":
+      return colors.warning;
+    case "IMPORTANT":
+      return colors.neutral;
+    case "SUPPORTING":
+      return colors.textDim;
+    case "PERIPHERAL":
+      return colors.textMuted;
+    default:
+      return colors.textDim;
+  }
+}
+
+/** A theme's tiers, most important first. */
+export const LIST_TIER_ORDER: readonly string[] = ["leader", "major", "notable", "watchlist"];
+
+/** `core_vendor` reads "Core vendor". */
+export function listWord(value: string | null | undefined): string | null {
+  const words = value?.trim().replace(/[_-]+/g, " ").toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : null;
+}
+
+export function tickerSymbol(value: string | null | undefined): string | null {
+  const symbol = value?.trim();
+  return symbol ? symbol.toUpperCase() : null;
+}
+
+/**
+ * The key the app looks a dataset ticker up and opens it by. A name-led
+ * symbol (NVDA, BRK.B) is its own. The dataset writes some Asian listings by
+ * number alone (2330, 005930), which a cashtag reads as money, so one takes
+ * the venue the dataset names (2330:TWSE, 005930:KRX). Null when the dataset
+ * names no venue the app knows: such a ticker is plain text, never a chip
+ * that looks different from the resolved ones around it.
+ */
+export function listingKey(ticker: string | null | undefined, exchange?: string | null): string | null {
+  const symbol = tickerSymbol(ticker);
+  if (!symbol) return null;
+  let key: string | null = symbol;
+  if (!/^[A-Z]/.test(symbol)) {
+    const venue = tickerSymbol(exchange);
+    // `688795.SS` names its venue twice: the dataset's venue is the one kept.
+    key = venue && isKnownExchangeCode(venue) ? `${symbol.replace(/\.[A-Z]{1,4}$/, "")}:${venue}` : null;
+  }
+  return key && collectUniqueTickerSymbols([`$${key}`]).includes(key) ? key : null;
+}
+
+export function tickerSearchText(symbols: readonly string[]) {
+  return symbols
+    .filter((symbol) => collectUniqueTickerSymbols([`$${symbol}`]).includes(symbol))
+    .map((symbol) => `$${symbol}`)
+    .join(" ");
+}
+
+export function appendUniqueById<T extends { id: string }>(existing: readonly T[], incoming: readonly T[]) {
+  const seen = new Set(existing.map((item) => item.id));
+  const merged = [...existing];
+  for (const item of incoming) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    merged.push(item);
+  }
+  return merged;
+}
+
+export function uniqueStrings(values: readonly string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function domainFromUrl(value: string | null | undefined) {
+  if (!value) return null;
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./, "");
+    return hostname || null;
+  } catch {
+    // Intentional ignore: malformed source URLs have no displayable domain.
+    return null;
+  }
+}
+
+export function sourceDomains(sources: readonly BuildoutSource[] | null | undefined) {
+  return uniqueStrings((sources ?? []).flatMap((source) => [
+    source.domain ?? domainFromUrl(source.url) ?? "",
+    ...(source.citations ?? []).map((citation) => domainFromUrl(citation.url) ?? ""),
+  ]));
+}
+
+export interface SourceDetailEntry {
+  url: string | null;
+  domain: string | null;
+  title: string | null | undefined;
+  note: string | null | undefined;
+  tier: string | null | undefined;
+}
+
+/** The source lines a site detail draws, each with its link when it has one. */
+export function sourceDetailEntries(sources: readonly BuildoutSource[] | undefined, maxItems: number): SourceDetailEntry[] {
+  return (sources ?? [])
+    .flatMap((source) => {
+      const flatUrl = source.url;
+      const flatTitle = source.title ?? source.snippet ?? source.reasoning;
+      const flat = flatUrl || flatTitle
+        ? [{
+          url: flatUrl ?? null,
+          domain: source.domain ?? domainFromUrl(flatUrl) ?? null,
+          title: flatTitle,
+          note: source.reasoning ?? source.snippet,
+          tier: source.tier,
+        }]
+        : [];
+      const citations = (source.citations ?? []).map((citation) => ({
+        url: citation.url ?? null,
+        domain: domainFromUrl(citation.url) ?? null,
+        title: citation.title ?? citation.excerpts?.[0] ?? null,
+        note: citation.excerpts?.[0] ?? null,
+        tier: source.tier,
+      }));
+      return [...flat, ...citations];
+    })
+    .filter((entry) => textOrNull(entry.domain ?? entry.title ?? entry.note) != null)
+    .slice(0, maxItems);
+}
+
+export function intelSourceDomains(update: BuildoutUpdate) {
+  return uniqueStrings([
+    ...sourceDomains(update.contextSources),
+    ...(update.sourceUrls ?? []).map((url) => domainFromUrl(url) ?? ""),
+  ]);
+}

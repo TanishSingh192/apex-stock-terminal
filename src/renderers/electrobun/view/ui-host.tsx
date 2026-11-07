@@ -1,0 +1,103 @@
+/** @jsxImportSource react */
+import type { RendererHost, UiHost } from "../../../ui/host";
+import { flushUsageCounts } from "../../../telemetry/usage-counts";
+import { backendRequest } from "./backend-rpc";
+import { NATIVE_CONTEXT_MENU_SUPPORTED, showDesktopContextMenu } from "./host/native";
+import { startElectrobunWindowDrag } from "./host/window-move";
+import { createDomUiHost } from "../../dom/dom-ui-host";
+import { detectPlatform } from "../../../utils/platform";
+import { logFailure } from "../../../utils/log-failure";
+
+export function createWebUiHost(desktopPlatform?: string): UiHost {
+  return createDomUiHost(desktopPlatform, {
+    nativeContextMenu: NATIVE_CONTEXT_MENU_SUPPORTED,
+    publicSharing: true,
+  });
+}
+
+export const webUiHost: UiHost = createWebUiHost();
+
+export const webRendererHost: RendererHost = {
+  supportsNativeDesktopNotifications: true,
+  requestExit() {
+    // The Bun process ends the app on `host.exit`, before `pagehide` could
+    // send what was counted, so that goes first.
+    void flushUsageCounts({ timeoutMs: 1_000 }).finally(() => {
+      void backendRequest("host.exit").catch(() => window.close());
+    });
+  },
+  startWindowDrag(press) {
+    // Windows moves the window itself, as it does from a native title bar, and
+    // a double-click there maximizes or restores it.
+    if (detectPlatform() === "win32") {
+      if (press?.detail === 2) {
+        void backendRequest("host.windowControl", { action: "toggle-maximize" }).catch((error: unknown) => {
+          console.error("[desktop] could not maximize the window", error instanceof Error ? error.message : String(error));
+        });
+        return;
+      }
+      void backendRequest("host.startWindowDrag").catch((error: unknown) => {
+        console.error("[desktop] could not start moving the window", error instanceof Error ? error.message : String(error));
+      });
+      return;
+    }
+    startElectrobunWindowDrag();
+  },
+  async controlWindow(action) {
+    // Closing the main window quits the app; send what was counted first.
+    if (action === "close") await flushUsageCounts({ timeoutMs: 1_000 });
+    await backendRequest("host.windowControl", { action });
+  },
+  startWindowResize(edge) {
+    // Windows resizes the window itself, as it does from a native frame's edge.
+    if (detectPlatform() !== "win32") return;
+    void backendRequest("host.startWindowResize", { edge }).catch((error: unknown) => {
+      console.error("[desktop] could not start resizing the window", error instanceof Error ? error.message : String(error));
+    });
+  },
+  async openExternal(url) {
+    return await backendRequest("host.openExternal", { url });
+  },
+  async copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      await backendRequest("host.copyText", { text });
+    }
+  },
+  async copyPngImage(pngBase64) {
+    const bytes = Uint8Array.from(atob(pngBase64), (char) => char.charCodeAt(0));
+    const blob = new Blob([bytes], { type: "image/png" });
+    try {
+      const ClipboardItemCtor = (globalThis as typeof globalThis & {
+        ClipboardItem?: new (items: Record<string, Blob>) => ClipboardItem;
+      }).ClipboardItem;
+      if (navigator.clipboard?.write && ClipboardItemCtor) {
+        await navigator.clipboard.write([new ClipboardItemCtor({ "image/png": blob })]);
+        return;
+      }
+    } catch {
+      // Intentional ignore: the native Electrobun clipboard bridge below copies the image instead.
+    }
+    await backendRequest("host.copyPngImage", { pngBase64 });
+  },
+  async readText() {
+    try {
+      return await navigator.clipboard.readText();
+    } catch {
+      return backendRequest("host.readText");
+    }
+  },
+  async saveTextFile({ name, text, mimeType }) {
+    return backendRequest("host.saveTextFile", { name, text, mimeType });
+  },
+  notify(notification) {
+    void backendRequest("host.notify", {
+      title: notification.title,
+      body: notification.body,
+      subtitle: notification.subtitle,
+      sound: notification.sound,
+    }).catch(logFailure("desktop-host", "Could not show a notification"));
+  },
+  showContextMenu: showDesktopContextMenu,
+};

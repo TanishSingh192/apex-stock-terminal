@@ -1,0 +1,322 @@
+import type { ScannerFlowEvent, ScannerFlowHistoryQuery, ScannerStatus } from "../../../api-client";
+
+export type FlowMinPremium = "50000" | "250000" | "1000000";
+export type FlowSide = "calls" | "puts" | "both";
+export type FlowKind = "all" | "sweeps" | "blocks";
+export type FlowVolOi = "off" | "1" | "5";
+export type FlowExpiry = "7" | "30" | "all";
+export type FlowUniverse = "active" | "watchlist";
+
+export interface FlowFilters {
+  minPremium: FlowMinPremium;
+  side: FlowSide;
+  kind: FlowKind;
+  volOi: FlowVolOi;
+  expiry: FlowExpiry;
+  universe: FlowUniverse;
+}
+
+export const DEFAULT_FLOW_FILTERS: FlowFilters = {
+  minPremium: "250000",
+  side: "both",
+  kind: "all",
+  volOi: "off",
+  expiry: "all",
+  universe: "active",
+};
+
+/**
+ * One source for the in-pane filter chips and the settings dialog. `label` is the
+ * dialog wording, `short` the chip wording.
+ */
+export const FLOW_FILTER_OPTIONS = {
+  minPremium: [
+    { value: "50000", label: "$50K", short: "50K" },
+    { value: "250000", label: "$250K", short: "250K" },
+    { value: "1000000", label: "$1M", short: "1M" },
+  ],
+  side: [
+    { value: "both", label: "Calls and puts", short: "C+P" },
+    { value: "calls", label: "Calls only", short: "C" },
+    { value: "puts", label: "Puts only", short: "P" },
+  ],
+  kind: [
+    { value: "all", label: "All prints", short: "all" },
+    { value: "sweeps", label: "Sweeps only", short: "swp" },
+    { value: "blocks", label: "Blocks only", short: "blk" },
+  ],
+  volOi: [
+    { value: "off", label: "No floor", short: "any" },
+    { value: "1", label: "1x and up", short: "1x" },
+    { value: "5", label: "5x and up", short: "5x" },
+  ],
+  expiry: [
+    { value: "all", label: "Any expiry", short: "any" },
+    { value: "7", label: "7 days or less", short: "7d" },
+    { value: "30", label: "30 days or less", short: "30d" },
+  ],
+  universe: [
+    { value: "active", label: "Active names", short: "active" },
+    { value: "watchlist", label: "My tickers only", short: "mine" },
+  ],
+} as const satisfies {
+  [K in keyof FlowFilters]: readonly { value: FlowFilters[K]; label: string; short: string }[]
+};
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function expiryDaysFromNow(expiry: string, now: number): number | null {
+  const parsed = Date.parse(`${expiry}T00:00:00Z`);
+  if (Number.isNaN(parsed)) return null;
+  return (parsed - now) / MS_PER_DAY;
+}
+
+/** The OSI root a listed symbol's options trade under: BRK.B trades as BRKB. */
+function flowOptionRoot(symbol: string): string {
+  return symbol.trim().toUpperCase().replace(/[.\-/ ]/g, "");
+}
+
+/** Adjusted contracts carry a numbered root (SOXS1) for the same name. */
+function printRoot(underlying: string): string {
+  return underlying.toUpperCase().replace(/\d+$/, "");
+}
+
+/**
+ * Whose prints the pane shows: one name (`FLOW NVDA`), which takes the place
+ * of the universe filter, or the market, narrowed to the user's own tickers
+ * when the universe filter says so.
+ */
+export interface FlowScope {
+  symbol?: string | null;
+  watchlist: ReadonlySet<string>;
+}
+
+/** The listed symbol a `FLOW <ticker>` pane is about, as the pane setting or report argument names it. */
+export function flowScopeSymbol(value: unknown): string | null {
+  const symbol = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return symbol || null;
+}
+
+/**
+ * The shared feed is published once for everyone, so every user preference is a
+ * local predicate over the same events. Never push these upstream.
+ */
+export function filterFlowEvents(
+  events: readonly ScannerFlowEvent[] | undefined,
+  filters: FlowFilters,
+  scope: FlowScope,
+  now = Date.now(),
+): ScannerFlowEvent[] {
+  const minPremium = Number(filters.minPremium);
+  const minVolOi = filters.volOi === "off" ? null : Number(filters.volOi);
+  const maxExpiryDays = filters.expiry === "all" ? null : Number(filters.expiry);
+  const roots = scope.symbol ? new Set([flowOptionRoot(scope.symbol)])
+    : filters.universe === "watchlist" ? new Set([...scope.watchlist].map(flowOptionRoot)) : null;
+
+  return (events ?? []).filter((event) => {
+    if (!(event.premium >= minPremium)) return false;
+    if (filters.side === "calls" && event.right !== "C") return false;
+    if (filters.side === "puts" && event.right !== "P") return false;
+    if (filters.kind === "sweeps" && event.kind !== "sweep") return false;
+    if (filters.kind === "blocks" && event.kind !== "block") return false;
+    if (minVolOi != null && !(typeof event.volOi === "number" && event.volOi >= minVolOi)) return false;
+    if (maxExpiryDays != null) {
+      const days = expiryDaysFromNow(event.expiry, now);
+      if (days == null || days > maxExpiryDays || days < -1) return false;
+    }
+    if (roots && !roots.has(printRoot(event.underlying))) return false;
+    return true;
+  });
+}
+
+/**
+ * An empty table has two unrelated causes, and blaming the filters for a tape
+ * the server never sent sends people to tune filters that were never the
+ * problem. Say which one happened.
+ */
+export function flowEmptyState(
+  received: number,
+  visible: number,
+  status: ScannerStatus | undefined,
+  symbol: string | null = null,
+): { title: string; hint: string } {
+  // One name's prints are mostly recorded ones, and a quiet name has none at all.
+  if (symbol) {
+    return {
+      title: `No ${symbol} prints under these filters.`,
+      hint: "Flow is recorded for the most active names, the day's movers and names with a flow alert.",
+    };
+  }
+  if (received > visible) {
+    return {
+      title: `${received - visible} ${received - visible === 1 ? "print" : "prints"} hidden by filters.`,
+      hint: "Loosen the premium, expiry, or universe filter.",
+    };
+  }
+  if (status === "closed") {
+    return {
+      title: "No prints on the tape.",
+      hint: "Options are closed; the tape fills again at the next session.",
+    };
+  }
+  return {
+    title: "No prints on the tape yet.",
+    hint: "Large sweeps, blocks, and premium prints appear here as they cross.",
+  };
+}
+
+export function formatFlowPremium(premium: number): string {
+  if (premium >= 1e9) return `$${(premium / 1e9).toFixed(1)}B`;
+  if (premium >= 1e6) return `$${(premium / 1e6).toFixed(1)}M`;
+  if (premium >= 1e3) return `$${Math.round(premium / 1e3)}K`;
+  return `$${Math.round(premium)}`;
+}
+
+export function formatFlowType(event: ScannerFlowEvent): string {
+  return `${event.right} ${event.kind}`;
+}
+
+export function formatFlowSide(side: ScannerFlowEvent["side"]): string {
+  return side === "unknown" ? "—" : side;
+}
+
+export function formatFlowVolOi(volOi: number | null | undefined): string {
+  if (typeof volOi !== "number" || !Number.isFinite(volOi)) return "—";
+  return volOi >= 10 ? `${Math.round(volOi)}x` : `${volOi.toFixed(1)}x`;
+}
+
+/** An expiry as the tape prints it, `06/16`, with its year when it is not this one: `06/16/27`. */
+export function formatFlowExpiry(expiry: string, now = Date.now()): string {
+  const [year, month, day] = expiry.split("-");
+  if (!year || !month || !day) return expiry;
+  return year === String(new Date(now).getUTCFullYear()) ? `${month}/${day}` : `${month}/${day}/${year.slice(2)}`;
+}
+
+/**
+ * A print's time in UTC, as the TIME UTC header says (formatFeedTime's
+ * `utc`): today's to the second, an earlier day's with its date.
+ */
+export function formatFlowTime(at: number, now = Date.now()): string {
+  const date = new Date(at);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  if (utcDay(at) !== utcDay(now)) {
+    return `${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+  }
+  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+/** Rows per page of recorded prints below the live tape. */
+const FLOW_HISTORY_PAGE = 100;
+/** Live prints a pane keeps once they scroll off the shared tape. */
+const FLOW_KEPT_PRINTS = 20_000;
+
+/** Newest first; ties keep the server's byte order on id so pages line up. */
+export function compareFlowDesc(left: ScannerFlowEvent, right: ScannerFlowEvent): number {
+  if (left.at !== right.at) return right.at - left.at;
+  return left.id < right.id ? 1 : left.id > right.id ? -1 : 0;
+}
+
+/**
+ * The shared tape holds its latest prints only. A pane keeps every print it
+ * has received, so a print that rolls off the tape does not leave a hole
+ * above the recorded pages loaded below it.
+ */
+export function keepFlowPrints(
+  kept: readonly ScannerFlowEvent[],
+  incoming: readonly ScannerFlowEvent[] | undefined,
+  limit = FLOW_KEPT_PRINTS,
+): readonly ScannerFlowEvent[] {
+  if (!incoming?.length) return kept;
+  const ids = new Set(kept.map((event) => event.id));
+  const fresh = incoming.filter((event) => !ids.has(event.id));
+  if (fresh.length === 0) return kept;
+  return [...fresh, ...kept].sort(compareFlowDesc).slice(0, limit);
+}
+
+/** Every print once, newest first. */
+export function mergeFlowRows(
+  live: readonly ScannerFlowEvent[],
+  older: readonly ScannerFlowEvent[],
+): ScannerFlowEvent[] {
+  if (older.length === 0) return [...live];
+  const byId = new Map<string, ScannerFlowEvent>();
+  for (const event of [...live, ...older]) {
+    if (!byId.has(event.id)) byId.set(event.id, event);
+  }
+  return [...byId.values()].sort(compareFlowDesc);
+}
+
+/** The pane's filters as a query for recorded prints, so each page is rows it will show. */
+export function flowHistoryQuery(
+  filters: FlowFilters,
+  scope: FlowScope,
+  before?: { at: number; id: string },
+  limit = FLOW_HISTORY_PAGE,
+): ScannerFlowHistoryQuery {
+  return {
+    ...(before ? { before } : {}),
+    limit,
+    ...flowFilterQuery(filters),
+    ...(scope.symbol ? { symbols: [scope.symbol.toUpperCase()] }
+      : filters.universe === "watchlist" ? { symbols: [...scope.watchlist].map((symbol) => symbol.toUpperCase()).sort() } : {}),
+  };
+}
+
+function flowFilterQuery(filters: FlowFilters): Omit<ScannerFlowHistoryQuery, "before" | "limit" | "symbols"> {
+  return {
+    minPremium: Number(filters.minPremium),
+    ...(filters.side === "calls" ? { right: "C" as const } : filters.side === "puts" ? { right: "P" as const } : {}),
+    ...(filters.kind === "sweeps" ? { kind: "sweep" as const } : filters.kind === "blocks" ? { kind: "block" as const } : {}),
+    ...(filters.volOi === "off" ? {} : { minVolOi: Number(filters.volOi) }),
+    ...(filters.expiry === "all" ? {} : { maxExpiryDays: Number(filters.expiry) }),
+  };
+}
+
+/**
+ * The session summary's query as the Cloud route reads it: the same filters as
+ * the recorded prints, with one name as `symbol`, which also asks for its strikes.
+ */
+export function flowSessionSearch(filters: FlowFilters, scope: FlowScope): string {
+  const params = new URLSearchParams(flowHistorySearch({
+    ...flowFilterQuery(filters),
+    ...(!scope.symbol && filters.universe === "watchlist"
+      ? { symbols: [...scope.watchlist].map((symbol) => symbol.toUpperCase()).sort() } : {}),
+  }));
+  if (scope.symbol) params.set("symbol", scope.symbol.toUpperCase());
+  return params.toString();
+}
+
+function utcDay(at: number): string {
+  return new Date(at).toISOString().slice(0, 10);
+}
+
+/** True when any row is from an earlier day in UTC, so the time column needs its date. */
+export function flowRowsSpanDays(events: readonly ScannerFlowEvent[], now = Date.now()): boolean {
+  const today = utcDay(now);
+  return events.some((event) => utcDay(event.at) !== today);
+}
+
+/** The recorded-print query as the Cloud route reads it. */
+export function flowHistorySearch(query: ScannerFlowHistoryQuery): string {
+  const params = new URLSearchParams();
+  if (query.before) {
+    params.set("beforeAt", String(query.before.at));
+    params.set("beforeId", query.before.id);
+  }
+  const optional: Array<[string, string | number | undefined]> = [
+    ["limit", query.limit],
+    ["minPremium", query.minPremium],
+    ["right", query.right],
+    ["kind", query.kind],
+    ["minVolOi", query.minVolOi],
+    ["maxExpiryDays", query.maxExpiryDays],
+  ];
+  for (const [key, value] of optional) {
+    if (value != null) params.set(key, String(value));
+  }
+  if (query.symbols) {
+    params.set("universe", "symbols");
+    params.set("symbols", query.symbols.join(","));
+  }
+  return params.toString();
+}

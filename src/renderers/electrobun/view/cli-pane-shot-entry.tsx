@@ -1,0 +1,621 @@
+/** @jsxImportSource react */
+import { createRoot } from "react-dom/client";
+import { useEffect, useState, type ReactNode } from "react";
+import { TapeClientContext } from "../../../plugins/builtin/time-sales/use-tape";
+import { createSnapshotTapeClient } from "../../../plugins/builtin/time-sales/snapshot-client";
+import { createSnapshotScannerClient, ScannerClientContext } from "../../../plugins/builtin/shared/scanner-capture";
+import type { TapeSnapshot } from "../../../api-client/tape";
+import { AppProvider, useAppDispatch } from "../../../state/app/context";
+import { createCliPaneShotConnectionHealth } from "./cli-pane-shot-health";
+import { changedThePage, SHOT_MUTATION_OPTIONS } from "./cli-pane-shot-mutations";
+import { ChartSnapshotContext } from "../../../time-series/hooks";
+import { decodeRpcValue } from "../shared/rpc-codec";
+import { createSnapshotDataProvider } from "../../../market-data/snapshot-provider";
+import { createAppRuntime } from "../../../core/app-runtime";
+import { JsonPersistence } from "../../../data/json-persistence";
+import { JsonTickerRepository } from "../../../data/json-ticker-repository";
+import type { DesktopPaneShotPayload } from "../../../cli/desktop-pane-shot";
+import {
+  SHOT_API_PROXY_PREFIX,
+  SHOT_API_SOCKET_PATH,
+  SHOT_HTTP_BRIDGE_PATH,
+  SHOT_MARKET_BRIDGE_PATH,
+  shotRouteUrl,
+  type ShotApiSocketCall,
+  type ShotApiSocketReply,
+} from "../../../cli/desktop-pane-shot-routes";
+import { instrumentFromTicker } from "../../../market-data/request-types";
+import type { RendererHost } from "../../../ui/host";
+import { DomHostProviders } from "../../dom/dom-host-providers";
+import { webUiHost } from "./ui-host";
+import { getLoadablePlugins } from "../../../plugins/catalog";
+import { setCurrentPluginTarget } from "../../../plugins/current-target";
+import type { LoadedExternalPlugin } from "../../../plugins/loader";
+import type { PluginRegistry } from "../../../plugins/registry";
+import { loadDesktopExternalPlugins } from "./external-plugins";
+import {
+  RemoteUiRegistryProvider,
+  useRemoteUiRegistry,
+} from "../../../remote/semantic-tree";
+import type { RemoteUiNodeSnapshot } from "../../../remote/types";
+import { PaneShotFrame } from "./cli-pane-shot-frame";
+import { PaneContent } from "../../../components/layout/pane/content";
+import { getPaneDisplayTitle } from "../../../components/layout/pane/title";
+import type {
+  DataProvider,
+  EarningsEvent,
+  QuoteBatchResult,
+  SecFilingDocument,
+  SecFilingItem,
+} from "../../../types/data-provider";
+import type {
+  AnalystResearchData,
+  CorporateActionsData,
+  HolderData,
+  OptionsChain,
+  PricePoint,
+  Quote,
+  QuoteMetadata,
+} from "../../../types/financials";
+import type { NewsCapability } from "../../../capabilities/types";
+import { setHttpFetchTransport } from "../../../utils/http-transport";
+import {
+  createProxyResponse,
+  toRequestEnvelope,
+  type HttpProxyResponseEnvelope,
+} from "../../../utils/http-proxy-response";
+import type { AppState } from "../../../core/state/app/state";
+import { canonicalTickerKey, parsePublicTickerKey } from "../../../utils/exchanges";
+import { valuationCache } from "../../../plugins/builtin/market-valuation/cache";
+import { statsCache } from "../../../plugins/builtin/econ-statistics/cache";
+import { apiClient, setCloudApiFetchTransport } from "../../../api-client";
+import { createGloomberbCloudCapabilities, createGloomberbCloudProvider } from "../../../sources/gloomberb-cloud";
+import { logFailure } from "../../../utils/log-failure";
+
+declare global {
+  interface Window {
+    __GLOOM_CLI_SHOT_PAYLOAD__?: DesktopPaneShotPayload;
+    __GLOOM_CLI_SHOT_READY__?: boolean;
+    __GLOOM_CLI_SHOT_PENDING__?: number;
+    __GLOOM_CLI_SHOT_ERROR__?: string;
+    __GLOOM_CLI_SHOT_SEMANTIC_UI__?: RemoteUiNodeSnapshot[];
+    /** Redraws the pane this many cells tall and waits for it to settle again: a capture growing to fit its rows. */
+    __GLOOM_CLI_SHOT_RESIZE__?: (heightCells: number) => void;
+  }
+}
+
+// Effects that request pane data start after the first paint. Waiting only two
+// frames can capture the shell before those requests register, leaving a
+// loading chart or stale performance table in an otherwise valid PNG.
+const SHOT_READY_STABLE_FRAMES = 10;
+// Loading is detected from an explicit marker rendered by Spinner and
+// PaneStatusBody. Matching on body text instead made any pane whose real
+// content contains the word "loading" (a changelog release note, a news
+// headline) wait forever and time out.
+const SHOT_LOADING_SELECTOR = "[data-gloom-status=\"loading\"]";
+const TRACKED_RESPONSE_METHODS = new Set<PropertyKey>([
+  "arrayBuffer",
+  "blob",
+  "formData",
+  "json",
+  "text",
+]);
+
+/**
+ * The page's own address, read once before anything can change it: the
+ * server answers only inside the secret folder the page opened at.
+ */
+const SHOT_PAGE_URL = window.location.href;
+
+let pendingShotWork = 0;
+let didInstallShotFetchTracker = false;
+const rendererHost: RendererHost = {
+  requestExit() {},
+  async openExternal() {},
+  async copyText() {},
+  async readText() {
+    return "";
+  },
+  notify() {},
+};
+
+function normalizeSymbol(value: string): string {
+  return value.trim().replace(/^\$/, "").toUpperCase();
+}
+
+function updatePendingShotWork(next: number): void {
+  pendingShotWork = Math.max(0, next);
+  window.__GLOOM_CLI_SHOT_PENDING__ = pendingShotWork;
+}
+
+function trackShotWork<T>(promise: Promise<T>): Promise<T> {
+  updatePendingShotWork(pendingShotWork + 1);
+  return promise.finally(() => updatePendingShotWork(pendingShotWork - 1));
+}
+
+function wrapTrackedResponse(response: Response): Response {
+  return new Proxy(response, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (!TRACKED_RESPONSE_METHODS.has(property)) return value.bind(target);
+      return (...args: unknown[]) => trackShotWork(Promise.resolve(value.apply(target, args)));
+    },
+  });
+}
+
+function installShotFetchTracker(): void {
+  if (didInstallShotFetchTracker) return;
+  didInstallShotFetchTracker = true;
+  updatePendingShotWork(0);
+  const fetchOriginal = window.fetch.bind(window);
+  window.fetch = ((...args: Parameters<typeof fetch>) => (
+    trackShotWork(fetchOriginal(...args)).then(wrapTrackedResponse)
+  )) as typeof fetch;
+}
+
+/** Sends a read over the socket; null once the socket has closed. */
+type ShotApiSocketSend = (call: Omit<ShotApiSocketCall, "id">, signal: AbortSignal | null | undefined) => Promise<Response> | null;
+
+/**
+ * Cloud API reads over one socket to the Bun server, answered as each lands.
+ * A page's fetches share six connections to its origin, so a board's seventy
+ * contract histories and terms waited on each other for seconds. Null when
+ * the socket does not open; the page's fetch carries the reads then, and
+ * once the socket closes.
+ */
+function openShotApiSocket(): Promise<ShotApiSocketSend | null> {
+  return new Promise((resolve) => {
+    const pending = new Map<number, (reply: ShotApiSocketReply | null) => void>();
+    let nextId = 1;
+    let open = false;
+    const url = shotRouteUrl(SHOT_API_SOCKET_PATH, SHOT_PAGE_URL);
+    url.protocol = "ws:";
+    const socket = new WebSocket(url);
+    socket.addEventListener("message", (event) => {
+      let reply: ShotApiSocketReply;
+      try {
+        reply = JSON.parse(String(event.data)) as ShotApiSocketReply;
+      } catch {
+        // Intentional ignore: every reply the server sends is JSON; anything else answers no call.
+        return;
+      }
+      pending.get(reply.id)?.(reply);
+      pending.delete(reply.id);
+    });
+    socket.addEventListener("close", () => {
+      open = false;
+      for (const settle of pending.values()) settle(null);
+      pending.clear();
+      resolve(null);
+    });
+    socket.addEventListener("open", () => {
+      open = true;
+      resolve((call, signal) => !open ? null : new Promise<Response>((answer, fail) => {
+        const aborted = () => fail(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+        if (signal?.aborted) return aborted();
+        const id = nextId++;
+        const onAbort = () => {
+          pending.delete(id);
+          aborted();
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        pending.set(id, (reply) => {
+          signal?.removeEventListener("abort", onAbort);
+          // A socket that closed mid-read is a request that never got an answer, as a dropped connection is to fetch.
+          if (!reply) return fail(new TypeError("Failed to fetch"));
+          if ("error" in reply) return fail(new TypeError(reply.error));
+          const bytes = Uint8Array.from(atob(reply.body), (char) => char.charCodeAt(0));
+          const empty = bytes.length === 0 || reply.status === 204 || reply.status === 304;
+          answer(new Response(empty ? null : bytes, { status: reply.status, statusText: reply.statusText, headers: reply.headers }));
+        });
+        socket.send(JSON.stringify({ id, ...call } satisfies ShotApiSocketCall));
+      }));
+    }, { once: true });
+  });
+}
+
+function installShotCloudApiTransport(): void {
+  apiClient.setCookieSessionMode(true);
+  let socket: Promise<ShotApiSocketSend | null> | null = null;
+  setCloudApiFetchTransport((url, init = {}) => {
+    const upstream = new URL(url);
+    const proxyUrl = shotRouteUrl(`${SHOT_API_PROXY_PREFIX}${upstream.pathname}`, SHOT_PAGE_URL);
+    proxyUrl.search = upstream.search;
+    const headers = new Headers(init.headers);
+    // Bun owns the real session cookie. The browser only talks to the local
+    // same-origin proxy and never receives or serializes the credential.
+    headers.delete("Cookie");
+    headers.delete("Origin");
+    const viaFetch = () => window.fetch(proxyUrl, {
+      ...init,
+      headers,
+      credentials: "same-origin",
+    });
+    if ((init.method ?? "GET").toUpperCase() !== "GET" || init.body != null) return viaFetch();
+    return trackShotWork((async () => {
+      socket ??= openShotApiSocket();
+      const send = await socket;
+      return await send?.({ path: `${upstream.pathname}${upstream.search}`, headers: [...headers] }, init.signal) ?? await viaFetch();
+    })());
+  });
+}
+
+/**
+ * External plugins can request third-party data through httpFetch. The preview
+ * page sends those requests through its local Bun server, matching the desktop
+ * renderer's native HTTP bridge and preserving upstream response cookies.
+ */
+function installShotHttpFetchTransport(): void {
+  setHttpFetchTransport(async (url, init) => {
+    const response = await window.fetch(shotRouteUrl(SHOT_HTTP_BRIDGE_PATH, SHOT_PAGE_URL), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(await toRequestEnvelope(url, init)),
+    });
+    const result = await response.json() as { ok: boolean; error?: string; data?: HttpProxyResponseEnvelope };
+    if (!result.ok || !result.data) throw new Error(result.error ?? `Request failed: ${url}`);
+    return createProxyResponse(result.data);
+  });
+}
+
+async function restoreShotCloudSession(): Promise<void> {
+  await apiClient.getSession().catch(logFailure("desktop-pane-shot", "Could not restore the session for a pane screenshot", null));
+}
+
+/**
+ * Runs an asset-data request in the Bun process so the page sees exactly what
+ * `gloom fn` sees. The page can only reach the cloud API on its own, and
+ * the cloud is one source among several: analyst rating price targets and part
+ * of the corporate action history come from providers the router merges in.
+ */
+async function requestShotMarketData<T>(operation: string, args: unknown[], signal?: AbortSignal): Promise<T> {
+  const response = await window.fetch(shotRouteUrl(SHOT_MARKET_BRIDGE_PATH, SHOT_PAGE_URL), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operation, args }),
+    // A board that stops waiting for a slow batch drops it, so the capture is not held for it.
+    ...(signal ? { signal } : {}),
+  });
+  const result = await response.json() as { ok: boolean; data?: T; error?: string };
+  if (!result.ok) throw new Error(result.error ?? `Screenshot data request failed: ${operation}`);
+  return result.data as T;
+}
+
+/** JSON has no Date, so every bridged date arrives as a string. */
+function reviveDate(value: unknown): Date | undefined {
+  if (value instanceof Date) return value;
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function reviveSecFilings(filings: SecFilingItem[]): SecFilingItem[] {
+  return filings.map((filing) => ({
+    ...filing,
+    filingDate: reviveDate(filing.filingDate) ?? new Date(0),
+    ...(filing.acceptedAt ? { acceptedAt: reviveDate(filing.acceptedAt) } : {}),
+  }));
+}
+
+function revivePricePoints(points: PricePoint[]): PricePoint[] {
+  return points.map((point) => ({ ...point, date: reviveDate(point.date) ?? new Date(0) }));
+}
+
+function reviveEarningsEvents(events: EarningsEvent[]): EarningsEvent[] {
+  return events.map((event) => ({
+    ...event,
+    earningsDate: reviveDate(event.earningsDate) ?? new Date(0),
+    ...(event.earningsCallDate ? { earningsCallDate: reviveDate(event.earningsCallDate) ?? null } : {}),
+  }));
+}
+
+function isShotLoadingTextVisible(): boolean {
+  return document.querySelector(SHOT_LOADING_SELECTOR) !== null;
+}
+
+/**
+ * A WebGL surface still being drawn: its first frame is not on the canvas, or
+ * a refreshed mesh is mid-morph. A frame with no mesh counts as drawn, so an
+ * empty sheet fails the capture's checks instead of holding it until timeout.
+ */
+function hasUndrawnSurface(): boolean {
+  return document.querySelector(
+    '[data-gloom-surface-renderer="webgl"]:not([data-gloom-surface-state="drawn"]):not([data-gloom-surface-state="blank"])',
+  ) !== null;
+}
+
+/** A chart pane holds the capture by publishing `ready: false` on its chart-data node. */
+function hasUnresolvedChartData(): boolean {
+  return (window.__GLOOM_CLI_SHOT_SEMANTIC_UI__ ?? []).some((node) => (
+    node.role === "chart-data" && node.metadata?.ready === false
+  ));
+}
+
+function waitForShotReadiness(): () => void {
+  let cancelled = false;
+  let mutationVersion = 0;
+  let lastSeenMutationVersion = 0;
+  let stableFrames = 0;
+  const observer = new MutationObserver((records) => {
+    if (changedThePage(records)) mutationVersion += 1;
+  });
+  observer.observe(document.body, SHOT_MUTATION_OPTIONS);
+
+  const check = () => {
+    if (cancelled || window.__GLOOM_CLI_SHOT_READY__) return;
+    const changedSinceLastFrame = mutationVersion !== lastSeenMutationVersion;
+    lastSeenMutationVersion = mutationVersion;
+    if (
+      pendingShotWork === 0
+      && !isShotLoadingTextVisible()
+      && !hasUnresolvedChartData()
+      && !hasUndrawnSurface()
+      && !changedSinceLastFrame
+    ) {
+      stableFrames += 1;
+    } else {
+      stableFrames = 0;
+    }
+
+    if (stableFrames >= SHOT_READY_STABLE_FRAMES) {
+      observer.disconnect();
+      window.__GLOOM_CLI_SHOT_READY__ = true;
+      return;
+    }
+    requestAnimationFrame(check);
+  };
+
+  requestAnimationFrame(check);
+  return () => {
+    cancelled = true;
+    observer.disconnect();
+  };
+}
+
+function createShotDataProvider(payload: DesktopPaneShotPayload): DataProvider {
+  const cloudProvider = createGloomberbCloudProvider();
+  const bridge: Partial<DataProvider> = {
+    id: payload.marketDataProviderId ?? cloudProvider.id,
+    getQuote: (symbol, exchange, context) => requestShotMarketData<Quote>("getQuote", [symbol, exchange, context]),
+    getQuoteMetadata: (symbol, exchange, context) => requestShotMarketData<QuoteMetadata | null>("getQuoteMetadata", [symbol, exchange, context]),
+    getQuotesBatch: (targets, options) => {
+      const { signal, ...sent } = options ?? {};
+      return requestShotMarketData<QuoteBatchResult[]>("getQuotesBatch", [targets, sent], signal)
+        .catch(() => targets.map((target) => ({ target, quote: null })));
+    },
+    getOptionsChain: (symbol, exchange, expirationDate, context) => requestShotMarketData<OptionsChain>("getOptionsChain", [symbol, exchange, expirationDate, context]),
+    getPriceHistory: (symbol, exchange, range, context) => requestShotMarketData<PricePoint[]>("getPriceHistory", [symbol, exchange, range, context])
+      .then(revivePricePoints).catch(logFailure("desktop-pane-shot", "Could not load price history for a pane screenshot", [])),
+    getPriceHistoryForResolution: (symbol, exchange, range, resolution, context) => requestShotMarketData<PricePoint[]>(
+      "getPriceHistoryForResolution", [symbol, exchange, range, resolution, context],
+    ).then(revivePricePoints),
+    async getExchangeRate(fromCurrency) {
+      // Only identity FX is known offline; don't invent a parity rate.
+      if (normalizeSymbol(fromCurrency) === normalizeSymbol(payload.config.baseCurrency)) return 1;
+      throw new Error(`No screenshot exchange rate available for ${fromCurrency}.`);
+    },
+    async search(query) {
+      const normalized = normalizeSymbol(query);
+      return payload.tickers
+        .filter((ticker) => ticker.metadata.ticker.includes(normalized) || (ticker.metadata.name ?? "").toUpperCase().includes(normalized))
+        .map((ticker) => ({
+          providerId: "cli-shot",
+          symbol: ticker.metadata.ticker,
+          name: ticker.metadata.name ?? ticker.metadata.ticker,
+          exchange: ticker.metadata.exchange ?? "",
+          currency: ticker.metadata.currency,
+          type: "equity",
+        }));
+    },
+    getArticleSummary: async () => null,
+    getAnalystResearch: (symbol, exchange) => requestShotMarketData<AnalystResearchData>("getAnalystResearch", [symbol, exchange]),
+    getCorporateActions: (symbol, exchange) => requestShotMarketData<CorporateActionsData>("getCorporateActions", [symbol, exchange]),
+    getHolders: (symbol, exchange) => requestShotMarketData<HolderData>("getHolders", [symbol, exchange]),
+    getSecFilings: (symbol, count, exchange) => requestShotMarketData<SecFilingItem[]>("getSecFilings", [symbol, count, exchange]).then(reviveSecFilings),
+    // The page holds no session credential, so verified cloud reads such as
+    // Form 4 content would fail as signed out if the page made them itself.
+    getSecFilingDocuments: (filing) => requestShotMarketData<SecFilingDocument[]>("getSecFilingDocuments", [filing]),
+    getSecFilingContent: (filing) => requestShotMarketData<string | null>("getSecFilingContent", [filing]),
+    getEarningsCalendar: (symbols) => requestShotMarketData<EarningsEvent[]>("getEarningsCalendar", [symbols]).then(reviveEarningsEvents),
+    subscribeQuotes: () => () => {},
+  };
+  const fallback = new Proxy(cloudProvider, {
+    get(target, property) {
+      const value = Reflect.get(bridge, property) ?? Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const provider = createSnapshotDataProvider(payload, fallback);
+  return new Proxy(provider, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const result = value.apply(target, args);
+        return result instanceof Promise ? trackShotWork(result) : result;
+      };
+    },
+  });
+}
+
+function createShotAppServices(payload: DesktopPaneShotPayload, externalPlugins: LoadedExternalPlugin[]) {
+  const dataProvider = createShotDataProvider(payload);
+  return createAppRuntime({
+    config: payload.config,
+    plugins: getLoadablePlugins(externalPlugins),
+    dataProvider,
+    persistence: new JsonPersistence(),
+    tickerRepository: new JsonTickerRepository(undefined, payload.tickers),
+    registryOptions: {
+      enableCapabilityHandlers: false,
+      connectionHealth: createCliPaneShotConnectionHealth(),
+    },
+    configure({ pluginRegistry, marketData, newsService }) {
+      pluginRegistry.bindHost({ getPaneRuntimeState: (paneId) => payload.paneState[paneId] ?? null });
+      // Capability handlers are off, so nothing registers a news source and
+      // every news pane rendered its empty state. The desktop view registers
+      // the cloud feed by hand for the same reason; the proxied session makes
+      // it the same feed the signed-in app shows.
+      for (const capability of createGloomberbCloudCapabilities()) {
+        if (capability.kind === "news") newsService.register(capability as NewsCapability);
+      }
+      marketData.primeCachedFinancials(payload.tickers.flatMap((ticker) => {
+        const instrument = instrumentFromTicker(ticker, ticker.metadata.ticker);
+        const instrumentKey = instrument
+          ? canonicalTickerKey(instrument.symbol, instrument.exchange)
+          : normalizeSymbol(ticker.metadata.ticker);
+        const financials = payload.financials.find(([key]) => {
+          const candidate = parsePublicTickerKey(key);
+          return canonicalTickerKey(candidate.symbol, candidate.exchange) === instrumentKey;
+        })?.[1];
+        return instrument && financials ? [{ instrument, financials }] : [];
+      }));
+    },
+    // One failing plugin must not cost the screenshot every other pane.
+    onPluginError: (error, plugin) => console.error(`[shot] Plugin ${plugin.id} failed to register:`, error),
+  });
+}
+
+function HydratePayload({
+  payload,
+  children,
+}: {
+  payload: DesktopPaneShotPayload;
+  children: ReactNode;
+}) {
+  const dispatch = useAppDispatch();
+
+  useEffect(() => {
+    dispatch({
+      type: "SET_TICKERS",
+      tickers: new Map(payload.tickers.map((ticker) => [ticker.metadata.ticker, ticker])),
+    });
+    dispatch({ type: "HYDRATE_FINANCIALS", financials: new Map(payload.financials) });
+    for (const [instanceId, accounts] of Object.entries(payload.brokerAccounts ?? {})) {
+      dispatch({ type: "SET_BROKER_ACCOUNTS", instanceId, accounts });
+    }
+    dispatch({ type: "SET_INITIALIZED" });
+
+    return waitForShotReadiness();
+  }, [dispatch, payload]);
+
+  return children;
+}
+
+function CaptureShotSemanticUi() {
+  const registry = useRemoteUiRegistry();
+
+  useEffect(() => {
+    let frame = 0;
+    const capture = () => {
+      window.__GLOOM_CLI_SHOT_SEMANTIC_UI__ = registry?.snapshot() ?? [];
+      frame = requestAnimationFrame(capture);
+    };
+    capture();
+    return () => cancelAnimationFrame(frame);
+  }, [registry]);
+
+  return null;
+}
+
+function ShotPane({ payload, registry }: { payload: DesktopPaneShotPayload; registry: PluginRegistry }) {
+  const instance = payload.config.layout.instances.find((entry) => entry.instanceId === payload.paneId);
+  if (!instance) throw new Error(`Pane instance ${payload.paneId} is missing from the screenshot layout.`);
+
+  const pane = registry.panes.get(instance.paneId);
+  if (!pane) throw new Error(`Pane ${instance.paneId} is not registered in the desktop renderer.`);
+
+  // The registry already bound its runtime to this pane component.
+  const titleState = {
+    config: payload.config,
+    paneState: payload.paneState,
+  } as Pick<AppState, "config" | "paneState">;
+  const title = getPaneDisplayTitle(titleState, instance, pane, registry.panes);
+  const width = payload.widthCells;
+  const [height, setHeight] = useState(payload.heightCells);
+  useEffect(() => {
+    let cancelReadiness: (() => void) | null = null;
+    window.__GLOOM_CLI_SHOT_RESIZE__ = (heightCells) => {
+      window.__GLOOM_CLI_SHOT_READY__ = false;
+      setHeight(heightCells);
+      cancelReadiness?.();
+      cancelReadiness = waitForShotReadiness();
+    };
+    return () => {
+      cancelReadiness?.();
+      delete window.__GLOOM_CLI_SHOT_RESIZE__;
+    };
+  }, []);
+  // PORT keeps what its basket covers, so a capture never reads as the whole account.
+  return (
+    <PaneShotFrame paneId={instance.instanceId} title={title} width={width} height={height} statusLine={payload.statusLine === true} preserveStatus={["time-sales", "gpu", "hiring", "apps", "catalysts", "litigation", "perps", "members", "analytics"].includes(pane.id)}>
+      {(bodyFrame) => <PaneContent
+        component={pane.component}
+        paneId={instance.instanceId}
+        paneType={instance.paneId}
+        title={title}
+        focused
+        width={bodyFrame.width ?? 1}
+        height={bodyFrame.height ?? 1}
+      />}
+    </PaneShotFrame>
+  );
+}
+
+async function render() {
+  const payload = decodeRpcValue<DesktopPaneShotPayload | undefined>(window.__GLOOM_CLI_SHOT_PAYLOAD__);
+  if (!payload) throw new Error("Missing CLI pane screenshot payload.");
+  const rootElement = document.getElementById("root");
+  if (!rootElement) throw new Error("Missing root element.");
+  installShotFetchTracker();
+  installShotCloudApiTransport();
+  installShotHttpFetchTransport();
+  valuationCache.hydrate(payload.valuationSeries ?? []);
+  statsCache.hydrate(payload.statSeries ?? []);
+  // This page is the desktop view's renderer, so installed plugins run here
+  // the way they do in the app: compiled by the Bun process, evaluated from
+  // the payload. A broken plugin is reported and skipped, not fatal.
+  setCurrentPluginTarget("desktop");
+  const externalPlugins = await loadDesktopExternalPlugins(payload.externalPlugins ?? []);
+  const services = createShotAppServices(payload, externalPlugins);
+  window.addEventListener("pagehide", () => services.destroy(), { once: true });
+  // Panes contributed from an async setup() only exist once every plugin has
+  // finished registering, so the tree cannot mount before that resolves.
+  await services.ready;
+  // Plugin setup hydrates its in-memory persistence and may reset apiClient.
+  // Restore the proxied cloud session only after registration is complete.
+  await restoreShotCloudSession();
+
+  const tapeClient = createSnapshotTapeClient(payload.tapeSnapshots ?? [],
+    (symbol, exchange) => requestShotMarketData<TapeSnapshot>("getCloudTape", [symbol, exchange]));
+  const scannerClient = createSnapshotScannerClient(payload.scannerSnapshots ?? []);
+  createRoot(rootElement).render(
+    <TapeClientContext.Provider value={tapeClient}>
+      <ScannerClientContext.Provider value={scannerClient}>
+        <RemoteUiRegistryProvider>
+          <CaptureShotSemanticUi />
+          <DomHostProviders ui={webUiHost} renderer={rendererHost}>
+            <AppProvider config={payload.config} desktopSnapshot={{
+              config: payload.config,
+              paneState: payload.paneState,
+              focusedPaneId: payload.paneId,
+              statusBarVisible: false,
+            }}>
+              <HydratePayload payload={payload}>
+                <ChartSnapshotContext.Provider value={payload.chartModel ?? null}>
+                  <ShotPane payload={payload} registry={services.pluginRegistry} />
+                </ChartSnapshotContext.Provider>
+              </HydratePayload>
+            </AppProvider>
+          </DomHostProviders>
+        </RemoteUiRegistryProvider>
+      </ScannerClientContext.Provider>
+    </TapeClientContext.Provider>,
+  );
+}
+
+render().catch((error) => {
+  window.__GLOOM_CLI_SHOT_ERROR__ = error instanceof Error ? error.stack ?? error.message : String(error);
+  throw error;
+});

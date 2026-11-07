@@ -1,0 +1,211 @@
+import { useEffect, useRef, useState } from "react";
+import { getPublishedUsEquitySession } from "../../../../market-data/published-us-sessions";
+import { usePaneVisible } from "../../../../state/app/activity";
+import { zonedWallClockToUtcMs } from "../../../../utils/zoned-date-time";
+
+/**
+ * Listed US options trade only the regular equity session: there is no
+ * extended-hours options market, so a chain or surface can only move between
+ * the open and the close (13:00 on published early closes).
+ */
+export interface OptionsSessionState {
+  open: boolean;
+  /** The next open or close, used to re-evaluate exactly at the boundary. */
+  nextChangeAt: number | null;
+}
+
+const NEW_YORK = "America/New_York";
+const DAY_MS = 86_400_000;
+const NEW_YORK_DATE = new Intl.DateTimeFormat("en-CA", { timeZone: NEW_YORK, year: "numeric", month: "2-digit", day: "2-digit" });
+/** Timers longer than this re-check instead of trusting a multi-day wait. */
+const MAX_BOUNDARY_WAIT_MS = 6 * 60 * 60_000;
+
+function newYorkDate(time: number): string {
+  return NEW_YORK_DATE.format(time);
+}
+
+/** Published NYSE hours where covered; outside that range, weekdays 09:30 to 16:00 New York. */
+function regularSession(date: string): { open: number; close: number } | null {
+  const published = getPublishedUsEquitySession("NYSE", date);
+  if (published) return published.kind === "session" ? { open: published.open, close: published.close } : null;
+  const [year, month, day] = date.split("-").map(Number) as [number, number, number];
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  if (weekday === 0 || weekday === 6) return null;
+  return {
+    open: zonedWallClockToUtcMs(NEW_YORK, year, month, day, 9, 30, 0),
+    close: zonedWallClockToUtcMs(NEW_YORK, year, month, day, 16, 0, 0),
+  };
+}
+
+export function usOptionsSession(now: number): OptionsSessionState {
+  if (!Number.isFinite(now)) return { open: false, nextChangeAt: null };
+  const date = newYorkDate(now);
+  const today = regularSession(date);
+  if (today && now >= today.open && now < today.close) return { open: true, nextChangeAt: today.close };
+  if (today && now < today.open) return { open: false, nextChangeAt: today.open };
+  // Calendar-date steps, so a daylight-saving day cannot skip or repeat a date.
+  const midnight = Date.parse(`${date}T00:00:00Z`);
+  for (let offset = 1; offset <= 10; offset += 1) {
+    const next = regularSession(new Date(midnight + offset * DAY_MS).toISOString().slice(0, 10));
+    if (next && next.open > now) return { open: false, nextChangeAt: next.open };
+  }
+  return { open: false, nextChangeAt: null };
+}
+
+/**
+ * Cboe calculates VIX and its sibling indices from SPX options, which trade 15
+ * minutes past the equity close: a day's level settles at 16:15 New York
+ * (13:15 after an early close), not at the 16:00 bell.
+ */
+const INDEX_SETTLEMENT_LAG_MS = 15 * 60_000;
+
+/**
+ * Whether an index level dated `date` (its New York `YYYY-MM-DD`) is that
+ * session's settled close at `now`, and when it settles if not yet. A date
+ * without a session (a weekend, a holiday) has nothing still trading.
+ */
+export function indexCloseSettlement(date: string, now: number): { settled: boolean; settlesAt: number | null } {
+  const session = regularSession(date);
+  const settlesAt = session ? session.close + INDEX_SETTLEMENT_LAG_MS : Number.NaN;
+  return Number.isFinite(settlesAt) ? { settled: now >= settlesAt, settlesAt } : { settled: true, settlesAt: null };
+}
+
+/**
+ * `indexCloseSettlement` for a pane, re-read at the settlement so a label
+ * turns to close without waiting on new data. No date has nothing to settle.
+ */
+export function useIndexCloseSettled(date: string | null | undefined): boolean {
+  const [check, setCheck] = useState(0);
+  const { settled, settlesAt } = date ? indexCloseSettlement(date, Date.now()) : { settled: true, settlesAt: null };
+  useEffect(() => {
+    if (settled || settlesAt == null) return;
+    const wait = Math.min(MAX_BOUNDARY_WAIT_MS, Math.max(1_000, settlesAt - Date.now() + 250));
+    const timer = setTimeout(() => setCheck((value) => value + 1), wait);
+    return () => clearTimeout(timer);
+  }, [settled, settlesAt, check]);
+  return settled;
+}
+
+/**
+ * Whether the US options market is in its regular session. Re-evaluated at the
+ * next open or close while the pane can be seen; a hidden app or a covered
+ * pane keeps its last answer, which is recomputed if its boundary has passed.
+ */
+export function useOptionsSessionOpen(enabled = true): boolean {
+  const visible = usePaneVisible();
+  const [state, setState] = useState(() => usOptionsSession(Date.now()));
+  useEffect(() => {
+    if (!enabled || !visible) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+      const now = Date.now();
+      const next = usOptionsSession(now);
+      setState((current) => current.open === next.open && current.nextChangeAt === next.nextChangeAt ? current : next);
+      const wait = next.nextChangeAt == null ? MAX_BOUNDARY_WAIT_MS
+        : Math.min(MAX_BOUNDARY_WAIT_MS, Math.max(1_000, next.nextChangeAt - now + 250));
+      timer = setTimeout(update, wait);
+    };
+    update();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [enabled, visible]);
+  // An answer from before its own boundary is recomputed rather than trusted.
+  return state.nextChangeAt != null && Date.now() >= state.nextChangeAt ? usOptionsSession(Date.now()).open : state.open;
+}
+
+export interface LiveSessionRefresh {
+  /** The refresh cycle is running, which is what "live" means. */
+  live: boolean;
+  /**
+   * Why the last refresh failed, until one succeeds or the cycle stops. The
+   * data it would have replaced stays on screen, so the pane shows this where
+   * it shows its own failed refreshes.
+   */
+  error: string | null;
+}
+
+function isCancellation(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
+}
+
+/**
+ * Calls `refresh` every `intervalMs` while enabled, the pane can be seen (the
+ * app is visible and the pane is not covered) and the options market is open.
+ * It never fires on mount, since the caller already loads once, nor right
+ * after the caller's own load (`loadedAt`); returning after a hidden or
+ * covered stretch, or reaching the open, more than an interval after the last
+ * data fires straight away. A refresh still in flight is never overlapped by
+ * the next. A refresh that throws or rejects is reported as `error` until the
+ * next one succeeds; a cancelled one (an AbortError) is no failure.
+ */
+export function useLiveSessionRefresh(
+  refresh: () => void | Promise<unknown>,
+  intervalMs: number,
+  enabled: boolean,
+  loadedAt?: number | null,
+): LiveSessionRefresh {
+  const visible = usePaneVisible();
+  const open = useOptionsSessionOpen(enabled);
+  const active = enabled && visible && open;
+  const [error, setError] = useState<string | null>(null);
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  const lastRef = useRef(Date.now());
+  const loadedAtRef = useRef(loadedAt);
+  loadedAtRef.current = loadedAt;
+  useEffect(() => {
+    if (!active) return;
+    let inFlight = false;
+    let cancelled = false;
+    // A load the caller finished itself counts as the latest refresh.
+    if (loadedAtRef.current != null && loadedAtRef.current > lastRef.current) lastRef.current = loadedAtRef.current;
+    const succeeded = () => { if (!cancelled) setError(null); };
+    const failed = (failure: unknown) => {
+      if (cancelled || isCancellation(failure)) return;
+      const message = (failure instanceof Error ? failure.message : String(failure ?? "")).trim();
+      setError(message || "Live refresh failed");
+    };
+    const run = () => {
+      if (inFlight || cancelled) return;
+      lastRef.current = Date.now();
+      let pending: void | Promise<unknown>;
+      try { pending = refreshRef.current(); } catch (failure) {
+        failed(failure);
+        return;
+      }
+      if (pending && typeof (pending as Promise<unknown>).then === "function") {
+        inFlight = true;
+        void (pending as Promise<unknown>).then(succeeded, failed).finally(() => { inFlight = false; });
+      } else succeeded();
+    };
+    if (Date.now() - lastRef.current >= intervalMs) run();
+    const timer = setInterval(run, intervalMs);
+    // A stopped cycle's failure is old news: the pane's own loads take over.
+    return () => { cancelled = true; clearInterval(timer); setError(null); };
+  }, [active, intervalMs]);
+  return { live: active, error: active ? error : null };
+}
+
+/**
+ * The latest value, published at most once per `intervalMs`. The trailing value
+ * is never dropped, and a new `resetKey` (another contract, expiry or ticker)
+ * publishes immediately so a selection change never waits on the throttle.
+ */
+export function useThrottledValue<T>(value: T, intervalMs: number, resetKey?: unknown): T {
+  const [state, setState] = useState(() => ({ value, key: resetKey }));
+  const appliedAtRef = useRef(Date.now());
+  const latestRef = useRef(value);
+  latestRef.current = value;
+  const keyChanged = !Object.is(state.key, resetKey);
+  useEffect(() => {
+    if (Object.is(state.value, value) && !keyChanged) return;
+    const wait = keyChanged ? 0 : appliedAtRef.current + intervalMs - Date.now();
+    const apply = () => {
+      appliedAtRef.current = Date.now();
+      setState({ value: latestRef.current, key: resetKey });
+    };
+    if (wait <= 0) { apply(); return; }
+    const timer = setTimeout(apply, wait);
+    return () => clearTimeout(timer);
+  }, [value, resetKey, intervalMs, keyChanged, state.value]);
+  return keyChanged ? value : state.value;
+}

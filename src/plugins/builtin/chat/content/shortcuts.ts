@@ -1,0 +1,346 @@
+import { useState, type MutableRefObject } from "react";
+import { useShortcut } from "../../../../react/input";
+import type { ScrollBoxRenderable } from "../../../../ui";
+import type { ChatMessage } from "../../../../api-client";
+import { countEscapeTowardClose, keepEscapeFromClosing } from "../../../../utils/double-escape-close";
+import { isPlainKey } from "../../../../utils/keyboard";
+import { createOneShot } from "../../../../utils/one-shot";
+import { scrollToBottom } from "../layout";
+import type { ChatSidebarRow } from "../sidebar-rows";
+import type { ComposerShareLink } from "../pane-links/composer";
+
+export function useChatContentShortcuts({
+  beginEditLatestMessage,
+  beginReplyTo,
+  blurInput,
+  canSend,
+  cancelEditMessage,
+  commandBarOpen,
+  clearReplyTarget,
+  closeProfilePopover,
+  cycleChannel,
+  focusChannelSidebar,
+  focusChatContent,
+  focusComposer,
+  focused,
+  hasOlderMessages,
+  inputFocused,
+  inputValueRef,
+  loadingOlderMessages,
+  messages,
+  mentionMenuOpen,
+  moveMentionSelection,
+  dismissMentionSuggestions,
+  commitMentionSelection,
+  moveMessageSelection,
+  moveSidebarChannelSelection,
+  moveSidebarToEdge,
+  nativePaneChrome,
+  editingMessage,
+  profilePopoverOpen,
+  replyTo,
+  requestOlderMessages,
+  requestOlderMessagesIfNeeded,
+  returnToComposer,
+  retryMessage,
+  removeLastDraftAttachment,
+  draftLinksRef,
+  removeLastDraftLink,
+  scrollRef,
+  selectedIdx,
+  setFollowMessages,
+  setSelectedIdx,
+  setSidebarSectionExpanded,
+  shouldLeaveComposerForSelection,
+  channelListReachable,
+  sidebarCursorRow,
+  sidebarFocusedRef,
+}: {
+  beginEditLatestMessage: (options?: { deferFocus?: boolean }) => boolean;
+  beginReplyTo: (index: number, options?: { deferFocus?: boolean }) => void;
+  blurInput: () => void;
+  canSend: boolean;
+  cancelEditMessage: () => void;
+  commandBarOpen: boolean;
+  clearReplyTarget: () => void;
+  closeProfilePopover: () => void;
+  cycleChannel: (direction: 1 | -1) => boolean;
+  focusChannelSidebar: () => boolean;
+  focusChatContent: () => boolean;
+  focusComposer: () => void;
+  focused: boolean;
+  hasOlderMessages: boolean;
+  inputFocused: boolean;
+  inputValueRef: MutableRefObject<string>;
+  loadingOlderMessages: boolean;
+  messages: ChatMessage[];
+  mentionMenuOpen: boolean;
+  moveMentionSelection: (direction: "up" | "down") => boolean;
+  dismissMentionSuggestions: () => boolean;
+  commitMentionSelection: () => boolean;
+  moveMessageSelection: (direction: "up" | "down") => boolean;
+  moveSidebarChannelSelection: (direction: "up" | "down") => boolean;
+  moveSidebarToEdge: (edge: "first" | "last") => boolean;
+  nativePaneChrome?: boolean;
+  editingMessage: ChatMessage | null;
+  profilePopoverOpen: boolean;
+  replyTo: ChatMessage | null;
+  requestOlderMessages: () => void;
+  requestOlderMessagesIfNeeded: (options?: { firstIsSelected?: boolean }) => void;
+  returnToComposer: () => void;
+  /** Sends a failed message again. */
+  retryMessage: (index: number) => void;
+  /** Drops the last image waiting in the composer; false when there is none. */
+  removeLastDraftAttachment: () => boolean;
+  /** The share links waiting as chips above the field: with any, the composer is not empty. */
+  draftLinksRef: MutableRefObject<ComposerShareLink[]>;
+  /** Drops the last of them; false when there is none. */
+  removeLastDraftLink: () => boolean;
+  scrollRef: MutableRefObject<ScrollBoxRenderable | null>;
+  selectedIdx: number;
+  setFollowMessages: (followMessages: boolean) => void;
+  setSelectedIdx: (selectedIdx: number) => void;
+  setSidebarSectionExpanded: (expanded: boolean | "toggle") => boolean;
+  shouldLeaveComposerForSelection: (direction: "up" | "down") => boolean;
+  /** The channel list is drawn, or in the narrow stack one step back. */
+  channelListReachable: boolean;
+  sidebarCursorRow: ChatSidebarRow | null;
+  sidebarFocusedRef: MutableRefObject<boolean>;
+}) {
+  // A terminal says a key is held only where its keyboard protocol can;
+  // elsewhere a held Backspace is a stream of presses, told apart by the gaps.
+  const [backspaceShot] = useState(createOneShot);
+
+  useShortcut((event) => {
+    if (!focused || commandBarOpen || !inputFocused || !mentionMenuOpen) return;
+    if (
+      event.name !== "tab"
+      || event.ctrl
+      || event.meta
+      || event.super
+      || event.alt
+    ) {
+      return;
+    }
+
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    commitMentionSelection();
+  }, { allowEditable: true, phase: "before" });
+
+  useShortcut((event) => {
+    if (!focused || commandBarOpen) return;
+    const isEnterKey = event.name === "return" || event.name === "enter";
+
+    if (sidebarFocusedRef.current && channelListReachable) {
+      // A section header folds and unfolds in place; a channel opens.
+      const headerRow = sidebarCursorRow && sidebarCursorRow.kind !== "channel" ? sidebarCursorRow : null;
+      if (isEnterKey) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        if (!setSidebarSectionExpanded("toggle")) focusChatContent();
+        return;
+      }
+
+      if (isPlainKey(event, "left")) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        setSidebarSectionExpanded(false);
+        return;
+      }
+
+      if (isPlainKey(event, "right")) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        if (headerRow && !headerRow.expanded) setSidebarSectionExpanded(true);
+        else focusChatContent();
+        return;
+      }
+
+      if (isPlainKey(event, "up", "down", "j", "k")) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        moveSidebarChannelSelection(event.name === "up" || event.name === "k" ? "up" : "down");
+        return;
+      }
+
+      if (isPlainKey(event, "home", "end")) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        moveSidebarToEdge(event.name === "home" ? "first" : "last");
+        return;
+      }
+    }
+
+    if (
+      isPlainKey(event, "left") &&
+      channelListReachable &&
+      (!inputFocused || inputValueRef.current.length === 0) &&
+      focusChannelSidebar()
+    ) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      return;
+    }
+
+    if (inputFocused) {
+      if (mentionMenuOpen) {
+        if (event.name === "escape") {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          dismissMentionSuggestions();
+          return;
+        }
+
+        if (isPlainKey(event, "up", "down")) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          if (event.name === "up" || event.name === "down") {
+            moveMentionSelection(event.name);
+          }
+          return;
+        }
+      }
+
+      if (event.name === "escape") {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        if (editingMessage) {
+          cancelEditMessage();
+        } else if (replyTo) {
+          clearReplyTarget();
+        } else {
+          // Leaving an empty composer is the first half of a double-Esc close;
+          // leaving a draft is not, so a quick Esc Esc never closes over it.
+          if (inputValueRef.current.trim().length === 0 && draftLinksRef.current.length === 0) countEscapeTowardClose(event);
+          blurInput();
+        }
+        return;
+      }
+
+      // A pasted link is one chip, and the terminal's image rows have no
+      // focus of their own: Backspace in an empty composer takes the nearest
+      // one back out, the links right above the field first. One for each
+      // new press: a Backspace held to clear the text, or held on after one
+      // went, takes out nothing more. Every press counts toward the gap.
+      if (isPlainKey(event, "backspace")) {
+        const freshPress = nativePaneChrome ? event.repeat !== true : !backspaceShot.refuses({ repeat: event.repeat });
+        if (freshPress && !nativePaneChrome) backspaceShot.end();
+        if (
+          freshPress
+          && inputValueRef.current.length === 0
+          && (removeLastDraftLink() || (!nativePaneChrome && removeLastDraftAttachment()))
+        ) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          return;
+        }
+      }
+
+      const verticalDirection = event.name === "up" || event.name === "down" ? event.name : null;
+      if (
+        verticalDirection === "up"
+        && canSend
+        && isPlainKey(event, "up")
+        && inputValueRef.current.trim().length === 0
+        && draftLinksRef.current.length === 0
+        && beginEditLatestMessage({ deferFocus: true })
+      ) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        return;
+      }
+      if (verticalDirection && isPlainKey(event, "up", "down") && shouldLeaveComposerForSelection(verticalDirection)) {
+        const moved = moveMessageSelection(verticalDirection);
+        if (moved) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          blurInput();
+          return;
+        }
+      }
+
+      return;
+    }
+
+    if (isPlainKey(event, "]") && cycleChannel(1)) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      return;
+    }
+    if (isPlainKey(event, "[") && cycleChannel(-1)) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      return;
+    }
+
+    if (canSend && isEnterKey && selectedIdx >= 0 && selectedIdx < messages.length) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      // A failed send of yours is sent again; any other message gets a reply.
+      if (messages[selectedIdx]?.clientStatus === "failed") retryMessage(selectedIdx);
+      else beginReplyTo(selectedIdx, { deferFocus: true });
+      return;
+    }
+
+    if ((isEnterKey || isPlainKey(event, "i")) && canSend) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      queueMicrotask(() => focusComposer());
+      return;
+    }
+
+    // Clearing a selection counts toward the pane's double-Esc close; closing
+    // the profile popover does not.
+    if (event.name === "escape" && (profilePopoverOpen || selectedIdx >= 0)) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      if (profilePopoverOpen) {
+        keepEscapeFromClosing(event);
+        closeProfilePopover();
+        return;
+      }
+      setSelectedIdx(-1);
+      setFollowMessages(true);
+      return;
+    }
+
+    if (isPlainKey(event, "j", "down")) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      if (selectedIdx === messages.length - 1) {
+        returnToComposer();
+        return;
+      }
+      moveMessageSelection("down");
+      return;
+    }
+    if (isPlainKey(event, "k", "up")) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      if (selectedIdx === 0 && hasOlderMessages && !loadingOlderMessages) {
+        requestOlderMessages();
+        return;
+      }
+      moveMessageSelection("up");
+      return;
+    }
+
+    if (isPlainKey(event, "g")) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      setSelectedIdx(0);
+      setFollowMessages(false);
+      scrollRef.current?.scrollTo(0);
+      queueMicrotask(() => requestOlderMessagesIfNeeded({ firstIsSelected: true }));
+      return;
+    }
+    if (event.name === "g" && event.shift && !event.ctrl && !event.meta && !event.super && !event.alt) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      setSelectedIdx(messages.length - 1);
+      setFollowMessages(true);
+      queueMicrotask(() => scrollToBottom(scrollRef.current, nativePaneChrome));
+    }
+  }, { allowEditable: true });
+}

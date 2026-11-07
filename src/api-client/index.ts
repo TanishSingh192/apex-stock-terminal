@@ -1,0 +1,1122 @@
+import { logFailure } from "../utils/log-failure";
+import {
+  isMarketplaceLayoutId,
+  parseMarketplaceLayoutEntry,
+  parseMarketplaceLayoutList,
+  type LayoutMarketplaceEntry,
+  type LayoutMarketplacePayload,
+} from "../shares/portable-layout";
+import {
+  type CloudLayoutEntry,
+  type LayoutRequirement,
+  LayoutRevisionConflictError,
+  parseCloudLayoutEntry,
+  parseCloudLayoutList,
+} from "../layout-marketplace/cloud";
+import { SyncRevisionConflictError, type SyncSnapshot } from "../sync/types";
+import { withDeadline } from "../utils/async-deadline";
+import { CloudASKGApi } from "./askg";
+import { CloudAuthApi } from "./auth";
+import { CloudChatApi } from "./chat";
+import { CloudDataApi } from "./data";
+import { ApiRequestError } from "./errors";
+import { CloudApiRequestTransport, putWithRevision } from "./request";
+import { CloudApiSocket } from "./socket";
+import { CloudCollectionsApi } from "./collections";
+import { CloudFeedbackApi } from "./feedback";
+import { CloudRoadmapApi } from "./roadmap";
+import { CloudNotesApi } from "./notes";
+import { CloudTeamsApi } from "./teams";
+import { CloudTelemetryApi } from "./telemetry";
+import { CloudThesesApi } from "./theses";
+import { CloudViewsApi } from "./views";
+import type { CommandSearchReport } from "./telemetry";
+import type {
+  AssistCommandDescriptor,
+  AssistCommandResponse,
+  AuthUser,
+  CloudSyncPushResponse,
+  CloudSyncSnapshotResponse,
+  PersistedAuthUser
+} from "./types";
+
+export { setCloudApiFetchTransport, setCloudApiUploadTransport } from "./request";
+export type { ChatAttachmentUpload } from "./chat";
+export type { ChatPaneLink } from "./chat-pane-link";
+export { NoteConflictError } from "./notes";
+export { ThesisConflictError, ThesisGoalpostError } from "./theses";
+export { TeamRevisionConflictError } from "./views";
+export type * from "./types";
+export type {
+  CommandSearchChoice,
+  CommandSearchOutcome,
+  CrashReportError,
+  CrashReportKind,
+  CrashReportSurface,
+  CrashReportsPayload,
+  FunctionUsageCount,
+  UpdateFailureReport,
+  UsageCountsPayload,
+  UsageCountsSurface,
+} from "./telemetry";
+
+/** Server-side caps for `/assist/command`; enforced here so a 422 is never sent. */
+const ASSIST_QUERY_MAX_LENGTH = 200;
+const ASSIST_COMMAND_LIMIT = 150;
+/** The futures curve's root list is the longest a command sends: 76. */
+export const ASSIST_ARG_OPTION_LIMIT = 128;
+const ASSIST_ARG_OPTION_VALUE_MAX_LENGTH = 40;
+const ASSIST_ARG_OPTION_LABEL_MAX_LENGTH = 60;
+const ASSIST_REQUEST_TIMEOUT_MS = 6_000;
+const SESSION_REVALIDATION_INITIAL_MS = 1_000;
+const SESSION_REVALIDATION_MAX_MS = 30_000;
+
+/**
+ * Fits a command's argument values inside the server caps. The value is what
+ * the bar runs, so one that is too long is dropped rather than cut; the label
+ * only describes it and is truncated. A list still over the cap is left out
+ * whole: the assistant would read a partial list as every value there is.
+ */
+function capAssistArgOptions(command: AssistCommandDescriptor): AssistCommandDescriptor {
+  if (!command.arg?.options) return command;
+  const { options, ...arg } = command.arg;
+  const capped = options
+    .filter(({ value }) => value.length > 0 && value.length <= ASSIST_ARG_OPTION_VALUE_MAX_LENGTH)
+    .map(({ value, label }) => ({ value, label: label.slice(0, ASSIST_ARG_OPTION_LABEL_MAX_LENGTH) }));
+  const fits = capped.length > 0 && capped.length <= ASSIST_ARG_OPTION_LIMIT;
+  return { ...command, arg: fits ? { ...arg, options: capped } : arg };
+}
+
+interface PendingSessionRequest {
+  promise: Promise<AuthUser | null>;
+  consumers: Array<() => boolean>;
+  isCurrent: () => boolean;
+  user: AuthUser | null;
+  credential: string | null;
+}
+
+class GloomApiClient {
+  private currentUser: AuthUser | null = null;
+  /** Local user/credential binding, masked until verified and never serialized. */
+  private verifiedSessionIdentity: object | null = null;
+  private verifiedSessionCredential: string | null = null;
+  private sessionTransitions = 0;
+  private sessionTransition: Promise<void> | null = null;
+  /** Device adoption and external session installs supersede pending email auth. */
+  private sessionInstallationGeneration = 0;
+  private sessionRevalidationGeneration = 0;
+  private sessionRevalidationTimer: ReturnType<typeof setTimeout> | null = null;
+  private sessionChecked = false;
+  /** When a session check last answered for the credential in place (`recentSession`). */
+  private sessionCheckedAt: number | null = null;
+  /** Last few session transitions, content-free, for app://auth. */
+  private authTrace: Array<{ at: number; event: string; token: boolean; user: string }> = [];
+  private sessionRequest: PendingSessionRequest | null = null;
+  private sessionRequestGeneration = 0;
+  private readonly currentUserListeners = new Set<() => void>();
+  private readonly transport = new CloudApiRequestTransport();
+  private readonly auth: CloudAuthApi = new CloudAuthApi({
+    getCurrentUser: () => this.currentUser,
+    getSessionToken: () => this.transport.getSessionToken(),
+    hasSessionCredential: () => this.transport.hasSessionCredential(),
+    request: (path, options, canApplySession) => this.request(path, options, canApplySession),
+    requireCapturedSession: (message) => this.requireCapturedSession(message),
+    setCurrentUser: (user) => this.setCurrentUser(user),
+    setSessionToken: (token) => this.installSessionToken(token),
+    updateCurrentUser: (updater) => this.updateCurrentUser(updater),
+  });
+  private readonly socket: CloudApiSocket = new CloudApiSocket({
+    getBaseUrl: () => this.transport.baseUrl,
+    getSocketAuthToken: () => this.getSocketAuthToken(),
+    hasSessionCredential: () => this.transport.hasSessionCredential(),
+    hasVerifiedUser: () => this.currentUser?.emailVerified === true,
+    isUsingWebSocketToken: () => !!this.transport.getWebSocketToken(),
+    clearWebSocketTokenForFallback: () => this.transport.clearWebSocketTokenForFallback(),
+    markCurrentUserUnverified: () => {
+      if (this.currentUser) {
+        this.currentUser = { ...this.currentUser, emailVerified: false };
+        this.emitCurrentUserChange();
+      }
+    },
+    updateCurrentUserFromSocket: (user) => {
+      this.updateCurrentUser((currentUser) => ({
+        ...currentUser,
+        ...user,
+      }));
+    },
+    onServiceAnswered: () => this.transport.noteServiceAnswered(),
+  });
+  private readonly chat: CloudChatApi = new CloudChatApi({
+    request: (path, options) => this.request(path, options),
+    upload: (path, body, options) => this.transport.upload(path, body, options),
+    socket: this.socket,
+  });
+  private readonly teams: CloudTeamsApi = new CloudTeamsApi({
+    request: (path, options) => this.request(path, options),
+    socket: this.socket,
+  });
+  private readonly data: CloudDataApi = new CloudDataApi((path, options) => this.request(path, options));
+  private readonly notes: CloudNotesApi = new CloudNotesApi((path, options) => this.request(path, options));
+  private readonly feedback: CloudFeedbackApi = new CloudFeedbackApi((path, options) => this.request(path, options));
+  private readonly roadmap: CloudRoadmapApi = new CloudRoadmapApi((path, options) => this.request(path, options));
+  private readonly telemetry: CloudTelemetryApi = new CloudTelemetryApi((path, options) => this.request(path, options));
+  private readonly theses: CloudThesesApi = new CloudThesesApi((path, options) => this.request(path, options));
+  private readonly collections: CloudCollectionsApi = new CloudCollectionsApi((path, options) => this.request(path, options));
+  private readonly views: CloudViewsApi = new CloudViewsApi((path, options) => this.request(path, options));
+  readonly askg: CloudASKGApi = new CloudASKGApi({
+    request: (path, options) => this.request(path, options),
+    openStream: (path, options) => this.transport.openStream(path, options),
+    isStreamingSupported: () => this.transport.isStreamingSupported(),
+  });
+
+  getSessionToken(): string | null {
+    return this.transport.getSessionToken();
+  }
+
+  getWebSocketToken(): string | null {
+    return this.transport.getWebSocketToken();
+  }
+
+  setCookieSessionMode(enabled: boolean): void {
+    this.cancelSessionRevalidation();
+    this.sessionInstallationGeneration += 1;
+    this.sessionChecked = false;
+    this.verifiedSessionIdentity = null;
+    this.transport.setCookieSessionMode(enabled);
+    this.emitCurrentUserChange();
+  }
+
+  setSessionToken(token: string | null): void {
+    if (this.transport.getSessionToken() !== token || !token) {
+      this.cancelSessionRevalidation();
+      this.sessionInstallationGeneration += 1;
+    }
+    this.installSessionToken(token);
+  }
+
+  private installSessionToken(token: string | null): void {
+    const changed = this.transport.getSessionToken() !== token;
+    this.sessionChecked = false;
+    this.transport.setSessionToken(token);
+    if (changed) this.verifiedSessionIdentity = null;
+    this.traceAuth(changed ? "setSessionToken:changed" : "setSessionToken:same");
+    if (!token) {
+      this.cancelSessionRevalidation();
+      this.currentUser = null;
+      this.verifiedSessionIdentity = null;
+    }
+    if (changed || !token) {
+      this.emitCurrentUserChange();
+    }
+    this.socket.syncAuthState({ reconnect: changed });
+  }
+
+  setWebSocketToken(token: string | null): void {
+    const changed = this.transport.getWebSocketToken() !== token;
+    this.transport.setWebSocketToken(token);
+    this.socket.syncAuthState({ reconnect: changed });
+  }
+
+  getCurrentUser(): AuthUser | null {
+    return this.currentUser;
+  }
+
+  /**
+   * Whether a signed-in session exists on this surface. Browser builds keep the
+   * session in an HttpOnly cookie, so the raw token is deliberately null there
+   * and the restored user is the only signal.
+   */
+  isSignedIn(): boolean {
+    return !!this.transport.getSessionToken() || !!this.currentUser;
+  }
+
+  /**
+   * Whether a request sent now carries a session: the token this client
+   * holds, or, in the browser, the cookie it cannot see and assumes is there.
+   */
+  hasSessionCredential(): boolean {
+    return this.transport.hasSessionCredential();
+  }
+
+  /** Notifies when the user or credential changes, including plan and trial entitlement. */
+  subscribeCurrentUser(listener: () => void): () => void {
+    this.currentUserListeners.add(listener);
+    return () => {
+      this.currentUserListeners.delete(listener);
+    };
+  }
+
+  restoreCachedUser(user: PersistedAuthUser | null): void {
+    this.auth.restoreCachedUser(user);
+  }
+
+  isVerified(): boolean {
+    return this.transport.hasSessionCredential() && !!this.currentUser?.emailVerified;
+  }
+
+  /** Null while a replacement credential still awaits its matching user. */
+  getVerifiedSessionIdentity(): object | null {
+    return this.sessionTransitions === 0 && this.isVerified()
+      && this.verifiedSessionCredential === this.transport.getSessionToken()
+      ? this.verifiedSessionIdentity : null;
+  }
+
+  /**
+   * What this client currently believes about its session, with no secrets.
+   * Exposed over remote control so a "shows my username but not my
+   * subscription" report can be answered from the running app instead of
+   * from guesses about it.
+   */
+  describeAuthState(): {
+    hasSessionCredential: boolean;
+    hasSessionToken: boolean;
+    sessionChecked: boolean;
+    sessionRequestInFlight: boolean;
+    trace: Array<{ at: number; event: string; token: boolean; user: string }>;
+    currentUser: {
+      id: string;
+      emailVerified: boolean;
+      plan: string | null;
+      effectivePlan: string | null;
+      trialEndsAt: string | null;
+    } | null;
+  } {
+    const user = this.currentUser;
+    return {
+      hasSessionCredential: this.transport.hasSessionCredential(),
+      hasSessionToken: !!this.transport.getSessionToken(),
+      sessionChecked: this.sessionChecked,
+      sessionRequestInFlight: !!this.sessionRequest,
+      trace: [...this.authTrace],
+      currentUser: user
+        ? {
+          id: user.id,
+          emailVerified: user.emailVerified === true,
+          plan: user.plan ?? null,
+          effectivePlan: user.effectivePlan ?? null,
+          trialEndsAt: user.trialEndsAt ?? null,
+        }
+        : null,
+    };
+  }
+
+  private traceAuth(event: string, user: AuthUser | null = this.currentUser): void {
+    this.authTrace.push({
+      at: Date.now(),
+      event,
+      token: !!this.transport.getSessionToken(),
+      user: user ? (user.emailVerified ? "verified" : "unverified") : "none",
+    });
+    if (this.authTrace.length > 24) this.authTrace.shift();
+  }
+
+  private setCurrentUser(user: AuthUser | null, confirmSession = true): void {
+    const sameAccount = this.currentUser?.id === user?.id;
+    const changed = this.socketEntitlementKey(this.currentUser) !== this.socketEntitlementKey(user);
+    this.traceAuth("setCurrentUser", user);
+    this.currentUser = user;
+    // Another account, or a plan that changed, reads other answers: no later read joins one sent before.
+    if (changed) this.transport.forgetSharedReads();
+    if (confirmSession) {
+      this.clearSessionRevalidationTimer();
+      this.verifiedSessionIdentity = user ? {} : null;
+      this.verifiedSessionCredential = this.transport.getSessionToken();
+    } else if (!sameAccount || !user) {
+      this.verifiedSessionIdentity = null;
+    }
+    this.socket.syncAuthState({ reconnect: changed });
+    this.emitCurrentUserChange();
+  }
+
+  private emitCurrentUserChange(): void {
+    for (const listener of this.currentUserListeners) listener();
+  }
+
+  private updateCurrentUser(updater: (user: AuthUser) => AuthUser): void {
+    if (!this.currentUser) return;
+    // A socket/profile update is metadata, not proof that a replacement
+    // credential belongs to this user. Keep its existing binding, even null.
+    this.setCurrentUser(updater(this.currentUser), false);
+  }
+
+  private socketEntitlementKey(user: AuthUser | null): string {
+    if (!user) return "anonymous";
+    return [
+      user.id,
+      user.emailVerified === true ? "verified" : "unverified",
+      user.plan,
+      // A trial starting or lapsing changes the stream entitlement without touching `plan`.
+      user.effectivePlan,
+    ].join(":");
+  }
+
+  private requireCapturedSession(message: string): void {
+    if (this.transport.hasSessionCredential()) return;
+    this.transport.setWebSocketToken(null);
+    this.setCurrentUser(null);
+    throw new Error(message);
+  }
+
+  private async request<T>(path: string, options?: RequestInit, canApplySession?: () => boolean): Promise<T> {
+    return this.transport.request<T>(path, options, canApplySession);
+  }
+
+  private getSocketAuthToken(): string | null {
+    return this.transport.getSocketAuthToken();
+  }
+
+  async ensureVerifiedSession(): Promise<AuthUser | null> {
+    if (!this.transport.hasSessionCredential()) return null;
+    if (!this.currentUser && !this.sessionChecked) await this.getSession();
+    return this.currentUser?.emailVerified ? this.currentUser : null;
+  }
+
+  signUp = (email: string, username: string, name: string, password: string) =>
+    this.withSessionTransition((isCurrent) => this.auth.signUp(email, username, name, password, isCurrent));
+  signIn = (email: string, password: string) =>
+    this.withSessionTransition((isCurrent) => this.auth.signIn(email, password, isCurrent));
+  signInWithGoogle = (idToken: string) =>
+    this.withSessionTransition((isCurrent) => this.auth.signInWithGoogle(idToken, isCurrent));
+  getOneTapConfig = this.auth.getOneTapConfig.bind(this.auth);
+  startDeviceSignIn = this.auth.startDeviceSignIn.bind(this.auth);
+  pollDeviceSignIn = this.auth.pollDeviceSignIn.bind(this.auth);
+  signOut = () => this.withSessionTransition((isCurrent) => this.auth.signOut(isCurrent), false);
+
+  /** Cookies can change before an auth response's body arrives, including ones the browser hides. */
+  private withSessionTransition<T>(run: (isCurrent: () => boolean) => Promise<T>, reconcileFailure = true): Promise<T> {
+    const previous = this.sessionTransition;
+    this.cancelSessionRevalidation();
+    let revalidationGeneration = this.sessionRevalidationGeneration;
+    const generation = this.sessionInstallationGeneration;
+    const isCurrent = () => generation === this.sessionInstallationGeneration;
+    this.sessionTransitions += 1;
+    this.sessionChecked = false;
+    this.verifiedSessionIdentity = null;
+    this.sessionRequestGeneration += 1;
+    this.emitCurrentUserChange();
+    let needsRevalidation = false;
+    const operation = (async () => {
+      // Serialize credential-changing requests so a late response cannot pair
+      // one account's user with another request's installed cookie.
+      if (previous) await previous;
+      try {
+        if (!isCurrent()) throw new Error("Another sign-in replaced this request.");
+        // An earlier queued sign-out may have retired retries while clearing its token.
+        revalidationGeneration = this.sessionRevalidationGeneration;
+        this.sessionRequestGeneration += 1;
+        const result = await run(isCurrent);
+        if (!isCurrent()) throw new Error("Another sign-in replaced this request.");
+        return result;
+      } catch (error) {
+        if (isCurrent()) {
+          this.verifiedSessionIdentity = null;
+          this.sessionChecked = false;
+        }
+        if (isCurrent() && reconcileFailure && this.transport.hasSessionCredential()) {
+          // A failed body may already have changed the cookie. A fresh session
+          // check is the only way to resume; retry if it cannot validate yet.
+          needsRevalidation = true;
+          this.sessionRequestGeneration += 1;
+          await this.revalidateSession(() => isCurrent()
+            && revalidationGeneration === this.sessionRevalidationGeneration).catch((failure) => {
+            if (!isCurrent()) return;
+            this.verifiedSessionIdentity = null;
+            logFailure("cloud.auth", "Restore session after failed sign-in failed")(failure);
+          });
+        }
+        throw error;
+      } finally {
+        if (isCurrent()) this.sessionRequestGeneration += 1;
+        this.sessionTransitions -= 1;
+        if (isCurrent() && needsRevalidation) this.scheduleSessionRevalidation(revalidationGeneration);
+        this.emitCurrentUserChange();
+      }
+    })();
+    const settled = operation.then(() => {}, () => {
+      // Intentional ignore: the caller receives the error while the auth queue continues.
+    });
+    this.sessionTransition = settled;
+    void settled.then(() => { if (this.sessionTransition === settled) this.sessionTransition = null; });
+    return operation;
+  }
+
+  private clearSessionRevalidationTimer(): void {
+    if (this.sessionRevalidationTimer !== null) clearTimeout(this.sessionRevalidationTimer);
+    this.sessionRevalidationTimer = null;
+  }
+
+  private cancelSessionRevalidation(): void {
+    this.sessionRevalidationGeneration += 1;
+    this.clearSessionRevalidationTimer();
+  }
+
+  /** A failed auth response can replace a cookie even when its recovery read is offline. */
+  private scheduleSessionRevalidation(generation: number, delay = SESSION_REVALIDATION_INITIAL_MS): void {
+    const isCurrent = () => generation === this.sessionRevalidationGeneration;
+    const needsRevalidation = () => isCurrent() && this.sessionTransitions === 0
+      && !this.sessionChecked && this.verifiedSessionIdentity === null && this.transport.hasSessionCredential();
+    if (!needsRevalidation() || this.sessionRevalidationTimer !== null) return;
+    this.sessionRevalidationTimer = setTimeout(() => {
+      this.sessionRevalidationTimer = null;
+      if (!needsRevalidation()) return;
+      void this.revalidateSession(isCurrent).catch((error) => {
+        if (isCurrent()) logFailure("cloud.auth", "Retry session validation failed")(error);
+      }).finally(() => {
+        this.scheduleSessionRevalidation(generation, Math.min(delay * 2, SESSION_REVALIDATION_MAX_MS));
+      });
+    }, delay);
+    this.sessionRevalidationTimer.unref?.();
+  }
+
+  private async revalidateSession(isCurrent: () => boolean): Promise<void> {
+    const user = await this.getSession(isCurrent);
+    const credential = this.getSessionToken();
+    if (user || !credential || !isCurrent()) return;
+    // A native null-session response can retain a usable token. Validate it
+    // through the account endpoint, without pairing it with a cached user.
+    this.sessionChecked = false;
+    const previousUser = this.currentUser;
+    const canApply = () => isCurrent() && this.getSessionToken() === credential && this.currentUser === previousUser;
+    try {
+      const profile = await this.auth.getAccountProfile(canApply);
+      if (!canApply()) return;
+      this.sessionChecked = true;
+      this.auth.restoreCachedUser({ ...profile, updatedAt: profile.updatedAt ?? undefined });
+    } catch (error) {
+      if (!canApply()) return;
+      if (error instanceof ApiRequestError && error.status === 401) {
+        this.installSessionToken(null);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * What a session check made within `maxAgeMs` found for the credential in
+   * place, or undefined when none did and the server has to be asked. Lets a
+   * view that opens right after the app checked its session use that answer.
+   */
+  recentSession(maxAgeMs: number): { user: AuthUser | null } | undefined {
+    if (!this.sessionChecked || this.sessionCheckedAt === null || this.sessionTransitions > 0 || this.sessionRequest) return undefined;
+    if (Date.now() - this.sessionCheckedAt > maxAgeMs) return undefined;
+    return { user: this.currentUser };
+  }
+
+  async getSession(isCurrent: () => boolean = () => true): Promise<AuthUser | null> {
+    if (!isCurrent()) return this.currentUser;
+    const existing = this.sessionRequest;
+    if (existing?.isCurrent()
+      && existing.user === this.currentUser
+      && existing.credential === this.getSessionToken()) {
+      existing.consumers.push(isCurrent);
+      this.traceAuth("getSession:joined-inflight");
+      return existing.promise;
+    }
+    this.traceAuth("getSession:start");
+    const generation = ++this.sessionRequestGeneration;
+    const consumers = [isCurrent];
+    const canApply = () => generation === this.sessionRequestGeneration && consumers.some((consumer) => consumer());
+    const request: PendingSessionRequest = {
+      consumers,
+      isCurrent: canApply,
+      user: this.currentUser,
+      credential: this.getSessionToken(),
+      promise: this.auth.getSession(canApply)
+        .then(({ user, validated }) => {
+          if (validated && canApply()) {
+            this.sessionChecked = true;
+            this.sessionCheckedAt = Date.now();
+            this.clearSessionRevalidationTimer();
+          }
+          this.traceAuth(validated ? "getSession:done" : "getSession:retained", user);
+          return user;
+        })
+        .catch((error) => {
+          this.traceAuth(`getSession:error:${error instanceof Error ? error.message.slice(0, 60) : "unknown"}`);
+          throw error;
+        })
+        .finally(() => {
+          if (this.sessionRequest === request) this.sessionRequest = null;
+        }),
+    };
+    this.sessionRequest = request;
+    return request.promise;
+  }
+
+  sendVerification = this.auth.sendVerification.bind(this.auth);
+  requestPasswordReset = this.auth.requestPasswordReset.bind(this.auth);
+  createBrowserHandoff = this.auth.createBrowserHandoff.bind(this.auth);
+
+  /**
+   * Creates a Stripe checkout session for Cloud Pro; the URL opens in a browser.
+   * `link` is a short link to the same checkout, to read or scan on another
+   * device. Older servers send none.
+   */
+  async createCloudCheckout(returnTo?: string, interval: "month" | "year" = "month"): Promise<{ url: string; link?: string }> {
+    return this.request<{ url: string; link?: string }>("/stripe/checkout", { method: "POST", body: JSON.stringify({ returnTo, interval }) });
+  }
+
+  async recordResearchActivity(payload: {
+    event: import("./research-activity").ResearchActivity; eventId: string;
+    surface: "web" | "desktop" | "tui" | "cli"; anonymousId?: string;
+    attribution?: Record<string, string>; feature?: import("./research-activity").ResearchFeature;
+    tab?: string; desks?: readonly string[]; placement?: string; teaser_kind?: "summary" | "sample" | "none";
+    cta?: "login" | "signup"; reason?: string;
+  }): Promise<void> {
+    await this.request("/activity/research", { method: "POST", body: JSON.stringify(payload) });
+  }
+
+  /** Stores a verified user's public terminal snapshot or pane handoff. */
+  async createTerminalShare(payload: unknown): Promise<{ id: string; expiresAt: string }> {
+    return this.request<{ id: string; expiresAt: string }>("/shares", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  /**
+   * A broker connection held by the Cloud account, under `/brokers/{broker}`.
+   * Broker plugins reach it through `gloomberb/broker`, so the path is confined
+   * to that prefix rather than the whole API.
+   */
+  async brokerRequest<T>(
+    broker: string,
+    path: string,
+    options: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown; signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(broker)) throw new Error(`Invalid broker id "${broker}".`);
+    if (path !== "" && (!/^\/[A-Za-z0-9/_.~%?=&-]*$/.test(path) || path.includes(".."))) {
+      throw new Error(`Invalid broker path "${path}".`);
+    }
+    return this.request<T>(`/brokers/${broker}${path}`, {
+      method: options.method ?? "GET",
+      ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+  }
+
+  /** Stripe billing portal for an account that already has a subscription. */
+  async createBillingPortal(): Promise<{ url: string }> {
+    return this.request<{ url: string }>("/stripe/portal", { method: "POST", body: JSON.stringify({}) });
+  }
+
+  /**
+   * Ends the Pro trial and Pro now, unbilled. Call it only once the person
+   * confirmed a warning that says so. `endedNow` is false when the server
+   * scheduled the cancel at the period end instead: the subscription was no
+   * longer in its trial, or the server predates ending a trial early.
+   */
+  async endCloudTrial(): Promise<{ canceled: boolean; endedNow?: boolean }> {
+    return this.request<{ canceled: boolean; endedNow?: boolean }>("/stripe/subscription/cancel", {
+      method: "POST",
+      body: JSON.stringify({ endTrialNow: true }),
+    });
+  }
+
+  /**
+   * Asks which arm of an app experiment this account or web visitor is in, at the
+   * moment it would show. The API counts the answer as the exposure.
+   */
+  async recordExperimentExposure(payload: {
+    eventId: string; surface: "web" | "desktop" | "tui" | "cli"; anonymousId?: string;
+    attribution?: Record<string, string>; experiment: string; variant?: string;
+  }, signal?: AbortSignal): Promise<import("./web-experiments").ExperimentAnswer> {
+    return this.request("/activity/research", {
+      method: "POST",
+      body: JSON.stringify({ event: "experiment_exposed", ...payload }),
+      ...(signal ? { signal } : {}),
+    });
+  }
+  getAccountProfile = this.auth.getAccountProfile.bind(this.auth);
+  getCloudPricing = this.auth.getCloudPricing.bind(this.auth);
+  getCloudAccountPlan = this.auth.getCloudAccountPlan.bind(this.auth);
+  getBuildoutAccount = this.auth.getBuildoutAccount.bind(this.auth);
+  getBuildoutToken = this.auth.getBuildoutToken.bind(this.auth);
+  updateAccountProfile = this.auth.updateAccountProfile.bind(this.auth);
+  getCalendarFeed = this.auth.getCalendarFeed.bind(this.auth);
+  ensureCalendarFeed = this.auth.ensureCalendarFeed.bind(this.auth);
+  rotateCalendarFeed = this.auth.rotateCalendarFeed.bind(this.auth);
+  createMcpKey = this.auth.createMcpKey.bind(this.auth);
+
+  async getSyncSnapshot(): Promise<CloudSyncSnapshotResponse> {
+    return this.request<CloudSyncSnapshotResponse>("/sync/snapshot", { method: "GET" });
+  }
+
+  /**
+   * `baseRevision` goes out as If-Match: the server ignores the body field and
+   * would replace a snapshot another device wrote since this one pulled. With
+   * the header it refuses that write (409), raised as SyncRevisionConflictError
+   * so the controller pulls again instead.
+   */
+  async putSyncSnapshot(snapshot: SyncSnapshot, options?: { baseRevision?: number | null }): Promise<CloudSyncPushResponse> {
+    const baseRevision = options?.baseRevision ?? null;
+    try {
+      return await this.request<CloudSyncPushResponse>("/sync/snapshot", {
+        method: "PUT",
+        ...(baseRevision !== null ? { headers: { "If-Match": String(baseRevision) } } : {}),
+        body: JSON.stringify({ snapshot, baseRevision }),
+      });
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 409) throw new SyncRevisionConflictError(error.message);
+      throw error;
+    }
+  }
+
+  async getMarketplaceLayout(
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<LayoutMarketplaceEntry | null> {
+    if (!isMarketplaceLayoutId(id)) return null;
+    try {
+      return parseMarketplaceLayoutEntry(await this.request<unknown>(`/layouts/${encodeURIComponent(id)}`, {
+        method: "GET",
+        signal: options?.signal,
+      }));
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async listMarketplaceLayouts(options?: { signal?: AbortSignal }): Promise<LayoutMarketplaceEntry[]> {
+    const items = parseMarketplaceLayoutList(await this.request<unknown>("/layouts", {
+      method: "GET",
+      signal: options?.signal,
+    }));
+    if (!items) throw new Error("The layout marketplace returned invalid data.");
+    return items;
+  }
+
+  async publishMarketplaceLayout(
+    name: string,
+    payload: LayoutMarketplacePayload,
+    options?: { signal?: AbortSignal },
+  ): Promise<LayoutMarketplaceEntry> {
+    const item = parseMarketplaceLayoutEntry(await this.request<unknown>("/layouts", {
+      method: "POST",
+      body: JSON.stringify({ name: name.trim(), ...payload }),
+      signal: options?.signal,
+    }));
+    if (!item) throw new Error("The layout marketplace returned invalid data.");
+    return item;
+  }
+
+  // Cloud layouts: the full, revisioned shape behind ?v=2 and the new routes.
+
+  async getCloudLayout(id: string, options?: { signal?: AbortSignal }): Promise<CloudLayoutEntry | null> {
+    if (!isMarketplaceLayoutId(id)) return null;
+    try {
+      return parseCloudLayoutEntry(await this.request<unknown>(`/layouts/${encodeURIComponent(id)}?v=2`, {
+        method: "GET",
+        signal: options?.signal,
+      }));
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async listTeamLayouts(teamId: string, options?: { signal?: AbortSignal }): Promise<CloudLayoutEntry[]> {
+    const items = parseCloudLayoutList(await this.request<unknown>(`/teams/${encodeURIComponent(teamId)}/layouts`, {
+      method: "GET",
+      signal: options?.signal,
+    }));
+    if (!items) throw new Error("The layout service returned invalid data.");
+    return items;
+  }
+
+  async publishTeamLayout(
+    teamId: string,
+    name: string,
+    payload: LayoutMarketplacePayload,
+    options: { requires?: LayoutRequirement[]; note?: string | null; visibility?: "team" | "public" } = {},
+  ): Promise<CloudLayoutEntry> {
+    const item = parseCloudLayoutEntry(await this.request<unknown>(`/teams/${encodeURIComponent(teamId)}/layouts`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: name.trim(),
+        ...payload,
+        requires: options.requires ?? [],
+        ...(options.note ? { note: options.note } : {}),
+        ...(options.visibility ? { visibility: options.visibility } : {}),
+      }),
+    }));
+    if (!item) throw new Error("The layout service returned invalid data.");
+    return item;
+  }
+
+  /**
+   * Appends a revision. `expectedRevision` is sent as If-Match; a 412 becomes
+   * a LayoutRevisionConflictError carrying the revision the server holds now.
+   */
+  async publishLayoutRevision(
+    id: string,
+    payload: LayoutMarketplacePayload,
+    options: { expectedRevision?: number; requires?: LayoutRequirement[]; note?: string | null; name?: string } = {},
+  ): Promise<CloudLayoutEntry> {
+    const item = parseCloudLayoutEntry(await putWithRevision<unknown, CloudLayoutEntry>(
+      (path, init) => this.request(path, init),
+      `/layouts/${encodeURIComponent(id)}`,
+      {
+        ...payload,
+        requires: options.requires ?? [],
+        ...(options.note ? { note: options.note } : {}),
+        ...(options.name ? { name: options.name } : {}),
+      },
+      {
+        expected: options.expectedRevision,
+        loadCurrent: () => this.getCloudLayout(id),
+        conflict: LayoutRevisionConflictError,
+      },
+    ));
+    if (!item) throw new Error("The layout service returned invalid data.");
+    return item;
+  }
+
+  changePassword = this.auth.changePassword.bind(this.auth);
+  deleteAccount = this.auth.deleteAccount.bind(this.auth);
+
+  /**
+   * Resolves a natural-language command-bar query into runnable command-bar
+   * inputs. Requires a verified session; free accounts are included. The
+   * request is bounded client-side so a stalled upstream cannot hold the
+   * command bar in its loading state. The server keeps the query and answers
+   * with a `searchId` unless told `log: false`, so an opt-out has to be sent
+   * explicitly.
+   */
+  async assistCommand(
+    query: string,
+    commands: AssistCommandDescriptor[],
+    options?: { signal?: AbortSignal; log?: boolean },
+  ): Promise<AssistCommandResponse> {
+    const controller = new AbortController();
+    const callerSignal = options?.signal;
+    const abortFromCaller = () => controller.abort(callerSignal?.reason);
+    if (callerSignal?.aborted) {
+      abortFromCaller();
+    } else {
+      callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    }
+
+    try {
+      const request = this.request<AssistCommandResponse>("/assist/command", {
+        method: "POST",
+        body: JSON.stringify({
+          query: query.trim().slice(0, ASSIST_QUERY_MAX_LENGTH),
+          commands: commands.slice(0, ASSIST_COMMAND_LIMIT).map(capAssistArgOptions),
+          ...(options?.log !== undefined ? { log: options.log } : {}),
+        }),
+        signal: controller.signal,
+      });
+      return await withDeadline(
+        request,
+        ASSIST_REQUEST_TIMEOUT_MS,
+        `Assist request timed out after ${ASSIST_REQUEST_TIMEOUT_MS}ms`,
+        (error) => controller.abort(error),
+      );
+    } finally {
+      callerSignal?.removeEventListener("abort", abortFromCaller);
+    }
+  }
+
+  /**
+   * Stores how a command-bar search ended, to improve search. Fire and
+   * forget: sent only with a signed-in session, it never throws and never
+   * waits, and a report that fails is dropped.
+   */
+  reportCommandSearch(report: CommandSearchReport): void {
+    try {
+      if (!this.isSignedIn()) return;
+      void this.telemetry.reportCommandSearch(report).catch(logFailure("cloud-telemetry", "Command search report failed"));
+    } catch (error) {
+      logFailure("cloud-telemetry", "Command search reporting failed")(error);
+      /* A report must never get in the way of the command bar. */
+    }
+  }
+
+  getChannels = this.chat.getChannels.bind(this.chat);
+  getChatPresence = this.chat.getPresence.bind(this.chat);
+  getChatState = this.chat.getState.bind(this.chat);
+  getChatMentionCandidates = this.chat.getMentionCandidates.bind(this.chat);
+  subscribeChatMentionCandidatesChanged = this.chat.subscribeMentionCandidatesChanged.bind(this.chat);
+  updateChatChannelState = this.chat.updateChannelState.bind(this.chat);
+  markChatNotificationsDelivered = this.chat.markNotificationsDelivered.bind(this.chat);
+  getUnseenChatNotificationIds = this.chat.getUnseenNotificationIds.bind(this.chat);
+  openDirectChannel = this.chat.openDirectChannel.bind(this.chat);
+  openGroupChannel = this.chat.openGroupChannel.bind(this.chat);
+  getMessages = this.chat.getMessages.bind(this.chat);
+  sendMessage = this.chat.sendMessage.bind(this.chat);
+  uploadChatAttachment = this.chat.uploadAttachment.bind(this.chat);
+  chatAttachmentsSupported = this.chat.attachmentsSupported.bind(this.chat);
+  subscribeChatAttachmentSupport = this.chat.subscribeAttachmentSupport.bind(this.chat);
+  editMessage = this.chat.editMessage.bind(this.chat);
+  setChatReaction = this.chat.setReaction.bind(this.chat);
+  subscribeChatReactions = this.chat.subscribeReactions.bind(this.chat);
+  connectChannel = this.chat.connectChannel.bind(this.chat);
+  subscribeChatNotifications = this.chat.subscribeNotifications.bind(this.chat);
+  subscribeChatChannelState = this.chat.subscribeChannelState.bind(this.chat);
+  subscribeChatPresence = this.chat.subscribePresence.bind(this.chat);
+  getChatDiscordLink = this.chat.getDiscordLink.bind(this.chat);
+  unlinkChatDiscord = this.chat.unlinkDiscord.bind(this.chat);
+  setChatDiscordMirror = this.chat.setDiscordMirror.bind(this.chat);
+  subscribeQuotes = this.socket.subscribeQuotes.bind(this.socket);
+
+  listTeams = this.teams.listTeams.bind(this.teams);
+  createTeam = this.teams.createTeam.bind(this.teams);
+  getTeamMembers = this.teams.getTeamMembers.bind(this.teams);
+  inviteTeamMemberByUsername = this.teams.inviteTeamMemberByUsername.bind(this.teams);
+  listTeamInviteLinks = this.teams.listTeamInviteLinks.bind(this.teams);
+  createTeamInviteLink = this.teams.createTeamInviteLink.bind(this.teams);
+  deleteTeamInviteLink = this.teams.deleteTeamInviteLink.bind(this.teams);
+  getTeamNotifications = this.teams.getTeamNotifications.bind(this.teams);
+  listTeamInvitations = this.teams.listTeamInvitations.bind(this.teams);
+  listMyTeamInvitations = this.teams.listMyTeamInvitations.bind(this.teams);
+  acceptTeamInvitation = this.teams.acceptTeamInvitation.bind(this.teams);
+  rejectTeamInvitation = this.teams.rejectTeamInvitation.bind(this.teams);
+  cancelTeamInvitation = this.teams.cancelTeamInvitation.bind(this.teams);
+  updateTeam = this.teams.updateTeam.bind(this.teams);
+  updateTeamMemberRole = this.teams.updateTeamMemberRole.bind(this.teams);
+  removeTeamMember = this.teams.removeTeamMember.bind(this.teams);
+  leaveTeam = this.teams.leaveTeam.bind(this.teams);
+  deleteTeam = this.teams.deleteTeam.bind(this.teams);
+  createTeamChannel = this.teams.createTeamChannel.bind(this.teams);
+  deleteTeamChannel = this.teams.deleteTeamChannel.bind(this.teams);
+  subscribeTeamUpdates = this.teams.subscribeTeamUpdates.bind(this.teams);
+  subscribeTeamNotifications = this.teams.subscribeTeamNotifications.bind(this.teams);
+  subscribeCloudEvent = this.teams.subscribeCloudEvent.bind(this.teams);
+  /** The Cloud socket's own lifecycle and frames, for protocols layered on it (the terminal relay). */
+  subscribeSocketConnection = this.socket.subscribeConnection.bind(this.socket);
+  sendSocketFrame = this.socket.sendFrame.bind(this.socket);
+  socketServerOffers = this.socket.serverOffers.bind(this.socket);
+  listCloudNotes = this.notes.listNotes.bind(this.notes);
+  getCloudNote = this.notes.getNote.bind(this.notes);
+  putCloudNote = this.notes.putNote.bind(this.notes);
+  submitFeedback = this.feedback.submitFeedback.bind(this.feedback);
+  listFeedback = this.feedback.listFeedback.bind(this.feedback);
+  getRoadmap = this.roadmap.getRoadmap.bind(this.roadmap);
+  setRoadmapVote = this.roadmap.setRoadmapVote.bind(this.roadmap);
+  reportCrashErrors = this.telemetry.reportCrashErrors.bind(this.telemetry);
+  reportUsageCounts = this.telemetry.reportUsageCounts.bind(this.telemetry);
+  reportAttentionCounts = this.telemetry.reportAttentionCounts.bind(this.telemetry);
+  deleteCloudNote = this.notes.deleteNote.bind(this.notes);
+  listTheses = this.theses.listTheses.bind(this.theses);
+  getThesis = this.theses.getThesis.bind(this.theses);
+  createThesis = this.theses.createThesis.bind(this.theses);
+  updateThesis = this.theses.updateThesis.bind(this.theses);
+  deleteThesis = this.theses.deleteThesis.bind(this.theses);
+  createThesisSignal = this.theses.createThesisSignal.bind(this.theses);
+  resolveThesisSignal = this.theses.resolveThesisSignal.bind(this.theses);
+  reviewThesis = this.theses.reviewThesis.bind(this.theses);
+  draftThesis = this.theses.draftThesis.bind(this.theses);
+  listTeamCollections = this.collections.listTeamCollections.bind(this.collections);
+  getTeamCollection = this.collections.getTeamCollection.bind(this.collections);
+  createTeamCollection = this.collections.createTeamCollection.bind(this.collections);
+  putTeamCollectionItem = this.collections.putTeamCollectionItem.bind(this.collections);
+  removeTeamCollectionItem = this.collections.removeTeamCollectionItem.bind(this.collections);
+  listTeamViews = this.views.listTeamViews.bind(this.views);
+  getTeamView = this.views.getTeamView.bind(this.views);
+  createTeamView = this.views.createTeamView.bind(this.views);
+  publishTeamViewRevision = this.views.publishTeamViewRevision.bind(this.views);
+  listTeamPluginState = this.views.listTeamPluginState.bind(this.views);
+  getTeamPluginState = this.views.getTeamPluginState.bind(this.views);
+  putTeamPluginState = this.views.putTeamPluginState.bind(this.views);
+  deleteTeamPluginState = this.views.deleteTeamPluginState.bind(this.views);
+
+  /** Subscribes to a shared scanner feed; all panes of one kind share one upstream subscription. */
+  subscribeTape = this.socket.subscribeTape.bind(this.socket);
+  subscribeScanner = this.socket.subscribeScanner.bind(this.socket);
+
+  dispose(): void {
+    this.cancelSessionRevalidation();
+    this.sessionInstallationGeneration += 1;
+    this.sessionRequestGeneration += 1;
+    this.sessionRequest = null;
+    this.socket.dispose();
+    this.transport.dispose();
+  }
+
+  searchInstruments = this.data.searchInstruments.bind(this.data);
+  getCloudQuote = this.data.getCloudQuote.bind(this.data);
+  getCloudQuotesBatch = this.data.getCloudQuotesBatch.bind(this.data);
+  getCloudWorldVenues = this.data.getCloudWorldVenues.bind(this.data);
+  getMarketEarningsCalendar = this.data.getMarketEarningsCalendar.bind(this.data);
+  getCloudArticleSummary = this.data.getCloudArticleSummary.bind(this.data);
+  getMarketMovers = this.data.getMarketMovers.bind(this.data);
+  getMarketTrending = this.data.getMarketTrending.bind(this.data);
+  getMarketHeatmap = this.data.getMarketHeatmap.bind(this.data);
+  getMarketDividends = this.data.getMarketDividends.bind(this.data);
+  getCloudMarketScreener = this.data.getCloudMarketScreener.bind(this.data);
+  getCloudOptionsChain = this.data.getCloudOptionsChain.bind(this.data);
+  getCloudFinancials = this.data.getCloudFinancials.bind(this.data);
+  getCloudFinancialsBatch = this.data.getCloudFinancialsBatch.bind(this.data);
+  getCloudHolders = this.data.getCloudHolders.bind(this.data);
+  getCloudShortInterest = this.data.getCloudShortInterest.bind(this.data);
+  getCloudAnalystResearch = this.data.getCloudAnalystResearch.bind(this.data);
+  getCloudCorporateActions = this.data.getCloudCorporateActions.bind(this.data);
+  getCloudTickerChanges = this.data.getCloudTickerChanges.bind(this.data);
+  getCloudOrganizationTickers = this.data.getCloudOrganizationTickers.bind(this.data);
+  getCloudTickerChangesBatch = this.data.getCloudTickerChangesBatch.bind(this.data);
+  getCloudIssuerListings = this.data.getCloudIssuerListings.bind(this.data);
+  searchInstrumentsBatch = this.data.searchInstrumentsBatch.bind(this.data);
+  getCloudHistory = this.data.getCloudHistory.bind(this.data);
+  getCloudExchangeRate = this.data.getCloudExchangeRate.bind(this.data);
+  getCloudEconomicCalendar = this.data.getCloudEconomicCalendar.bind(this.data);
+  getCloudEconomicCalendarFrom = this.data.getCloudEconomicCalendarFrom.bind(this.data);
+  getCloudMacroReleaseDays = this.data.getCloudMacroReleaseDays.bind(this.data);
+  getCloudShortRates = this.data.getCloudShortRates.bind(this.data);
+  getCloudEquityDiagnostic = this.data.getCloudEquityDiagnostic.bind(this.data);
+  getCloudEarningsCalendar = this.data.getCloudEarningsCalendar.bind(this.data);
+  getCloudEarningsHistory = this.data.getCloudEarningsHistory.bind(this.data);
+  getCloudFredSeries = this.data.getCloudFredSeries.bind(this.data);
+  getCloudFredSeriesCatalog = this.data.getCloudFredSeriesCatalog.bind(this.data);
+  getCloudCryptoMarkets = this.data.getCloudCryptoMarkets.bind(this.data);
+  getCloudStablecoinSupply = this.data.getCloudStablecoinSupply.bind(this.data);
+  getCloudStablecoinSupplyHistory = this.data.getCloudStablecoinSupplyHistory.bind(this.data);
+  getCloudDefiTvl = this.data.getCloudDefiTvl.bind(this.data);
+  getCloudBitcoinNetwork = this.data.getCloudBitcoinNetwork.bind(this.data);
+  getCloudCentralBankRates = this.data.getCloudCentralBankRates.bind(this.data);
+  getCloudFxInterventions = this.data.getCloudFxInterventions.bind(this.data);
+  getMobileAlertHistory = this.data.getMobileAlertHistory.bind(this.data);
+  getScannerFlowHistory = this.data.getScannerFlowHistory.bind(this.data);
+  getScannerFlowSession = this.data.getScannerFlowSession.bind(this.data);
+  getLiveScan = this.data.getLiveScan.bind(this.data);
+  getCloudEstimateRevisions = this.data.getCloudEstimateRevisions.bind(this.data);
+  getCloudMoneyMarkets = this.data.getCloudMoneyMarkets.bind(this.data);
+  equityScreener = this.data.equityScreener.bind(this.data);
+  getMemberFunds = this.data.getMemberFunds.bind(this.data);
+  getFundMembers = this.data.getFundMembers.bind(this.data);
+  getFundBreadth = this.data.getFundBreadth.bind(this.data);
+  getFundChanges = this.data.getFundChanges.bind(this.data);
+  getFundFacts = this.data.getFundFacts.bind(this.data);
+  getCloudExchangeAnnouncements = this.data.getCloudExchangeAnnouncements.bind(this.data);
+  getCloudThemes = this.data.getCloudThemes.bind(this.data);
+  getCloudThemeMembers = this.data.getCloudThemeMembers.bind(this.data);
+  impliedVolatility = this.data.impliedVolatility.bind(this.data);
+  optionsPositioning = this.data.optionsPositioning.bind(this.data);
+  getCloudBankFigures = this.data.getCloudBankFigures.bind(this.data);
+  getCloudDebtMaturities = this.data.getCloudDebtMaturities.bind(this.data);
+  getCloudStoredBond = this.data.getCloudStoredBond.bind(this.data);
+  getCloudStoredIssuerBonds = this.data.getCloudStoredIssuerBonds.bind(this.data);
+  getCloudRevenueBreakdown = this.data.getCloudRevenueBreakdown.bind(this.data);
+  getCloudMnaDeals = this.data.getCloudMnaDeals.bind(this.data);
+  getCloudMnaDeal = this.data.getCloudMnaDeal.bind(this.data);
+  getPublicDistressFilings = this.data.getPublicDistressFilings.bind(this.data);
+  getPublicGoingConcern = this.data.getPublicGoingConcern.bind(this.data);
+  getPublicDistressDesignations = this.data.getPublicDistressDesignations.bind(this.data);
+  getPublicInsolvencyNotices = this.data.getPublicInsolvencyNotices.bind(this.data);
+  getPublicLetters = this.data.getPublicLetters.bind(this.data);
+  getCloudIpoCalendar = this.data.getCloudIpoCalendar.bind(this.data);
+  getCloudFailsToDeliver = this.data.getCloudFailsToDeliver.bind(this.data);
+  getCloudOtcVolume = this.data.getCloudOtcVolume.bind(this.data);
+  getCloudShortVolume = this.data.getCloudShortVolume.bind(this.data);
+  getCloudCryptoEtfFlows = this.data.getCloudCryptoEtfFlows.bind(this.data);
+  getCloudSocialMentions = this.data.getCloudSocialMentions.bind(this.data);
+  getCloudSocialMentionPosts = this.data.getCloudSocialMentionPosts.bind(this.data);
+  getCloudSocialOutliers = this.data.getCloudSocialOutliers.bind(this.data);
+  getCloudFuturesCurve = this.data.getCloudFuturesCurve.bind(this.data);
+  getCloudFuturesCurveAsOf = this.data.getCloudFuturesCurveAsOf.bind(this.data);
+  getCloudFuturesContract = this.data.getCloudFuturesContract.bind(this.data);
+  getCloudFuturesContracts = this.data.getCloudFuturesContracts.bind(this.data);
+  batchesReads = this.data.batchesReads.bind(this.data);
+  getCloudRatePath = this.data.getCloudRatePath.bind(this.data);
+  getCloudShiller = this.data.getCloudShiller.bind(this.data);
+  getCloudCotBoard = this.data.getCloudCotBoard.bind(this.data);
+  getCloudCotContract = this.data.getCloudCotContract.bind(this.data);
+  creditDocuments = this.data.creditDocuments.bind(this.data);
+  geo = this.data.geo.bind(this.data);
+  getCloudHiring = this.data.getCloudHiring.bind(this.data);
+  getCloudHiringMoves = this.data.getCloudHiringMoves.bind(this.data);
+  getCloudHiringSignals = this.data.getCloudHiringSignals.bind(this.data);
+  getCloudHiringCompanySignals = this.data.getCloudHiringCompanySignals.bind(this.data);
+  getCloudHiringBuilding = this.data.getCloudHiringBuilding.bind(this.data);
+  getCloudHiringCompanyBuilding = this.data.getCloudHiringCompanyBuilding.bind(this.data);
+  getCloudAppRankHistory = this.data.getCloudAppRankHistory.bind(this.data);
+  getCloudAppAttention = this.data.getCloudAppAttention.bind(this.data);
+  getCloudCatalystChanges = this.data.getCloudCatalystChanges.bind(this.data);
+  getCloudCatalysts = this.data.getCloudCatalysts.bind(this.data);
+  getCloudCatalystEvent = this.data.getCloudCatalystEvent.bind(this.data);
+  getCloudCatalystStatus = this.data.getCloudCatalystStatus.bind(this.data);
+  getCloudCompanyKpis = this.data.getCloudCompanyKpis.bind(this.data);
+  getCloudCompanyGuidance = this.data.getCloudCompanyGuidance.bind(this.data);
+  getCloudPerpsBoard = this.data.getCloudPerpsBoard.bind(this.data);
+  getCloudPerpsHistory = this.data.getCloudPerpsHistory.bind(this.data);
+  getCloudPerpsRankings = this.data.getCloudPerpsRankings.bind(this.data);
+  getCloudPerpsCompare = this.data.getCloudPerpsCompare.bind(this.data);
+  getCloudPerpsLiquidations = this.data.getCloudPerpsLiquidations.bind(this.data);
+  getCloudPerpsDepth = this.data.getCloudPerpsDepth.bind(this.data);
+  getCloudPerpsEquity = this.data.getCloudPerpsEquity.bind(this.data);
+  getCloudPerpsEquities = this.data.getCloudPerpsEquities.bind(this.data);
+  getCloudPerpsMarket = this.data.getCloudPerpsMarket.bind(this.data);
+  analyzeCloudExposure = this.data.analyzeCloudExposure.bind(this.data);
+  getCloudExposureScenarios = this.data.getCloudExposureScenarios.bind(this.data);
+  getCloudSupplyGraph = this.data.getCloudSupplyGraph.bind(this.data);
+  getCloudSupplyChains = this.data.getCloudSupplyChains.bind(this.data);
+  getCloudSupplyGraphs = this.data.getCloudSupplyGraphs.bind(this.data);
+  getCloudSupplyPaths = this.data.getCloudSupplyPaths.bind(this.data);
+  getCloudSupplyChain = this.data.getCloudSupplyChain.bind(this.data);
+  getCloudAwards = this.data.getCloudAwards.bind(this.data);
+  getCloudAward = this.data.getCloudAward.bind(this.data);
+  getCloudDoeBoard = this.data.getCloudDoeBoard.bind(this.data);
+  getCloudDoePrices = this.data.getCloudDoePrices.bind(this.data);
+  getCloudJodiBoard = this.data.getCloudJodiBoard.bind(this.data);
+  getCloudPsdBoard = this.data.getCloudPsdBoard.bind(this.data);
+  getCloudAttention = this.data.getCloudAttention.bind(this.data);
+  getCloudPowerBoard = this.data.getCloudPowerBoard.bind(this.data);
+  getCloudPowerHistory = this.data.getCloudPowerHistory.bind(this.data);
+  getCloudPowerProject = this.data.getCloudPowerProject.bind(this.data);
+  getCloudEuropePower = this.data.getCloudEuropePower.bind(this.data);
+  getCloudEuropePowerHistory = this.data.getCloudEuropePowerHistory.bind(this.data);
+  getCloudEuropeCarbon = this.data.getCloudEuropeCarbon.bind(this.data);
+  getCloudEuropeCarbonHistory = this.data.getCloudEuropeCarbonHistory.bind(this.data);
+  getCloudEuropeGas = this.data.getCloudEuropeGas.bind(this.data);
+  getCloudEuropeGasHistory = this.data.getCloudEuropeGasHistory.bind(this.data);
+  getCloudEuropeGasSeasonal = this.data.getCloudEuropeGasSeasonal.bind(this.data);
+  getCloudGpuBoard = this.data.getCloudGpuBoard.bind(this.data);
+  getCloudGpuHistory = this.data.getCloudGpuHistory.bind(this.data);
+  getCloudGpuEvents = this.data.getCloudGpuEvents.bind(this.data);
+  getCloudCpiBoard = this.data.getCloudCpiBoard.bind(this.data);
+  getCloudTape = this.data.getCloudTape.bind(this.data);
+  getCloudYieldCurve = this.data.getCloudYieldCurve.bind(this.data);
+  getCloudCurve = this.data.getCloudCurve.bind(this.data);
+  getCloudSwapCurve = this.data.getCloudSwapCurve.bind(this.data);
+  getCloudCurveHistory = this.data.getCloudCurveHistory.bind(this.data);
+  getCloudWorldCurves = this.data.getCloudWorldCurves.bind(this.data);
+  getCloudCds = this.data.getCloudCds.bind(this.data);
+  getCloudCdsHistory = this.data.getCloudCdsHistory.bind(this.data);
+  getCloudCdsLevels = this.data.getCloudCdsLevels.bind(this.data);
+  getCloudCdxBoard = this.data.getCloudCdxBoard.bind(this.data);
+  getCloudSovrBoard = this.data.getCloudSovrBoard.bind(this.data);
+  getCloudCongressHouse = this.data.getCloudCongressHouse.bind(this.data);
+  getCloudJobs = this.data.getCloudJobs.bind(this.data);
+  getCloudJobsPostings = this.data.getCloudJobsPostings.bind(this.data);
+  getCloudJobsPosting = this.data.getCloudJobsPosting.bind(this.data);
+  getCloudJobsMovers = this.data.getCloudJobsMovers.bind(this.data);
+  getCloudEarningsCalls = this.data.getCloudEarningsCalls.bind(this.data);
+  getCloudEarningsTranscript = this.data.getCloudEarningsTranscript.bind(this.data);
+  getCloudEarningsCallAudio = this.data.getCloudEarningsCallAudio.bind(this.data);
+  getProxyStatements = this.data.getProxyStatements.bind(this.data);
+  getProxyStatement = this.data.getProxyStatement.bind(this.data);
+  getFilingEvents = this.data.getFilingEvents.bind(this.data);
+  getRiskReports = this.data.getRiskReports.bind(this.data);
+  getRiskReport = this.data.getRiskReport.bind(this.data);
+  getCloudSecFilings = this.data.getCloudSecFilings.bind(this.data);
+  getCloudSecBeneficialOwners = this.data.getCloudSecBeneficialOwners.bind(this.data);
+  getCloudSecInsiderSignals = this.data.getCloudSecInsiderSignals.bind(this.data);
+  getCloudSecFilingDocuments = this.data.getCloudSecFilingDocuments.bind(this.data);
+  getCloudSecFilingContent = this.data.getCloudSecFilingContent.bind(this.data);
+  getCloudSec13F = this.data.getCloudSec13F.bind(this.data);
+  searchCloudDocuments = this.data.searchCloudDocuments.bind(this.data);
+  getCloudSearchDocument = this.data.getCloudSearchDocument.bind(this.data);
+  getCloudSavedSearches = this.data.getCloudSavedSearches.bind(this.data);
+  createCloudSavedSearch = this.data.createCloudSavedSearch.bind(this.data);
+  updateCloudSavedSearch = this.data.updateCloudSavedSearch.bind(this.data);
+  deleteCloudSavedSearch = this.data.deleteCloudSavedSearch.bind(this.data);
+  getCloudNews = this.data.getCloudNews.bind(this.data);
+  searchCloudNews = this.data.searchCloudNews.bind(this.data);
+  getCloudNewsStory = this.data.getCloudNewsStory.bind(this.data);
+  getCloudTickerTweets = this.data.getCloudTickerTweets.bind(this.data);
+  searchCloudTweets = this.data.searchCloudTweets.bind(this.data);
+}
+
+export const apiClient = new GloomApiClient();

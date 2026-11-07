@@ -1,0 +1,883 @@
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useShortcut } from "../../../react/input";
+import {
+  usePaneArrowHold,
+  usePaneArrowsClaimed,
+  usePaneFooter,
+  usePaneHasTabStrip,
+} from "../../layout/pane/footer/registration";
+import type { PaneHint } from "../../layout/pane/footer/model";
+import type { ContextMenuItem } from "../../../types/context-menu";
+import type { ResolvedSeries } from "../../../time-series/types";
+import { isPlainKey } from "../../../utils/keyboard";
+import { keepEscapeFromClosing } from "../../../utils/double-escape-close";
+import { nextDrawingId, nextLevelId } from "./drawing-store";
+import { CHART_TOOL_MENU, KEYBOARD_TOOL_HINTS, ARMED_TOOL_BY_INTERACTION } from "./tool-catalog";
+import {
+  COMPOSITE_KEYBOARD_PAN_RATIO,
+  COMPOSITE_ZOOM_STEP_FACTOR,
+  resolveCompositeChartInteraction,
+  type CompositeNavigationFrame,
+  type CompositeViewportRange,
+} from "./interactions";
+import { levelPanel, roundLevelValue, type CompositeChartLevel } from "./levels";
+import {
+  resolveMeasureAxisDomain,
+  resolveMeasureValueAt,
+  resolveZoomTimeRange,
+  isDrawingTool,
+  nextDrawingColor,
+  shapedDrawingId,
+  type ChartDrawing,
+  type ChartDrawingPoint,
+  type ChartToolDrag,
+  type ChartToolKind,
+} from "./tools";
+import { projectCompositeTimestamp } from "./time-scale";
+import { projectCompositeValue, resolveAdjacentCompositeCursorDate, unprojectCompositeValue } from "./scene";
+import type { CompositeChartProps, CompositeChartScene } from "./types";
+import type { CompositeCursorSource } from "./cursor-source";
+
+/**
+ * A tool placed from the keyboard: Enter anchors it at the cursor, the arrows
+ * move its end and Enter finishes it. Held in data, so a pan, a zoom or a new
+ * bar leaves it on the observations it was placed on.
+ */
+interface KeyboardToolPlacement {
+  kind: ChartToolKind;
+  panelId: string;
+  start: ChartDrawingPoint;
+  end: ChartDrawingPoint;
+  /** Every step the end took: the freehand tool's trail. */
+  path: ChartDrawingPoint[];
+  /** Up or Down set the end's level, so Left and Right stop following the series. */
+  freeValue: boolean;
+}
+
+/** A keyboard placement projected into the plot of the panel that holds it. */
+export interface KeyboardToolDrag {
+  panelId: string;
+  drag: ChartToolDrag;
+  start: ChartDrawingPoint;
+  end: ChartDrawingPoint;
+}
+
+/** The chart's own layout: its tool bar, its legend and its panels' heights. */
+export interface CompositeChartLayoutControls {
+  /** The bar is saved hidden; it still opens while a tool is in hand. */
+  toolbarHidden: boolean;
+  toggleToolbar: () => void;
+  /** The legend has more than one series, so it can fold to its first. */
+  legendCollapsible: boolean;
+  legendCollapsed: boolean;
+  toggleLegend: () => void;
+  /** Two or more panels share the plot, so the keys can move the line between them. */
+  panelsResizable: boolean;
+  stepTopPanel: (direction: 1 | -1) => void;
+  /** Heights were set by hand. */
+  panelHeightsSet: boolean;
+  resetPanelHeights: () => void;
+  /** A panel has the whole plot. */
+  panelMaximized: boolean;
+  restorePanels: () => void;
+}
+
+/** Shift with one of the arrows, and no other modifier. */
+function isShiftedArrow(event: { name?: string; shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean }, ...names: string[]): boolean {
+  return event.shift === true && !event.ctrl && !event.meta && !event.alt && names.includes(event.name ?? "");
+}
+
+/** Shift and a letter, whether or not the terminal reports the shift itself. */
+function isShiftedLetter(event: { name?: string; shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean }, letter: string): boolean {
+  if (event.ctrl || event.meta || event.alt) return false;
+  return event.name === letter.toUpperCase() || (event.shift === true && event.name === letter);
+}
+
+export function useCompositeChartKeyboard({
+  focused,
+  interactive,
+  navigable,
+  enterable,
+  showLegend,
+  scene,
+  cursor,
+  cursorDate,
+  restingCursor,
+  updateCursor,
+  pin,
+  onActivate,
+  timePick,
+  pricePick,
+  levels,
+  visibleLegendSeries,
+  visibleSeriesIds,
+  onToggleSeries,
+  isSeriesToggleable,
+  navigationFrame,
+  activeUserViewport,
+  scaledByHand,
+  panViewportByRatio,
+  zoomViewport,
+  setViewportRange,
+  resetViewport,
+  drawings,
+  selectedDrawingId,
+  setSelectedDrawingId,
+  drawColor,
+  addDrawing,
+  removeDrawing,
+  pickDrawColor,
+  layout,
+}: {
+  focused: boolean;
+  interactive: boolean;
+  navigable: boolean;
+  /** Under a tab strip, moves into the chart for its cursor keys though it does not navigate. */
+  enterable: boolean;
+  showLegend: boolean;
+  /** The chart's scene, without its cursor. */
+  scene: CompositeChartScene | null;
+  /** Where the crosshair is, which moves without rendering the chart. */
+  cursor: CompositeCursorSource | null;
+  cursorDate: CompositeChartProps["cursorDate"];
+  /** `cursorDate` is where the chart's own cursor goes back to, as when the pointer leaves. */
+  restingCursor: boolean;
+  updateCursor: (date: Date | null) => void;
+  /** The tab's crosshair pin, when there is a cursor to pin or a pin to lift. */
+  pin: { pinned: boolean; toggle: () => void } | null;
+  onActivate: CompositeChartProps["onActivate"];
+  timePick: CompositeChartProps["timePick"];
+  pricePick: CompositeChartProps["pricePick"];
+  levels: CompositeChartProps["levels"];
+  visibleLegendSeries: ResolvedSeries[];
+  visibleSeriesIds: ReadonlySet<string>;
+  onToggleSeries: CompositeChartProps["onToggleSeries"];
+  isSeriesToggleable: CompositeChartProps["isSeriesToggleable"];
+  navigationFrame: CompositeNavigationFrame | null;
+  activeUserViewport: CompositeViewportRange | null;
+  /** A value axis was stretched or squeezed by hand, which `resetViewport` also fits again. */
+  scaledByHand: boolean;
+  panViewportByRatio: (shiftRatio: number) => void;
+  zoomViewport: (zoomFactor: number, anchorRatio?: number) => void;
+  setViewportRange: (range: CompositeViewportRange) => void;
+  resetViewport: () => void;
+  drawings: readonly ChartDrawing[];
+  selectedDrawingId: string | null;
+  setSelectedDrawingId: (id: string | null) => void;
+  drawColor: string;
+  addDrawing: (drawing: ChartDrawing) => void;
+  removeDrawing: () => void;
+  pickDrawColor: (color: string) => void;
+  layout: CompositeChartLayoutControls;
+}) {
+  const [legendKeyboardIndex, setLegendKeyboardIndex] = useState<number | null>(null);
+  const [armedTool, setArmedTool] = useState<ChartToolKind | null>(null);
+  const [keyboardPlacement, setKeyboardPlacement] = useState<KeyboardToolPlacement | null>(null);
+  // Whether the user moved into the chart from the pane's tab strip; see `inside`.
+  const [entered, setEnteredState] = useState(false);
+  // Follows every change as it is made, not the next render: a step out (Esc,
+  // Up, focus leaving) and a wheel step in one batch must still enter again.
+  const enteredRef = useRef(entered);
+  const setEntered = useCallback((next: boolean) => {
+    enteredRef.current = next;
+    setEnteredState(next);
+  }, []);
+  const keyboardId = `composite-chart:${useId()}`;
+  const [selectedLevelId, setSelectedLevelId] = useState<string | null>(null);
+  useEffect(() => {
+    setLegendKeyboardIndex((current) => (
+      current === null || visibleLegendSeries.length === 0
+        ? null
+        : Math.min(current, visibleLegendSeries.length - 1)
+    ));
+  }, [visibleLegendSeries.length]);
+  // Sticky while armed: the toolbar chip shows which tool owns the drag, and a
+  // one-shot tool would blink off before the user could see it.
+  const armTool = useCallback((tool: ChartToolKind | null) => {
+    // A tool is placed with the arrows, so picking one moves into the chart.
+    if (tool !== null) setEntered(true);
+    setArmedTool((current) => current === tool ? null : tool);
+    setKeyboardPlacement(null);
+    if (tool === null) setSelectedDrawingId(null);
+    if (tool !== "level") setSelectedLevelId(null);
+  }, [setEntered]);
+  const cancelKeyboardPlacement = useCallback(() => setKeyboardPlacement(null), []);
+  // A press, drag or wheel on the chart moves into it, as Down or Enter do.
+  // Once inside, a wheel step sets nothing: setting the same state right
+  // after the chart rendered still costs React a render of the chart that
+  // bails out, and a pan or zoom renders it on every step.
+  const activateFromPointer = useCallback(() => {
+    if (!enteredRef.current) setEntered(true);
+    onActivate?.();
+  }, [onActivate, setEntered]);
+  const levelHost = useMemo(
+    () => scene && levels ? levelPanel(scene, levels.seriesId) : null,
+    [levels, scene],
+  );
+  const levelItems = levels?.items ?? [];
+  const levelsEditable = !!levels?.onEdit && !!levelHost;
+  const selectedLevel = levelItems.find((level) => level.id === selectedLevelId) ?? null;
+  useEffect(() => {
+    if (selectedLevelId && !selectedLevel) setSelectedLevelId(null);
+  }, [selectedLevel, selectedLevelId]);
+  // The keys step on from the crosshair wherever the pointer or another chart
+  // left it, read as it moves: a move does not render the chart.
+  const keyboardCursorDateRef = useRef<Date | null>(null);
+  keyboardCursorDateRef.current = cursor?.scene().cursorDate ?? null;
+  useEffect(() => cursor?.subscribe(() => {
+    keyboardCursorDateRef.current = cursor.scene().cursorDate;
+  }), [cursor]);
+
+  // The cursor keys belong to every focused chart; pan, zoom, the tools and
+  // their keys only to one that navigates.
+  const arrowsClaimed = usePaneArrowsClaimed();
+  const keyboardActive = focused && interactive;
+  const toolsActive = keyboardActive && navigable;
+  // Under a tab strip, a chart you pan and draw on is one focus level down: the
+  // strip keeps Left, Right, h and l until Down, Enter, a click or a tool moves
+  // into the chart, and Esc or Up hands them back. A pane with no strip (G)
+  // leaves the chart its keys throughout. A read-only chart stays at the
+  // strip's level unless it is enterable.
+  const paneHasStrip = usePaneHasTabStrip();
+  const zoned = (navigable || enterable) && paneHasStrip;
+  const inside = zoned && entered;
+  usePaneArrowHold(focused && inside);
+  // The next visit to the pane or the tab starts at the strip.
+  const wasFocusedRef = useRef(focused);
+  useEffect(() => {
+    if (wasFocusedRef.current && !focused) setEntered(false);
+    wasFocusedRef.current = focused;
+  }, [focused, setEntered]);
+  // A time or a price is picked with the arrows and Enter.
+  const picking = !!timePick || !!pricePick;
+  useEffect(() => {
+    if (picking) setEntered(true);
+  }, [picking, setEntered]);
+  useEffect(() => {
+    if (!toolsActive) setKeyboardPlacement(null);
+  }, [toolsActive]);
+  const legendKeysActive = keyboardActive && showLegend && visibleLegendSeries.length > 0;
+  const legendEntry = legendKeyboardIndex === null ? undefined : visibleLegendSeries[legendKeyboardIndex];
+  const legendEntryToggleable = !!legendEntry && !!onToggleSeries && (isSeriesToggleable?.(legendEntry) ?? true);
+  const anyLegendToggleable = legendKeysActive && !!onToggleSeries
+    && visibleLegendSeries.some((entry) => isSeriesToggleable?.(entry) ?? true);
+  // With a drawing tool in hand, [ and ] step through the drawings instead of
+  // the legend, the way a click with that tool picks one.
+  const drawingKeysActive = toolsActive && isDrawingTool(armedTool) && drawings.length > 0 && !keyboardPlacement;
+  // Backspace only deletes what the user is working on; otherwise it is the
+  // pane's back key.
+  const canDeleteDrawing = toolsActive && drawings.length > 0 && (!!selectedDrawingId || isDrawingTool(armedTool));
+  // An owner that holds the cursor decides when it goes, so Esc stays the pane's.
+  const clearableCursor = () => !!cursor?.scene().cursorDate && cursorDate === undefined;
+
+  const enterChart = () => {
+    setEntered(true);
+    // The cursor shows where the keys went, starting on the latest bar.
+    if (!scene || cursorDate !== undefined || keyboardCursorDateRef.current) return;
+    const date = resolveAdjacentCompositeCursorDate(scene, null, -1);
+    keyboardCursorDateRef.current = date;
+    updateCursor(date);
+  };
+  const leaveChart = () => {
+    setEntered(false);
+    setLegendKeyboardIndex(null);
+    // Stepping out to the strip leaves a pinned crosshair where it is. A
+    // cursor that rests on the owner's bar goes back there, as when the
+    // pointer leaves.
+    if ((!clearableCursor() && !restingCursor) || pin?.pinned) return;
+    keyboardCursorDateRef.current = null;
+    updateCursor(null);
+  };
+  const placementPanel = (panelId: string) => scene?.panels.find((panel) => panel.id === panelId) ?? null;
+  const startKeyboardPlacement = () => {
+    if (!scene || !armedTool) return;
+    const panel = scene.panels.find((entry) => resolveMeasureAxisDomain(entry) !== null);
+    const domain = panel ? resolveMeasureAxisDomain(panel) : null;
+    const date = keyboardCursorDateRef.current ?? resolveAdjacentCompositeCursorDate(scene, null, -1);
+    if (!panel || !domain || !date) return;
+    const time = date.getTime();
+    const value = resolveMeasureValueAt(panel, time) ?? unprojectCompositeValue(0.5, domain);
+    if (value === null) return;
+    const anchor = { time, value };
+    onActivate?.();
+    if (isDrawingTool(armedTool)) setSelectedDrawingId(null);
+    setKeyboardPlacement({ kind: armedTool, panelId: panel.id, start: anchor, end: anchor, path: [anchor], freeValue: false });
+    keyboardCursorDateRef.current = date;
+    updateCursor(date);
+  };
+  /** Moves the end to a new bar, following the series until Up or Down set a level. */
+  const moveKeyboardPlacement = (
+    placement: KeyboardToolPlacement,
+    move: { time: number } | { level: 1 | -1 },
+  ): KeyboardToolPlacement | null => {
+    const panel = placementPanel(placement.panelId);
+    const domain = panel ? resolveMeasureAxisDomain(panel) : null;
+    if (!panel || !domain) return null;
+    let { time, value } = placement.end;
+    let freeValue = placement.freeValue;
+    if ("level" in move) {
+      // Half a row per press: fine enough to reach a wick, quick enough to cross the plot.
+      const step = 1 / (2 * Math.max(panel.height - 1, 1));
+      const ratio = projectCompositeValue(value, domain) ?? 0.5;
+      value = unprojectCompositeValue(Math.max(0, Math.min(1, ratio - move.level * step)), domain) ?? value;
+      freeValue = true;
+    } else {
+      time = move.time;
+      if (!freeValue) value = resolveMeasureValueAt(panel, time) ?? value;
+    }
+    const end = { time, value };
+    return { ...placement, end, path: [...placement.path, end], freeValue };
+  };
+  const finishKeyboardPlacement = () => {
+    const placement = keyboardPlacement;
+    setKeyboardPlacement(null);
+    // A placement that never left its anchor spans nothing, like a click.
+    if (!placement || (placement.start.time === placement.end.time && placement.kind !== "ray")) return;
+    if (placement.kind === "zoom") {
+      if (!navigationFrame) return;
+      const range = resolveZoomTimeRange(placement.start.time, placement.end.time, navigationFrame.minimumSpanMs);
+      if (range) setViewportRange(range);
+      return;
+    }
+    if (!isDrawingTool(placement.kind)) return;
+    const points = placement.kind === "pencil"
+      ? placement.path.filter((point, index, path) => (
+        index === 0 || point.time !== path[index - 1]!.time || point.value !== path[index - 1]!.value
+      ))
+      : [placement.start, placement.kind === "ray" ? { ...placement.end, value: placement.start.value } : placement.end];
+    if (points.length < 2) return;
+    addDrawing({ id: shapedDrawingId(placement.kind, nextDrawingId()), panelId: placement.panelId, points, color: drawColor });
+  };
+  const stepLegend = (direction: -1 | 1) => {
+    onActivate?.();
+    // The series stepped to must be on screen.
+    if (layout.legendCollapsed) layout.toggleLegend();
+    setLegendKeyboardIndex((current) => (
+      current === null
+        ? direction > 0 ? 0 : visibleLegendSeries.length - 1
+        : (current + direction + visibleLegendSeries.length) % visibleLegendSeries.length
+    ));
+  };
+  const toggleLegendEntry = () => {
+    if (!legendEntry || !legendEntryToggleable) return;
+    onActivate?.();
+    onToggleSeries?.(legendEntry.id);
+  };
+  /** The levels' series price at the keyboard cursor, or the last price without a cursor. */
+  const priceAtCursor = (): number | null => {
+    if (!levels || !levelHost || !scene) return null;
+    const { panel, domain } = levelHost;
+    const date = keyboardCursorDateRef.current ?? scene.dates.at(-1) ?? null;
+    // The levels' own series, not whichever one the panel lists first.
+    const pricePanel = { ...panel, series: panel.series.filter((entry) => entry.source.id === levels.seriesId) };
+    const value = (date ? resolveMeasureValueAt(pricePanel, date.getTime()) : null)
+      ?? (panel.lastPrice?.seriesId === levels.seriesId ? panel.lastPrice.value : null)
+      ?? unprojectCompositeValue(0.5, domain);
+    return value === null ? null : roundLevelValue(value, domain);
+  };
+  /** A level at the keyboard cursor's price, or the last price without a cursor. */
+  const addLevelAtCursor = () => {
+    if (!levels?.onEdit) return;
+    const rounded = priceAtCursor();
+    if (rounded === null) return;
+    onActivate?.();
+    // Enter again at the same cursor picks the level already there.
+    const existing = levelItems.find((level) => level.editable && level.value === rounded);
+    if (existing) {
+      setSelectedLevelId(existing.id);
+      return;
+    }
+    const id = nextLevelId();
+    levels.onEdit({ kind: "add", id, value: rounded });
+    setSelectedLevelId(id);
+  };
+  /** Half a row per press, like a keyboard-placed tool's end. */
+  const nudgeLevel = (level: CompositeChartLevel, direction: 1 | -1) => {
+    if (!levels?.onEdit || !levelHost) return;
+    const { panel, domain } = levelHost;
+    const ratio = projectCompositeValue(level.value, domain);
+    if (ratio === null) return;
+    const step = 1 / (2 * Math.max(panel.height - 1, 1));
+    const value = unprojectCompositeValue(Math.max(0, Math.min(1, ratio - direction * step)), domain);
+    if (value !== null) levels.onEdit({ kind: "move", id: level.id, value: roundLevelValue(value, domain) });
+  };
+  const stepLevel = (direction: -1 | 1) => {
+    // Top to bottom, the order they read in on the plot.
+    const ordered = [...levelItems].sort((left, right) => right.value - left.value);
+    if (ordered.length === 0) return;
+    const index = ordered.findIndex((level) => level.id === selectedLevelId);
+    const next = index < 0
+      ? direction > 0 ? 0 : ordered.length - 1
+      : (index + direction + ordered.length) % ordered.length;
+    setSelectedLevelId(ordered[next]!.id);
+  };
+  const removeSelectedLevel = () => {
+    // An order's line moves here; it is cancelled where the order is.
+    if (!selectedLevel?.editable || selectedLevel.draggable) return;
+    levels?.onEdit?.({ kind: "remove", id: selectedLevel.id });
+    setSelectedLevelId(null);
+  };
+  const runLevelAction = () => {
+    if (selectedLevel?.actionable) levels?.action?.run(selectedLevel);
+  };
+  const stepDrawing = (direction: -1 | 1) => {
+    if (drawings.length === 0) return;
+    const index = drawings.findIndex((drawing) => drawing.id === selectedDrawingId);
+    const next = index < 0
+      ? direction > 0 ? 0 : drawings.length - 1
+      : (index + direction + drawings.length) % drawings.length;
+    setSelectedDrawingId(drawings[next]!.id);
+  };
+  const keyboardToolDrag = useMemo<KeyboardToolDrag | null>(() => {
+    if (!keyboardPlacement || !scene) return null;
+    const panel = scene.panels.find((entry) => entry.id === keyboardPlacement.panelId);
+    const domain = panel ? resolveMeasureAxisDomain(panel) : null;
+    if (!panel || !domain) return null;
+    const project = (point: ChartDrawingPoint) => {
+      const xRatio = projectCompositeTimestamp(scene.timeScale, point.time)?.ratio;
+      const yRatio = projectCompositeValue(point.value, domain);
+      return typeof xRatio === "number" && yRatio !== null ? { xRatio, yRatio } : null;
+    };
+    const start = project(keyboardPlacement.start);
+    const end = project(keyboardPlacement.end);
+    if (!start || !end) return null;
+    return {
+      panelId: panel.id,
+      start: keyboardPlacement.start,
+      end: keyboardPlacement.end,
+      drag: {
+        kind: keyboardPlacement.kind,
+        startXRatio: start.xRatio,
+        startYRatio: start.yRatio,
+        endXRatio: end.xRatio,
+        endYRatio: end.yRatio,
+        path: keyboardPlacement.path.flatMap((point) => {
+          const projected = project(point);
+          return projected ? [projected] : [];
+        }),
+      },
+    };
+  }, [keyboardPlacement, scene]);
+
+  // Scoped, so the chart sees its keys before an older pane or stack handler
+  // (Backspace back, Esc close) whichever mounted first; a dialog opened over
+  // it is a newer scope and still comes first.
+  useShortcut((event) => {
+    if (!keyboardActive) return;
+    const consume = () => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    if (timePick && scene && isPlainKey(event, "return", "enter", "escape")) {
+      consume();
+      // A pick, like a placement below, is unfinished input: ending it is no half of a close.
+      if (event.name === "escape") {
+        keepEscapeFromClosing(event);
+        timePick.onCancel();
+      }
+      else chartActionsRef.current.pick();
+      return;
+    }
+    // Esc ends a price pick even with nothing drawn yet; Enter needs a price at the cursor.
+    if (pricePick && (scene || isPlainKey(event, "escape")) && isPlainKey(event, "return", "enter", "escape")) {
+      consume();
+      if (event.name === "escape") {
+        keepEscapeFromClosing(event);
+        pricePick.onCancel();
+      }
+      else chartActionsRef.current.pickPrice();
+      return;
+    }
+    if (zoned && !entered && isPlainKey(event, "down", "return", "enter")) {
+      consume();
+      enterChart();
+      return;
+    }
+    const levelKeys = toolsActive && armedTool === "level" && levelsEditable && !keyboardPlacement;
+    if (levelKeys && isPlainKey(event, "return", "enter")) {
+      consume();
+      addLevelAtCursor();
+      return;
+    }
+    if (levelKeys && selectedLevel?.editable && isPlainKey(event, "up", "down")) {
+      consume();
+      nudgeLevel(selectedLevel, event.name === "up" ? 1 : -1);
+      return;
+    }
+    if (levelKeys && levelItems.length > 0 && isPlainKey(event, "[", "]")) {
+      consume();
+      stepLevel(event.name === "[" ? -1 : 1);
+      return;
+    }
+    if (toolsActive && selectedLevel?.editable && !selectedLevel.draggable && levelsEditable && isPlainKey(event, "backspace", "delete")) {
+      consume();
+      removeSelectedLevel();
+      return;
+    }
+    // Taken even once the level has its alert, which then says so, so a quick
+    // second press never falls through to the plain `a` pan.
+    if (toolsActive && selectedLevel && levels?.action && isShiftedLetter(event, "a")) {
+      consume();
+      levels.action.run(selectedLevel);
+      return;
+    }
+    if (toolsActive && armedTool && isPlainKey(event, "return", "enter") && scene) {
+      consume();
+      if (keyboardPlacement) finishKeyboardPlacement();
+      else startKeyboardPlacement();
+      return;
+    }
+    if (keyboardPlacement && (isPlainKey(event, "escape") || isPlainKey(event, "backspace"))) {
+      consume();
+      keepEscapeFromClosing(event);
+      setKeyboardPlacement(null);
+      return;
+    }
+    if (keyboardPlacement && keyboardPlacement.kind !== "zoom" && isPlainKey(event, "up", "down")) {
+      consume();
+      const level = event.name === "up" ? 1 : -1;
+      setKeyboardPlacement((current) => current && moveKeyboardPlacement(current, { level }));
+      return;
+    }
+    if (toolsActive && isShiftedLetter(event, "t")) {
+      consume();
+      layout.toggleToolbar();
+      return;
+    }
+    if (legendKeysActive && layout.legendCollapsible && isShiftedLetter(event, "l")) {
+      consume();
+      layout.toggleLegend();
+      return;
+    }
+    if (toolsActive && layout.panelsResizable && isShiftedArrow(event, "up", "down")) {
+      consume();
+      layout.stepTopPanel(event.name === "up" ? 1 : -1);
+      return;
+    }
+    if (isPlainKey(event, "[", "]") && (drawingKeysActive || legendKeysActive)) {
+      consume();
+      const direction = event.name === "[" ? -1 : 1;
+      if (drawingKeysActive) stepDrawing(direction);
+      else stepLegend(direction);
+      return;
+    }
+    if (isPlainKey(event, "space") && legendKeysActive && legendEntryToggleable) {
+      consume();
+      toggleLegendEntry();
+      return;
+    }
+    if (isPlainKey(event, "escape") && toolsActive && (armedTool || selectedDrawingId || selectedLevelId)) {
+      consume();
+      setArmedTool(null);
+      setSelectedDrawingId(null);
+      setSelectedLevelId(null);
+      return;
+    }
+    if (isPlainKey(event, "escape") && legendKeysActive && legendKeyboardIndex !== null && !clearableCursor()) {
+      consume();
+      setLegendKeyboardIndex(null);
+      return;
+    }
+    // Then Esc lifts a pin, whether or not the pinned moment is on this
+    // chart's bars, and before an owner that holds the cursor (a pane's
+    // selected date) gets it: the pin shows over that cursor until it goes.
+    if (pin?.pinned && isPlainKey(event, "escape")) {
+      consume();
+      pin.toggle();
+      return;
+    }
+    // Whatever a tool or a pick held is gone by now, so Esc steps out to the
+    // strip, and so does Up: the strip sits above. Consumed, so leaving never
+    // counts toward a double-Esc close.
+    if (inside && isPlainKey(event, "escape", "up")) {
+      consume();
+      leaveChart();
+      return;
+    }
+    const interaction = resolveCompositeChartInteraction(event);
+    if (!interaction) return;
+    const cursorInteraction = interaction === "cursor-left"
+      || interaction === "cursor-right"
+      || interaction === "clear-cursor";
+    if (!cursorInteraction && !toolsActive) return;
+    if (
+      (interaction === "clear-cursor" && !clearableCursor())
+      || ((interaction === "arm-measure"
+        || interaction === "arm-zoom"
+        || interaction === "arm-line"
+        || interaction === "arm-pencil"
+        || interaction === "arm-ray"
+        || interaction === "arm-rect"
+        || interaction === "arm-fib") && !scene)
+      || (interaction === "arm-level" && !levelsEditable)
+      || (interaction === "delete-drawing" && !canDeleteDrawing)
+      || (interaction === "cycle-colour" && !isDrawingTool(armedTool) && !selectedDrawingId)
+      // A focused tab strip in the pane keeps the arrows until the user moves
+      // into a chart they pan and draw on, or an enterable one; any other
+      // read-only chart never takes them.
+      || ((interaction === "cursor-left" || interaction === "cursor-right") && (!scene || (arrowsClaimed && !inside)))
+      || ((interaction === "zoom-in"
+        || interaction === "zoom-out"
+        || interaction === "pan-left"
+        || interaction === "pan-right") && !navigationFrame)
+    ) {
+      return;
+    }
+    consume();
+    switch (interaction) {
+      case "arm-measure":
+      case "arm-zoom":
+      case "arm-line":
+      case "arm-pencil":
+      case "arm-ray":
+      case "arm-rect":
+      case "arm-fib":
+      case "arm-level":
+        onActivate?.();
+        armTool(ARMED_TOOL_BY_INTERACTION[interaction]);
+        return;
+      case "delete-drawing":
+        removeDrawing();
+        return;
+      case "cycle-colour":
+        pickDrawColor(nextDrawingColor(drawColor));
+        return;
+      case "clear-cursor":
+        keyboardCursorDateRef.current = null;
+        updateCursor(null);
+        return;
+      case "cursor-left":
+      case "cursor-right": {
+        const nextDate = resolveAdjacentCompositeCursorDate(
+          scene!,
+          keyboardCursorDateRef.current,
+          interaction === "cursor-left" ? -1 : 1,
+        );
+        keyboardCursorDateRef.current = nextDate;
+        updateCursor(nextDate);
+        if (nextDate && keyboardPlacement) {
+          const time = nextDate.getTime();
+          setKeyboardPlacement((current) => current && moveKeyboardPlacement(current, { time }));
+        }
+        return;
+      }
+      case "pan-left":
+        panViewportByRatio(COMPOSITE_KEYBOARD_PAN_RATIO);
+        return;
+      case "pan-right":
+        panViewportByRatio(-COMPOSITE_KEYBOARD_PAN_RATIO);
+        return;
+      case "reset":
+        resetViewport();
+        return;
+      case "zoom-in":
+        zoomViewport(COMPOSITE_ZOOM_STEP_FACTOR);
+        return;
+      case "zoom-out":
+        zoomViewport(1 / COMPOSITE_ZOOM_STEP_FACTOR);
+    }
+  }, { enabled: keyboardActive, scope: keyboardId });
+
+  // The keys a mode adds show where they act: Enter with a tool in hand, Space
+  // on a legend entry. Everything else the chart answers is in the pane menu.
+  // Footer and menu entries outlive the render that registered them, so they
+  // call through to this render's actions.
+  const chartActions = {
+    pick: () => {
+      const date = keyboardCursorDateRef.current ?? scene?.dates.at(-1) ?? null;
+      if (date) timePick?.onPick(date);
+    },
+    pickPrice: () => {
+      const value = priceAtCursor();
+      if (value !== null) pricePick?.onPick(value);
+    },
+    start: armedTool === "level" ? addLevelAtCursor : startKeyboardPlacement,
+    finish: finishKeyboardPlacement,
+    stepLevel,
+    removeLevel: removeSelectedLevel,
+    levelAction: runLevelAction,
+    toggleLegend: toggleLegendEntry,
+    stepLegend,
+    stepDrawing,
+    removeDrawing,
+    cycleColour: () => pickDrawColor(nextDrawingColor(drawColor)),
+    reset: resetViewport,
+    arm: (tool: ChartToolKind) => {
+      onActivate?.();
+      armTool(tool);
+    },
+    leave: leaveChart,
+    togglePin: () => pin?.toggle(),
+    layout,
+  };
+  const chartActionsRef = useRef(chartActions);
+  chartActionsRef.current = chartActions;
+  // Inside the chart the footer names the way back first, so it never falls
+  // behind More; on the strip there is nothing to say.
+  const leaveHint = keyboardActive && inside;
+  usePaneFooter(`${keyboardId}:leave`, () => leaveHint
+    ? { order: -2, hints: [{ id: "chart-leave", key: "Esc", label: "tabs", title: "Back to Tabs", onPress: () => chartActionsRef.current.leave() }] }
+    : null, [leaveHint]);
+  const armedHints = armedTool ? KEYBOARD_TOOL_HINTS[armedTool] : null;
+  const placing = !!keyboardPlacement;
+  const legendEntryVisible = !!legendEntry && visibleSeriesIds.has(legendEntry.id);
+  const resettable = !!activeUserViewport || scaledByHand;
+  const timePickLabel = timePick?.label ?? (levelHost ? pricePick?.label : null) ?? null;
+  const pickingPrice = !timePick && !!pricePick;
+  const levelActionHint = selectedLevel?.actionable && levels?.action ? levels.action : null;
+  const levelToolKeys = toolsActive && armedTool === "level" && levelsEditable;
+  const canDeleteLevel = toolsActive && levelsEditable && !!selectedLevel?.editable && !selectedLevel.draggable;
+  const pinState = pin ? pin.pinned : null;
+  // Hidden as it shows: a saved hidden bar is open while a tool is in hand.
+  const toolbarHidden = layout.toolbarHidden && armedTool === null;
+  const {
+    legendCollapsible,
+    legendCollapsed,
+    panelsResizable,
+    panelHeightsSet,
+    panelMaximized,
+  } = layout;
+  usePaneFooter(keyboardId, () => {
+    if (!keyboardActive || !scene) return null;
+    const hints: PaneHint[] = [];
+    if (timePickLabel) {
+      hints.push({ id: "chart-pick", key: "Enter", label: timePickLabel, onPress: () => pickingPrice ? chartActionsRef.current.pickPrice() : chartActionsRef.current.pick() });
+    } else if (toolsActive && armedHints) {
+      hints.push(placing
+        ? { id: "chart-tool", key: "Enter", label: armedHints.finish, title: armedHints.finishTitle, onPress: () => chartActionsRef.current.finish() }
+        : { id: "chart-tool", key: "Enter", label: armedHints.start, title: armedHints.startTitle, onPress: () => chartActionsRef.current.start() });
+    }
+    if (toolsActive && levelActionHint) {
+      hints.push({
+        id: "chart-level-action",
+        key: "Shift+A",
+        label: levelActionHint.label,
+        title: levelActionHint.title,
+        onPress: () => chartActionsRef.current.levelAction(),
+      });
+    }
+    if (pinState !== null) {
+      hints.push({
+        id: "chart-pin",
+        key: "p",
+        // "[p]in", and "[p] unpin" for the word that does not start with its key.
+        label: pinState ? " unpin" : "in",
+        title: pinState ? "Unpin Crosshair" : "Pin Crosshair",
+        // A pane whose own `p` means something else keeps it.
+        yieldsKey: true,
+        onPress: () => chartActionsRef.current.togglePin(),
+      });
+    }
+    if (legendKeysActive && legendEntryToggleable) {
+      hints.push({
+        id: "chart-series",
+        key: "Space",
+        label: legendEntryVisible ? "hide" : "show",
+        title: legendEntryVisible ? "Hide Series" : "Show Series",
+        onPress: () => chartActionsRef.current.toggleLegend(),
+      });
+    }
+    const menu: ContextMenuItem[] = [];
+    if (toolsActive) {
+      for (const tool of CHART_TOOL_MENU.filter((entry) => entry.kind !== "level" || levelsEditable)) {
+        menu.push({
+          id: `chart-tool-${tool.kind}`,
+          label: tool.label,
+          accelerator: tool.accelerator,
+          checked: armedTool === tool.kind,
+          onSelect: () => chartActionsRef.current.arm(tool.kind),
+        });
+      }
+      if (drawingKeysActive) {
+        menu.push({ id: "chart-drawing-next", label: "Next Drawing", accelerator: "]", onSelect: () => chartActionsRef.current.stepDrawing(1) });
+      }
+      if (canDeleteDrawing) {
+        menu.push({ id: "chart-drawing-delete", label: "Delete Drawing", accelerator: "Backspace", onSelect: () => chartActionsRef.current.removeDrawing() });
+      }
+      if (levelToolKeys && levelItems.length > 0) {
+        menu.push({ id: "chart-level-next", label: "Next Level", accelerator: "]", onSelect: () => chartActionsRef.current.stepLevel(1) });
+      }
+      if (canDeleteLevel) {
+        menu.push({ id: "chart-level-delete", label: "Delete Level", accelerator: "Backspace", onSelect: () => chartActionsRef.current.removeLevel() });
+      }
+      if (isDrawingTool(armedTool) || selectedDrawingId) {
+        menu.push({
+          id: "chart-drawing-colour",
+          label: "Drawing Colour",
+          accelerator: "c",
+          onSelect: () => chartActionsRef.current.cycleColour(),
+        });
+      }
+      if (resettable) menu.push({ id: "chart-reset", label: "Reset Zoom", accelerator: "0", onSelect: () => chartActionsRef.current.reset() });
+      menu.push({
+        id: "chart-toolbar",
+        label: toolbarHidden ? "Show Drawing Tools" : "Hide Drawing Tools",
+        accelerator: "Shift+T",
+        onSelect: () => chartActionsRef.current.layout.toggleToolbar(),
+      });
+      if (panelsResizable) {
+        menu.push({ id: "chart-panel-taller", label: "Taller Top Panel", accelerator: "Shift+Up", onSelect: () => chartActionsRef.current.layout.stepTopPanel(1) });
+        menu.push({ id: "chart-panel-shorter", label: "Shorter Top Panel", accelerator: "Shift+Down", onSelect: () => chartActionsRef.current.layout.stepTopPanel(-1) });
+      }
+      if (panelMaximized) {
+        menu.push({ id: "chart-panels-restore", label: "Show All Panels", onSelect: () => chartActionsRef.current.layout.restorePanels() });
+      } else if (panelHeightsSet) {
+        menu.push({ id: "chart-panels-reset", label: "Reset Panel Heights", onSelect: () => chartActionsRef.current.layout.resetPanelHeights() });
+      }
+    }
+    if (legendKeysActive && legendCollapsible) {
+      menu.push({
+        id: "chart-legend",
+        label: legendCollapsed ? "Expand Legend" : "Collapse Legend",
+        accelerator: "Shift+L",
+        onSelect: () => chartActionsRef.current.layout.toggleLegend(),
+      });
+    }
+    if (legendKeysActive && anyLegendToggleable && !drawingKeysActive) {
+      menu.push({ id: "chart-series-next", label: "Next Series", accelerator: "]", onSelect: () => chartActionsRef.current.stepLegend(1) });
+    }
+    return { order: 10, hints, menu };
+  }, [
+    armedHints,
+    anyLegendToggleable,
+    armedTool,
+    canDeleteDrawing,
+    drawingKeysActive,
+    keyboardActive,
+    legendEntryToggleable,
+    legendEntryVisible,
+    legendKeysActive,
+    placing,
+    resettable,
+    !!scene,
+    selectedDrawingId,
+    timePickLabel,
+    pickingPrice,
+    levelActionHint,
+    levelToolKeys,
+    levelItems.length,
+    canDeleteLevel,
+    levelsEditable,
+    toolsActive,
+    pinState,
+    toolbarHidden,
+    legendCollapsible,
+    legendCollapsed,
+    panelsResizable,
+    panelHeightsSet,
+    panelMaximized,
+  ]);
+
+  return {
+    armedTool,
+    armTool,
+    cancelKeyboardPlacement,
+    activateFromPointer,
+    legendKeyboardIndex,
+    levelHost,
+    levelsEditable,
+    selectedLevelId,
+    setSelectedLevelId,
+    keyboardToolDrag,
+  };
+}

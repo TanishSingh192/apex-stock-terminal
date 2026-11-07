@@ -1,0 +1,543 @@
+import { apiClient } from "../../../api-client";
+import type {
+  DebtBand,
+  DebtFact,
+  DebtMaturitiesPayload,
+  DebtMetric,
+  DebtQuarter,
+} from "../../../api-client/debt-maturities";
+import { ApiRequestError } from "../../../api-client/errors";
+import { listingAbroad, type IssuerListingParams } from "../../../api-client/paths";
+import { createPluginCache } from "../../../data/plugin-cache";
+import { secListingKey } from "../../../utils/sec";
+import {
+  cachedCloudResource,
+  loadCloudResource,
+  unavailableOnServer,
+} from "../shared/cloud-resource";
+
+export const debtMaturitiesCache = createPluginCache<DebtMaturitiesPayload>({
+  kind: "debt-maturities",
+  source: "gloom-cloud",
+  // 2: payloads that can hold a schedule in its filing's own bands, so an
+  // answer cached before them (one that left the schedule out) is asked again.
+  schemaVersion: 2,
+  policy: { staleMs: 6 * 60 * 60_000, expireMs: 14 * 24 * 60 * 60_000 },
+});
+export const BUCKET_IDS = [
+  "InNextTwelveMonths",
+  "InYearTwo",
+  "InYearThree",
+  "InYearFour",
+  "InYearFive",
+  "AfterYearFive",
+] as const;
+/** Rolling-period concepts some filers (JPM from FY2023) use for the same buckets. */
+const ROLLING_BUCKET_TAGS = [
+  "InNextRollingTwelveMonths",
+  "InRollingYearTwo",
+  "InRollingYearThree",
+  "InRollingYearFour",
+  "InRollingYearFive",
+  "InRollingAfterYearFive",
+] as const;
+const number = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+const nullableNumber = (value: unknown) => value === null || number(value);
+const day = (value: unknown): value is string =>
+  typeof value === "string" &&
+  /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+  Number.isFinite(Date.parse(value)) &&
+  new Date(value).toISOString().slice(0, 10) === value;
+const nullableDay = (value: unknown) => value === null || day(value);
+const annualPeriod = (start: string, end: string) => {
+  const days = (Date.parse(end) - Date.parse(start)) / 86_400_000 + 1;
+  return days >= 350 && days <= 380;
+};
+const accession = (value: unknown) =>
+  typeof value === "string" && /^\d{10}-\d{2}-\d{6}$/.test(value);
+const textOrNull = (value: unknown) =>
+  value === null || typeof value === "string";
+const currency = (value: unknown) =>
+  typeof value === "string" && /^[A-Z]{3}$/.test(value);
+const sourceUrl = (value: unknown) =>
+  typeof value === "string" &&
+  /^https:\/\/(?:www\.|data\.)?sec\.gov\//.test(value);
+/** A report's own page or document, wherever it is published. */
+const httpsUrl = (value: unknown) =>
+  typeof value === "string" && URL.canParse(value) && new URL(value).protocol === "https:";
+/** SEC's annual forms a schedule by year is read from. */
+const ANNUAL_FORM = /^(10-K|20-F|40-F)(\/A)?$/;
+const near = (a: number | null, b: number | null) =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    Math.abs(a - b) <= Math.max(1, Math.abs(b)) * 1e-8);
+
+function validFact(fact: DebtFact): boolean {
+  return (
+    !!fact &&
+    number(fact.value) &&
+    typeof fact.tag === "string" &&
+    !!fact.tag &&
+    currency(fact.unit) &&
+    nullableDay(fact.start) &&
+    day(fact.end) &&
+    day(fact.filed) &&
+    fact.end <= fact.filed &&
+    (fact.start === null || fact.start <= fact.end) &&
+    accession(fact.accession) &&
+    ANNUAL_FORM.test(fact.form)
+  );
+}
+function validMetric(
+  metric: DebtMetric,
+  latest: NonNullable<DebtMaturitiesPayload["latest"]>,
+  unit: string,
+): boolean {
+  if (
+    !metric ||
+    !nullableNumber(metric.value) ||
+    metric.unit !== unit ||
+    metric.asOf !== latest.asOf ||
+    metric.filed !== latest.filed
+  )
+    return false;
+  const p = metric.percentile;
+  return (
+    !!p &&
+    nullableNumber(p.value) &&
+    (p.value === null || p.value <= 100) &&
+    nullableNumber(p.rank) &&
+    Number.isInteger(p.sampleCount) &&
+    p.sampleCount >= 0 &&
+    p.minimumSamples === 5 &&
+    (p.value === null ||
+      (metric.value !== null && p.sampleCount >= p.minimumSamples)) &&
+    [p.min, p.max, p.mean].every(nullableNumber) &&
+    day(p.windowStart) &&
+    p.windowEnd === latest.asOf &&
+    p.windowStart <= p.windowEnd &&
+    nullableDay(p.historyStart) &&
+    nullableDay(p.historyEnd) &&
+    (p.historyStart === null || p.historyStart >= p.windowStart) &&
+    (p.historyEnd === null || p.historyEnd <= p.windowEnd)
+  );
+}
+
+/**
+ * A 10-Q newer than the schedule, in its currency, whose amounts are facts of
+ * that filing on its own balance-sheet date. Servers before it was added send
+ * no field, which reads as no newer 10-Q.
+ */
+function validQuarter(
+  quarter: DebtQuarter,
+  latest: NonNullable<DebtMaturitiesPayload["latest"]>,
+): boolean {
+  const fact = (value: DebtFact | null) =>
+    value === null ||
+    (!!value &&
+      number(value.value) &&
+      typeof value.tag === "string" &&
+      !!value.tag &&
+      value.unit === quarter.currency &&
+      value.start === null &&
+      value.end === quarter.asOf &&
+      value.accession === quarter.accession &&
+      value.filed === quarter.filed &&
+      value.form === quarter.form);
+  return (
+    !!quarter &&
+    day(quarter.asOf) &&
+    day(quarter.filed) &&
+    quarter.asOf <= quarter.filed &&
+    quarter.asOf > latest.asOf &&
+    accession(quarter.accession) &&
+    /^10-Q(\/A)?$/.test(quarter.form) &&
+    quarter.currency === latest.currency &&
+    sourceUrl(quarter.filingUrl) &&
+    fact(quarter.current) &&
+    fact(quarter.noncurrent) &&
+    (quarter.current !== null || quarter.noncurrent !== null)
+  );
+}
+
+/**
+ * Reject mixed filing/currency cohorts and preserve absent principal as null.
+ * The latest 10-Q is optional and additive: one that does not hold up, or
+ * comes with no annual schedule, is dropped and the schedule stands. The
+ * payload keeps the field only when it carries a 10-Q.
+ */
+export function validateDebtMaturities(
+  data: DebtMaturitiesPayload,
+  symbol: string,
+): DebtMaturitiesPayload {
+  if (data?.version === 2 && typeof data.latest === "object" && data.latest !== null && "sourceBuckets" in data.latest)
+    return validateBands(data, symbol);
+  if (!data || typeof data !== "object" || !("latestQuarter" in data)) return validateSchedule(data, symbol);
+  const { latestQuarter, ...schedule } = data;
+  const valid = validateSchedule(schedule, symbol);
+  return latestQuarter != null && valid.latest && validQuarter(latestQuarter, valid.latest) ? data : valid;
+}
+
+function validateSchedule(
+  data: DebtMaturitiesPayload,
+  symbol: string,
+): DebtMaturitiesPayload {
+  const invalid = (): never => {
+    throw new Error("The server returned an invalid debt maturity schedule");
+  };
+  // Version 2 answers a schedule in its filing's own bands (validateBands),
+  // and a company with none as version 1 does, under any standard and with
+  // the report's link, or none.
+  const v2 = data?.version === 2;
+  if (
+    !data ||
+    (data.version !== 1 && !v2) ||
+    data.symbol !== symbol ||
+    !["available", "partial", "unavailable"].includes(data.status) ||
+    !textOrNull(data.entityName) ||
+    !(v2 && data.latest === null ? ["us-gaap", "ifrs-full", "cn-cas", null] : ["us-gaap", null]).includes(data.taxonomy) ||
+    !(
+      data.cik === null ||
+      (typeof data.cik === "string" && /^\d{10}$/.test(data.cik))
+    ) ||
+    typeof data.fetchedAt !== "string" ||
+    !Number.isFinite(Date.parse(data.fetchedAt)) ||
+    !nullableDay(data.asOf) ||
+    !data.source ||
+    typeof data.source.name !== "string" ||
+    !(sourceUrl(data.source.url) || (v2 && data.latest === null && (data.source.url === "" || httpsUrl(data.source.url)))) ||
+    typeof data.source.cadence !== "string" ||
+    !Array.isArray(data.warnings) ||
+    data.warnings.some((value) => typeof value !== "string") ||
+    !Array.isArray(data.history)
+  )
+    return invalid();
+  const latest = data.latest;
+  if (latest === null) {
+    if (
+      data.asOf !== null ||
+      data.status !== "unavailable" ||
+      data.history.length
+    )
+      return invalid();
+    return data;
+  }
+  if (
+    !latest ||
+    data.status === "unavailable" ||
+    data.taxonomy !== "us-gaap" ||
+    !data.cik ||
+    !day(latest.asOf) ||
+    latest.asOf !== data.asOf ||
+    !day(latest.filed) ||
+    latest.asOf > latest.filed ||
+    !accession(latest.accession) ||
+    !ANNUAL_FORM.test(latest.form) ||
+    !currency(latest.currency) ||
+    !sourceUrl(latest.filingUrl) ||
+    typeof latest.complete !== "boolean" ||
+    !Array.isArray(latest.buckets) ||
+    latest.buckets.length !== 6
+  )
+    return invalid();
+  const sameFiling = (fact: DebtFact) =>
+    validFact(fact) &&
+    fact.accession === latest.accession &&
+    fact.filed === latest.filed &&
+    fact.form === latest.form &&
+    fact.unit === latest.currency;
+  for (const [index, bucket] of latest.buckets.entries()) {
+    if (
+      !bucket ||
+      bucket.id !== BUCKET_IDS[index] ||
+      typeof bucket.label !== "string" ||
+      !nullableNumber(bucket.value) ||
+      (index === 5 ? bucket.year !== null : !Number.isInteger(bucket.year)) ||
+      (bucket.fact === null
+        ? bucket.value !== null
+        : !sameFiling(bucket.fact) ||
+          bucket.fact.end !== latest.asOf ||
+          bucket.fact.start !== null ||
+          (bucket.fact.tag !==
+            `LongTermDebtMaturitiesRepaymentsOfPrincipal${bucket.id}` &&
+            bucket.fact.tag !==
+              `LongTermDebtMaturitiesRepaymentsOfPrincipal${ROLLING_BUCKET_TAGS[index]}`) ||
+          bucket.fact.value !== bucket.value)
+    )
+      return invalid();
+  }
+  const amountKeys = [
+    "totalPrincipal",
+    "next12Months",
+    "next3Years",
+    "interestExpense",
+  ] as const;
+  const percentKeys = [
+    "next12MonthsShare",
+    "next3YearsShare",
+    "borrowingCostPercent",
+  ] as const;
+  if (
+    amountKeys.some(
+      (key) => !validMetric(latest[key], latest, latest.currency),
+    ) ||
+    percentKeys.some((key) => !validMetric(latest[key], latest, "%"))
+  )
+    return invalid();
+  const sum = (values: Array<number | null>) =>
+    values.every((value) => value !== null)
+      ? values.reduce<number>((a, b) => a + b!, 0)
+      : null;
+  const values = latest.buckets.map((row) => row.value),
+    total = sum(values),
+    next3 = sum(values.slice(0, 3));
+  const share = (value: number | null) =>
+    value !== null && total !== null && total > 0
+      ? (100 * value) / total
+      : null;
+  if (
+    latest.complete !== (total !== null) ||
+    !near(latest.totalPrincipal.value, total) ||
+    latest.next12Months.value !== values[0] ||
+    !near(latest.next3Years.value, next3) ||
+    !near(latest.next12MonthsShare.value, share(values[0]!)) ||
+    !near(latest.next3YearsShare.value, share(next3))
+  )
+    return invalid();
+  const interest = latest.interestExpenseFact;
+  if (
+    interest === null
+      ? latest.interestExpense.value !== null
+      : !sameFiling(interest) ||
+        interest.end !== latest.asOf ||
+        !interest.start ||
+        !annualPeriod(interest.start, interest.end) ||
+        interest.value !== latest.interestExpense.value
+  )
+    return invalid();
+  const cost = latest.borrowingCostEvidence;
+  if (cost === null) {
+    if (latest.borrowingCostPercent.value !== null) return invalid();
+  } else {
+    if (
+      !cost ||
+      !day(cost.periodStart) ||
+      cost.periodEnd !== latest.asOf ||
+      !sameFiling(cost.interest) ||
+      cost.interest.tag !== "InterestExpenseDebt" ||
+      cost.interest.start !== cost.periodStart ||
+      cost.interest.end !== cost.periodEnd ||
+      !annualPeriod(cost.periodStart, cost.periodEnd) ||
+      !Array.isArray(cost.opening) ||
+      !Array.isArray(cost.closing) ||
+      cost.opening.length !== 2 ||
+      cost.closing.length !== 2
+    )
+      return invalid();
+    const openingEnd = new Date(Date.parse(cost.periodStart) - 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    for (const [index, facts] of [cost.opening, cost.closing].entries()) {
+      if (
+        facts.some(
+          (fact) =>
+            !sameFiling(fact) ||
+            fact.start !== null ||
+            fact.end !== (index ? latest.asOf : openingEnd),
+        ) ||
+        facts[0]!.tag !== "LongTermDebt" ||
+        !["ShortTermBorrowings", "CommercialPaper"].includes(facts[1]!.tag)
+      )
+        return invalid();
+    }
+    const average =
+      [...cost.opening, ...cost.closing].reduce(
+        (sum, fact) => sum + fact.value,
+        0,
+      ) / 2;
+    if (
+      cost.opening[1]!.tag !== cost.closing[1]!.tag ||
+      average <= 0 ||
+      !near(cost.value, (100 * cost.interest.value) / average) ||
+      !near(latest.borrowingCostPercent.value, cost.value)
+    )
+      return invalid();
+  }
+  for (const [index, point] of data.history.entries()) {
+    if (
+      !point ||
+      !day(point.asOf) ||
+      !day(point.filed) ||
+      point.asOf > point.filed ||
+      !accession(point.accession) ||
+      point.currency !== latest.currency ||
+      typeof point.complete !== "boolean" ||
+      [...amountKeys, ...percentKeys].some(
+        (key) => !nullableNumber(point[key]),
+      ) ||
+      !textOrNull(point.interestExpenseTag) ||
+      !textOrNull(point.borrowingCostDebtTags) ||
+      point.complete !== (point.totalPrincipal !== null) ||
+      point.asOf > latest.asOf ||
+      (index > 0 && point.asOf <= data.history[index - 1]!.asOf)
+    )
+      return invalid();
+  }
+  const last = data.history.at(-1);
+  if (
+    !last ||
+    last.asOf !== latest.asOf ||
+    last.filed !== latest.filed ||
+    last.accession !== latest.accession ||
+    [...amountKeys, ...percentKeys].some(
+      (key) => !near(last[key], latest[key].value),
+    )
+  )
+    return invalid();
+  return data;
+}
+
+/** A report's accession (an SEC one, HKEX-2026040800985, a receipt number) and form (20-F, HKEX, ESEF). */
+const reportAccession = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9-]{0,79}$/.test(value);
+const reportForm = (value: unknown) => typeof value === "string" && /^[A-Z0-9][A-Z0-9/-]{1,11}$/.test(value);
+const BAND_TAXONOMIES: readonly unknown[] = ["ifrs-full", "cn-cas"];
+const AMOUNT_BASES: readonly unknown[] = ["principal", "carrying", "contractual_undiscounted"];
+
+/**
+ * Bands that cover the schedule from the balance-sheet date on, in order,
+ * each starting where the last ended; only the last may be open ended.
+ */
+function validBands(bands: readonly DebtBand[]): boolean {
+  let from = 0;
+  for (const [index, band] of bands.entries()) {
+    if (
+      !band ||
+      typeof band.label !== "string" ||
+      !band.label.trim() ||
+      !number(band.value) ||
+      band.fromMonths !== from ||
+      !Array.isArray(band.members) ||
+      band.members.some((member) => typeof member !== "string") ||
+      (band.toMonths === null
+        ? index !== bands.length - 1
+        : !Number.isInteger(band.toMonths) || band.toMonths <= band.fromMonths)
+    )
+      return false;
+    from = band.toMonths ?? from;
+  }
+  return bands.length > 0;
+}
+
+/**
+ * A schedule in its filing's own bands (version 2): an IFRS or China CAS
+ * ladder, as reported, with what its amounts are and the report it came
+ * from. Its yearly buckets and principal figures are not read, so they are
+ * not checked; a 10-Q beside it is not read either.
+ */
+function validateBands(data: DebtMaturitiesPayload, symbol: string): DebtMaturitiesPayload {
+  const latest = data.latest!;
+  const bands = latest.sourceBuckets;
+  const interest = latest.interestExpenseFact;
+  const source = latest.source;
+  if (
+    data.symbol !== symbol ||
+    !["available", "partial"].includes(data.status) ||
+    !textOrNull(data.entityName) ||
+    !BAND_TAXONOMIES.includes(data.taxonomy) ||
+    latest.taxonomy !== data.taxonomy ||
+    !(data.cik === null || (typeof data.cik === "string" && /^\d{10}$/.test(data.cik))) ||
+    typeof data.fetchedAt !== "string" ||
+    !Number.isFinite(Date.parse(data.fetchedAt)) ||
+    !data.source ||
+    typeof data.source.name !== "string" ||
+    !httpsUrl(data.source.url) ||
+    typeof data.source.cadence !== "string" ||
+    !Array.isArray(data.warnings) ||
+    data.warnings.some((value) => typeof value !== "string") ||
+    !Array.isArray(data.history) ||
+    !day(latest.asOf) ||
+    latest.asOf !== data.asOf ||
+    !day(latest.filed) ||
+    latest.asOf > latest.filed ||
+    !reportAccession(latest.accession) ||
+    !reportForm(latest.form) ||
+    !currency(latest.currency) ||
+    !httpsUrl(latest.filingUrl) ||
+    !AMOUNT_BASES.includes(latest.amountBasis) ||
+    !Array.isArray(bands) ||
+    !validBands(bands) ||
+    !near(latest.sourceTotal ?? null, bands.reduce((sum, band) => sum + band.value, 0)) ||
+    (interest !== null &&
+      !(interest && number(interest.value) && typeof interest.tag === "string" && interest.unit === latest.currency &&
+        nullableDay(interest.start) && day(interest.end))) ||
+    (source != null &&
+      !(httpsUrl(source.url) && typeof source.concept === "string" && number(source.scale) && source.scale > 0 &&
+        typeof source.scaleStated === "boolean" &&
+        (source.reconciledTo == null ||
+          (typeof source.reconciledTo.concept === "string" && number(source.reconciledTo.value) &&
+            number(source.reconciledTo.ratio)))))
+  )
+    throw new Error("The server returned an invalid debt maturity schedule");
+  const { latestQuarter: _quarter, ...schedule } = data;
+  return schedule;
+}
+
+/** The symbol the server answers with: a listing abroad's bare symbol, otherwise the one sent. */
+const answeredSymbol = (symbol: string, listing?: IssuerListingParams) =>
+  listingAbroad(symbol, listing?.exchange)?.symbol ?? symbol;
+
+/**
+ * The schedule of the issuer behind a listing. A listing abroad asks for its
+ * bare symbol with its venue and company (cloudDebtMaturitiesPath), and the
+ * server answers for the bare symbol; a 404 for it is no schedule, like the
+ * server's own empty answer, not a failure.
+ */
+export async function fetchDebtMaturities(
+  symbol: string,
+  client: Pick<typeof apiClient, "getCloudDebtMaturities"> = apiClient,
+  listing?: IssuerListingParams,
+) {
+  const abroad = listingAbroad(symbol, listing?.exchange) !== null;
+  const answered = answeredSymbol(symbol, listing);
+  try {
+    return validateDebtMaturities(
+      await client.getCloudDebtMaturities(symbol, listing),
+      answered,
+    );
+  } catch (error) {
+    if (abroad && error instanceof ApiRequestError && error.status === 404) return noSchedule(answered);
+    // The server sends its own payload with a 503 when no schedule could be
+    // read (SEC or the store failing): said in one line, its status kept so a
+    // saved copy still answers for it.
+    if (error instanceof ApiRequestError && (error.status ?? 0) >= 500)
+      throw new ApiRequestError(NOT_READ, error.status, error.retryAfterMs, error.code, error.details);
+    throw unavailableOnServer(error, "Debt maturities are not available yet.");
+  }
+}
+const NOT_READ = "No maturity schedule could be read for this listing.";
+
+function noSchedule(symbol: string): DebtMaturitiesPayload {
+  return {
+    version: 1, symbol, cik: null, entityName: null, taxonomy: null, status: "unavailable",
+    fetchedAt: new Date().toISOString(), asOf: null,
+    source: { name: "SEC EDGAR company facts", url: "https://www.sec.gov/edgar/search/", cadence: "" },
+    latest: null, history: [], warnings: [],
+  };
+}
+
+// SAN in Paris is not SAN in New York: a listing abroad is cached under its venue.
+export function cachedDebtMaturities(symbol: string, listing?: IssuerListingParams) {
+  return cachedCloudResource(debtMaturitiesCache, secListingKey(symbol, listing?.exchange), (payload) =>
+    validateDebtMaturities(payload, answeredSymbol(symbol, listing)),
+  );
+}
+export function loadDebtMaturities(symbol: string, listing?: IssuerListingParams, force = false) {
+  return loadCloudResource(
+    debtMaturitiesCache,
+    secListingKey(symbol, listing?.exchange),
+    () => fetchDebtMaturities(symbol, apiClient, listing),
+    { force, validate: (payload) => validateDebtMaturities(payload, answeredSymbol(symbol, listing)) },
+  );
+}

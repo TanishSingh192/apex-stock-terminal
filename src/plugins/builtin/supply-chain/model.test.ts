@@ -1,0 +1,287 @@
+import { afterEach, expect, test } from "bun:test";
+import { setCloudApiFetchTransport } from "../../../api-client";
+import { ApiRequestError } from "../../../api-client/errors";
+import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
+import { cachedSupplyChain, fetchSupplyChain, loadSupplyChain, supplyChainCache, validateSupplyChain } from "./client";
+import { getThemeIds, getTheme, isDarkTheme, SUBTLE_TEXT_MIN, themeKeysDirection } from "../../../theme/themes";
+import { contrastRatio } from "../../../theme/color-utils";
+import { themedColorSet } from "../../../theme/series-colors";
+import { counterpartyLabel, counterpartyName, disclosedValue, disclosureText, fitShareBasis, flowBands, focusCompanyLabel, focusCompanyName, percentage, periodText, receivablesConcentration, ROLE_SLOTS, shareParts, sortRows, supplyEmptyText, supplyRoleCounts } from "./model";
+import { entity, supplyPayload, supplyRow } from "./test-fixture";
+import { supplyOptions } from "./trust";
+
+afterEach(() => { setCloudApiFetchTransport(null); supplyChainCache.reset(); });
+
+test("untrusted disclosure rows cannot fabricate units, clickable schemes or anonymous tickers", () => {
+  for (const row of [supplyRow("x", { pctBasis: null }), supplyRow("x", { usd: 1, usdBasis: null }),
+    supplyRow("x", { quote: " " }), supplyRow("x", { pctOfRevenue: Number.NaN }), supplyRow("x", { pctOfRevenue: 101 }),
+    supplyRow("x", { filedDate: "2026-02-30" }), supplyRow("x", { confidence: 2 }), supplyRow("x", { filingUrl: "javascript:alert(1)" }),
+    supplyRow("x", { counterparty: { ...entity("anonymous"), anonymous: true } }), supplyRow("x", { periodMonths: 1.5 }), supplyRow("x", { periodMonths: -3 })]) {
+    expect(() => validateSupplyChain(supplyPayload({ says: [row] }))).toThrow("unreadable");
+  }
+  expect(validateSupplyChain(supplyPayload()).says[0]?.pctOfRevenue).toBe(22);
+});
+
+test("cache partitions accounts and entitlements, preserves data on outage, refuses revoked access", async () => {
+  supplyChainCache.attach(new MemoryPluginPersistence());
+  let response = supplyPayload();
+  let code = 200;
+  setCloudApiFetchTransport(async () => Response.json(code === 200 ? response : { message: "Denied" }, { status: code }));
+  await loadSupplyChain("FOCUS", "alice:full");
+  expect(cachedSupplyChain("FOCUS", "alice:preview")).toBeNull();
+  expect(cachedSupplyChain("FOCUS", "bob:full")).toBeNull();
+  code = 502;
+  expect((await loadSupplyChain("FOCUS", "alice:full", true)).stale).toBe(true);
+  code = 403;
+  await expect(loadSupplyChain("FOCUS", "alice:full", true)).rejects.toThrow();
+  code = 200;
+  response = supplyPayload({ says: [], names: [], totalRows: 0, status: "unavailable" });
+  expect((await loadSupplyChain("FOCUS", "alice:full", true)).payload.says).toHaveLength(0);
+});
+
+test("native amounts retain their disclosed currency and scale without cross-currency comparisons", () => {
+  const yen = supplyRow("yen", { nativeAmount: 368_079, nativeCurrency: "JPY", nativeScale: 1_000_000, jurisdiction: "JP", quoteLanguage: "ja", quoteGloss: "Samsung Electronics represented 15.1% of revenue." });
+  expect(disclosedValue(validateSupplyChain(supplyPayload({ says: [yen] })).says[0]!)).toBe("368,079 JPY million");
+  const plainYen = supplyRow("plain-yen", { nativeAmount: 400_000_000_000, nativeCurrency: "JPY", nativeScale: 1 });
+  const won = supplyRow("won", { nativeAmount: 1, nativeCurrency: "KRW", nativeScale: 1_000 });
+  const usd = supplyRow("usd", { usd: 5_000_000, usdBasis: "disclosed" });
+  expect(sortRows([won, yen, plainYen, usd], { column: "usd", direction: "desc" }).map((row) => row.id)).toEqual(["plain-yen", "yen", "won", "usd"]);
+  expect(disclosedValue(supplyRow("zero", { nativeAmount: 0, nativeCurrency: "TWD", nativeScale: 1_000 }))).toBe("0 TWD thousand");
+  expect(flowBands([supplyRow("native-supplier", { ...yen, role: "supplier", pctOfRevenue: null, pctBasis: null })], 6).suppliers[0]?.weight).toBeNull();
+  for (const fields of [{ nativeCurrency: null }, { nativeCurrency: "yen" }, { nativeScale: 0 }, { nativeScale: Number.POSITIVE_INFINITY }, { nativeAmount: -1 }, { nativeAmount: 1e308, nativeScale: 1e308 }, { jurisdiction: "Japan" }, { quoteGloss: 42 }, { entityScope: "invented" }]) {
+    expect(() => validateSupplyChain(supplyPayload({ says: [{ ...yen, ...fields } as typeof yen] }))).toThrow("unreadable");
+  }
+  expect(disclosedValue(validateSupplyChain(supplyPayload()).says[0]!)).toBe("--");
+});
+
+test("missing route has an unavailable state, other request errors stay actionable", async () => {
+  await expect(fetchSupplyChain("X", { getCloudSupplyChain: async () => { throw new ApiRequestError("missing", 404); } })).rejects.toThrow("not available yet");
+  await expect(fetchSupplyChain("X", { getCloudSupplyChain: async () => { throw new ApiRequestError("offline", 502); } })).rejects.toThrow("offline");
+});
+
+test("70 relationships remain bounded and every band page is reachable without inventing weights", () => {
+  const rows = Array.from({ length: 70 }, (_, i) => supplyRow(`company-${i}`, { pctOfRevenue: i + 1 }));
+  const found = new Set<string>();
+  for (let page = 0; page < 14; page++) {
+    const band = flowBands(rows, 6, { customers: page }).customers;
+    expect(band).toHaveLength(6);
+    expect(band.at(-1)?.more).toBe(65);
+    for (const node of band) if (node.row) found.add(node.id);
+  }
+  expect(found.size).toBe(70);
+  const unknown = flowBands([supplyRow("unknown", { pctOfRevenue: null, pctBasis: null })], 6).customers[0]!;
+  expect(unknown.weight).toBeNull();
+  const mixed = flowBands([supplyRow("scoped", { pctOfRevenue: 99, pctScope: "Segment" }), supplyRow("revenue", { pctOfRevenue: 80 }), supplyRow("receivables", { pctOfRevenue: 99, pctBasis: "receivables" })], 6).customers;
+  expect(mixed.find((node) => node.id === "receivables")?.weight).toBeNull();
+  expect(mixed.find((node) => node.id === "scoped")?.weight).toBeNull();
+});
+
+test("shares rank by their basis, revenue before receivables, in the table and the flow", () => {
+  // NVIDIA's customer shares are scoped XBRL facts, so none sets a ribbon width and the order is the share sort's alone.
+  const rows = [
+    supplyRow("ar-a", { pctOfRevenue: 30, pctBasis: "receivables" }), supplyRow("rev-a", { pctOfRevenue: 21, pctScope: "Compute", sourceKind: "xbrl" }),
+    supplyRow("ar-b", { pctOfRevenue: 22, pctBasis: "receivables" }), supplyRow("rev-b", { pctOfRevenue: 16, pctScope: "Compute", sourceKind: "xbrl" }),
+    supplyRow("none", { pctOfRevenue: null, pctBasis: null }),
+  ];
+  expect(sortRows(rows, { column: "pct", direction: "desc" }).map((row) => row.id)).toEqual(["rev-a", "rev-b", "ar-a", "ar-b", "none"]);
+  expect(sortRows(rows, { column: "pct", direction: "asc" }).map((row) => row.id)).toEqual(["rev-b", "rev-a", "ar-b", "ar-a", "none"]);
+  expect(flowBands(rows, 12).customers.map((node) => node.id)).toEqual(["rev-a", "rev-b", "ar-a", "ar-b", "none"]);
+});
+
+test("role counts are companies the tab draws, with preview disclosures locked apart, the same for table and flow", () => {
+  // A free preview of FN: its filings name three of eleven customer disclosures, and the reverse
+  // view repeats NVIDIA twice. The flow draws three customer cards; the server counts disclosures.
+  const nvidia = entity("nvidia");
+  const says = [supplyRow("cisco"), supplyRow("nvidia", { counterparty: nvidia }), supplyRow("nokia"),
+    supplyRow("bench", { role: "competitor", direction: "mutual" }), supplyRow("cohort", { counterparty: { ...entity("cohort", "Four customers"), aggregate: true } }),
+    supplyRow("lead", { tier: 6, leadStatus: "lead" }), supplyRow("rejected", { leadStatus: "rejected" })];
+  const names = [supplyRow("nvidia-xbrl", { counterparty: nvidia, reportingEntity: nvidia }), supplyRow("nvidia-text", { counterparty: nvidia, reportingEntity: nvidia })];
+  const data = supplyPayload({ says, names, access: "preview", truncated: true });
+  data.counts.says = { customer: 11, supplier: 0, partner: 0, competitor: 10, investee: 0 };
+  data.counts.names = { customer: 2, supplier: 0, partner: 0, competitor: 0, investee: 0 };
+  const options = supplyOptions();
+  const table = supplyRoleCounts(data, ["says"], options);
+  expect(table).toEqual([{ role: "customer", counterparties: 3, locked: 5 }, { role: "competitor", counterparties: 1, locked: 9 }]);
+  expect(supplyRoleCounts(data, ["says", "names"], options)).toEqual(table);
+  expect(supplyRoleCounts(data, ["names"], options)).toEqual([{ role: "customer", counterparties: 1, locked: 0 }]);
+  // Exactly the companies the flow draws: one card per counterparty and role.
+  const bands = flowBands([...says, ...names], 12, {}, "FOCUS");
+  expect(bands.customers.filter((node) => node.row)).toHaveLength(table[0]!.counterparties);
+  // Leads stay out even when the evidence filter shows them; full access locks nothing.
+  expect(supplyRoleCounts(data, ["says"], supplyOptions("sec,unconfirmed"))[0]?.counterparties).toBe(3);
+  const full = supplyPayload({ says, names, counts: { says: { customer: 6, supplier: 0, partner: 0, competitor: 1, investee: 0 }, names: { customer: 2, supplier: 0, partner: 0, competitor: 0, investee: 0 } } });
+  expect(supplyRoleCounts(full, ["says", "names"], options).map((entry) => entry.locked)).toEqual([0, 0]);
+});
+
+test("flow keeps the latest counterparty role once and does not total reverse concentrations", () => {
+  const latest = supplyRow("latest", { counterparty: entity("same"), pctOfRevenue: 80 });
+  const old = supplyRow("old", { counterparty: entity("same"), asOf: "2025-01-31", pctOfRevenue: 10 });
+  expect(flowBands([old, latest], 6).customers.map((node) => node.id)).toEqual(["latest"]);
+  const reverse = supplyRow("reverse", { role: "supplier", direction: "in", reportingEntity: entity("CRUS"), pctOfRevenue: 91 });
+  expect(percentage(reverse)).toBe("91% revenue");
+  expect(flowBands([reverse], 6).suppliers[0]?.weight).toBeNull();
+  const reverseCustomer = supplyRow("buyer", { reportingEntity: entity("INGM"), pctOfRevenue: 21 });
+  expect(flowBands([reverseCustomer], 6, {}, "AAPL").customers[0]?.weight).toBeNull();
+  for (const direction of ["asc", "desc"] as const) expect(sortRows([latest, supplyRow("missing", { pctOfRevenue: null })], { column: "pct", direction }).at(-1)?.id).toBe("missing");
+});
+
+test("aggregate concentrations stay labeled table facts and never affect flow membership or scale", () => {
+  const group = supplyRow("group", { counterparty: { ...entity("group", "United States And Europe Based End Customers"), aggregate: true }, pctOfRevenue: 76 });
+  const payload = supplyPayload({ says: [group, supplyRow("one"), supplyRow("two", { pctOfRevenue: 14 })], totalRows: 3 });
+  payload.counts.says.customer = 3;
+  expect(validateSupplyChain(payload).says).toHaveLength(3);
+  expect(counterpartyName(group)).toStartWith("Group: ");
+  const nodes = flowBands(payload.says, 2, {}, "FOCUS").customers;
+  expect(nodes.map((node) => node.id)).toEqual(["one", "two"]);
+  expect(nodes.map((node) => node.weight)).toEqual([1, 14 / 22]);
+  const legacy = JSON.parse(JSON.stringify(payload));
+  delete legacy.says[1].counterparty.aggregate;
+  expect(validateSupplyChain(legacy).says[1]?.counterparty.aggregate).toBe(false);
+  legacy.says[1].counterparty.aggregate = "yes";
+  expect(() => validateSupplyChain(legacy)).toThrow("unreadable");
+});
+
+test("revenue ribbons share exact scope and period while dollar scales remain stable across pages", () => {
+  const scoped = (id: string, pct: number) => supplyRow(id, { pctScope: "Compute And Networking Segment", pctOfRevenue: pct });
+  const nodes = flowBands([scoped("one", 22), scoped("two", 14), supplyRow("other-scope", { pctScope: "Gaming", pctOfRevenue: 60 }),
+    supplyRow("old-period", { period: "2025-01-31", pctScope: "Compute And Networking Segment", pctOfRevenue: 95 })], 6, {}, "FOCUS").customers;
+  expect(nodes.find((node) => node.id === "one")?.weight).toBe(1);
+  expect(nodes.find((node) => node.id === "two")?.weight).toBe(14 / 22);
+  expect(nodes.find((node) => node.id === "other-scope")?.weight).toBeNull();
+  expect(nodes.find((node) => node.id === "old-period")?.weight).toBeNull();
+  // A quarter and a half ending on one date are different periods; a share of unstated length joins either.
+  const lengths = flowBands([supplyRow("q-1", { periodMonths: 3, pctOfRevenue: 20 }), supplyRow("q-2", { periodMonths: 3, pctOfRevenue: 10 }),
+    supplyRow("half", { periodMonths: 6, pctOfRevenue: 30 }), supplyRow("unstated", { pctOfRevenue: 5 })], 6, {}, "FOCUS").customers;
+  expect(lengths.map((node) => [node.id, node.weight])).toEqual([["q-1", 1], ["q-2", 0.5], ["unstated", 0.25], ["half", null]]);
+  const dollars = [149_000_000, 3_320_000, 1_000_000].map((usd, i) => supplyRow(`dollar-${i}`, { role: "supplier", usd, usdBasis: "disclosed", pctOfRevenue: null, pctBasis: null }));
+  dollars.unshift(supplyRow("unknown-dollars", { role: "supplier", pctOfRevenue: 99 }));
+  expect(flowBands(dollars, 2, { suppliers: 0 }).suppliers[0]?.id).toBe("dollar-0");
+  expect(flowBands(dollars, 2, { suppliers: 0 }).suppliers[0]?.weight).toBe(1);
+  expect(flowBands(dollars, 2, { suppliers: 1 }).suppliers[0]?.weight).toBe(3_320_000 / 149_000_000);
+});
+
+test("shares retain the reporter and distinguish tagged context from a prose denominator", () => {
+  const reverse = supplyRow("crus", { role: "supplier", direction: "in", reportingEntity: entity("CRUS"), pctOfRevenue: 91 });
+  expect(shareParts(reverse, "AAPL")).toMatchObject({ value: "91%", basis: "of CRUS revenue" });
+  expect(shareParts(supplyRow("own", { pctOfRevenue: 22.04 }), "FOCUS")).toMatchObject({ value: "22%", basis: "of revenue" });
+  expect(shareParts(supplyRow("seg", { sourceKind: "filing_text", pctOfRevenue: 14, pctScope: "Compute And Networking Segment" }), "FOCUS")?.basis).toBe("of Compute & Networking revenue");
+  expect(shareParts(supplyRow("ar", { sourceKind: "filing_text", pctOfRevenue: 47, pctBasis: "receivables", pctScope: "Vendor non-trade receivables" }), "FOCUS")?.basis).toBe("of vendor non-trade receivables (owed to Focus)");
+  expect(shareParts(supplyRow("none", { pctOfRevenue: null, pctBasis: null }), "FOCUS")).toBeNull();
+  // A multi-hop disclosure always names its reporter, even when it is the focus company.
+  expect(shareParts(supplyRow("path", { pctOfRevenue: 22.04, pctBasis: "revenue" }), "FOCUS", { includeReporter: true }))
+    .toMatchObject({ value: "22%", basis: "of FOCUS revenue" });
+  expect(shareParts(supplyRow("no-basis", { pctOfRevenue: 22, pctBasis: null }), undefined, { includeReporter: true })).toBeNull();
+  expect(shareParts(supplyRow("no-pct", { pctOfRevenue: null, pctBasis: "revenue" }), undefined, { includeReporter: true })).toBeNull();
+  const group = supplyRow("group", { counterparty: { ...entity("group", "United States And Europe Based End Customers"), aggregate: true, ticker: null } });
+  expect(counterpartyLabel(group)).toBe("United States and Europe based end customers");
+});
+
+test("a share's basis gives way to a shorter form and an ellipsis, never to nothing", () => {
+  const prose = shareParts(supplyRow("ar", { sourceKind: "filing_text", pctOfRevenue: 47, pctBasis: "receivables", pctScope: "Vendor non-trade receivables" }), "FOCUS")!;
+  expect(prose.forms).toEqual(["of vendor non-trade receivables (owed to Focus)", "of vendor non-trade receivables", "of receivables", "receivables"]);
+  expect([47, 31, 14, 13, 11].map((cells) => fitShareBasis(prose, cells))).toEqual(["of vendor non-trade receivables (owed to Focus)", "of vendor non-trade receivables", "of receivables", "receivables", "receivables"]);
+  expect([10, 4, 1].map((cells) => fitShareBasis(prose, cells))).toEqual(["receivabl…", "rec…", "…"]);
+  // A tagged dimension is dropped whole rather than cut: "(T…)" would claim a different one.
+  const tagged = shareParts(supplyRow("tagged", { sourceKind: "xbrl", pctOfRevenue: 47, pctScope: "Non Us" }), "FOCUS")!;
+  expect(tagged.forms).toEqual(["of revenue (non-US)", "revenue"]);
+  expect(fitShareBasis(tagged, 16)).toBe("revenue");
+  expect(shareParts(supplyRow("plain", { pctOfRevenue: 22 }), "FOCUS")!.forms).toEqual(["of revenue", "revenue"]);
+});
+
+test("a tagged share and its period read as the filing says them, the same in every view", () => {
+  // Newmont's 10-K: Standard Chartered was 27% of total revenue, from gold sales. Apple's: two vendors
+  // owed 45% and 27% of its vendor non-trade receivables at the year end. No XBRL word reaches a reader.
+  const gold = supplyRow("stan", { sourceKind: "xbrl", pctOfRevenue: 27, pctScope: "Gold", periodMonths: 12, period: "2025-12-31", reportingEntity: entity("NEM", "NEWMONT Corp /DE/"),
+    quote: "ConcentrationRiskByBenchmark=RevenueFromContractWithCustomerProductAndServiceBenchmark;ConcentrationRiskByType=CustomerConcentrationRisk;MajorCustomers=StandardChartered;ProductOrService=Gold;" });
+  const vendor = supplyRow("vendor", { sourceKind: "xbrl", role: "supplier", pctOfRevenue: 45, pctBasis: "receivables", pctScope: "Vendor non-trade receivables", periodMonths: 0, period: "2026-09-26",
+    reportingEntity: entity("AAPL", "Apple Inc."), quote: "ConcentrationRiskByType=SupplierConcentrationRisk;" });
+  expect(shareParts(gold, "NEM")).toMatchObject({ value: "27%", basis: "of total revenue (gold sales)" });
+  expect(shareParts(vendor, "AAPL")).toMatchObject({ value: "45%", basis: "of vendor non-trade receivables (owed to Apple)" });
+  // From the other company's page, or in the graph, the share names whose it is.
+  expect(shareParts(gold, "STAN")?.basis).toBe("of NEM total revenue (gold sales)");
+  expect(disclosureText(gold)).toBe("Customer concentration: 27% of NEM total revenue (gold sales)");
+  expect([periodText(gold), periodText(vendor), periodText({ period: "2025-12-31", periodMonths: null })]).toEqual(["year to 31 Dec 2025", "as of 26 Sep 2026", "31 Dec 2025"]);
+  for (const words of [shareParts(gold, "NEM")!.forms, shareParts(vendor, "AAPL")!.forms, [disclosureText(gold), periodText(vendor)]].flat())
+    expect(words).not.toMatch(/context:|instant/);
+});
+
+test("role colours read on every theme's page and stay apart in a colour-blind palette", () => {
+  for (const id of getThemeIds()) {
+    const theme = getTheme(id);
+    const roles = themedColorSet(ROLE_SLOTS, id);
+    for (const color of Object.values(roles)) expect(Math.min(contrastRatio(color, theme.bg), contrastRatio(color, theme.panel))).toBeGreaterThanOrEqual(SUBTLE_TEXT_MIN);
+    if (themeKeysDirection(id)) expect(new Set(Object.values(roles)).size).toBe(Object.keys(roles).length);
+    // A dark theme without a palette of its own keeps the series colours as they were.
+    if (isDarkTheme(id) && !themeKeysDirection(id)) expect(roles).toEqual(ROLE_SLOTS);
+  }
+});
+
+test("an empty supply chain says SPLC does not read a company's filings only when its country is known to be outside them", () => {
+  const empty = (country: string | null) => supplyEmptyText(supplyPayload({ symbol: "X", entity: { ...supplyPayload().entity!, country }, says: [], names: [] }))!;
+  expect(empty("TW")).toContain("SPLC reads US (SEC) and Korean (DART) company filings");
+  // The server sends ISO codes or none: a missing or unreadable country is never read as an uncovered market.
+  for (const unknown of [null, "", "Taiwan"]) {
+    expect(empty(unknown)).not.toContain("SPLC reads");
+    expect(empty(unknown)).toContain("try the customer's side, such as SPLC AAPL.");
+  }
+  expect(empty("us")).toBe("No filing, announcement or call read so far names a relationship for X.");
+});
+
+test("NVDA geographic XBRL facts do not invent a denominator or quarterly duration", () => {
+  // 76% and 86%: Data Center sales to Taiwan-headquartered customers; 30%:
+  // total revenue from non-US customers over six months. Tags omit this prose.
+  for (const [pctOfRevenue, pctScope, form] of [[76, "TW", "10-K"], [86, "TW", "10-Q"], [30, "Non Us", "10-Q"]] as const) {
+    const row = supplyRow("nvda", { sourceKind: "xbrl", pctOfRevenue, pctScope, form });
+    expect(shareParts(row, "FOCUS")).toMatchObject({ value: `${pctOfRevenue}%`, basis: `of revenue (${pctScope === "TW" ? "TW" : "non-US"})` });
+    expect(shareParts(row, "OTHER")?.basis).toStartWith("of FOCUS revenue (");
+  }
+  expect(shareParts(supplyRow("ytd", { form: "10-Q" }), "FOCUS")?.basis).toBe("of revenue");
+  const scoped = [22, 14].map((pct, i) => supplyRow(`xbrl-${i}`, { sourceKind: "xbrl", pctScope: "TW", pctOfRevenue: pct }));
+  expect(flowBands(scoped, 6, {}, "FOCUS").customers.map(row => row.weight)).toEqual([null, null]);
+  const mixed = flowBands([...scoped, supplyRow("prose", { pctScope: "TW" })], 6, {}, "FOCUS").customers;
+  expect(mixed.find(row => row.id === "xbrl-0")?.weight).toBeNull();
+});
+
+test("receivables concentration takes the largest customer each period end, from the company's own filings, and needs three periods", () => {
+  const ar = (id: string, period: string, pct: number, overrides: Parameters<typeof supplyRow>[1] = {}) =>
+    supplyRow(id, { pctOfRevenue: pct, pctBasis: "receivables", period, asOf: period, sourceKind: "xbrl", ...overrides });
+  const rows = [
+    ar("a", "2025-10-31", 12), ar("b", "2026-01-31", 25), ar("c", "2026-01-31", 18), ar("d", "2026-04-30", 30), ar("e", "2026-07-31", 22),
+    // Not a single customer's receivables share at a period end of the focus company:
+    supplyRow("revenue", { pctOfRevenue: 40, period: "2026-07-31" }),
+    ar("scoped", "2026-07-31", 45, { pctScope: "Compute" }),
+    ar("reverse", "2026-07-31", 50, { reportingEntity: supplyRow("x").counterparty }),
+    ar("group", "2026-07-31", 60, { counterparty: { ...supplyRow("g").counterparty, aggregate: true } }),
+    ar("corporate-group", "2026-07-31", 65, { entityScope: "group" }),
+    ar("negative", "2026-07-31", -1), ar("nan", "2026-08-31", NaN),
+    ar("overflow-day", "2026-02-30", 90), ar("non-leap", "2025-02-29", 90),
+    ar("supplier", "2026-07-31", 70, { role: "supplier", direction: "in" }),
+    ar("announced", "2026-07-31", 75, { tier: 2, sourceKind: "press_release" }),
+    ar("lead", "2026-07-31", 80, { leadStatus: "lead" }),
+    ar("stale", "2026-07-31", 85, { leadStatus: "stale" }),
+    ar("implausible", "2026-07-31", 140),
+    // Not a balance-sheet date, so never a point of its own.
+    ar("quarter", "2026-Q1", 90), ar("year", "2026", 90), ar("ongoing", "ongoing", 90), ar("month13", "2026-13-01", 90),
+  ];
+  expect(receivablesConcentration(rows, "FOCUS")).toEqual([
+    { period: "2025-10-31", date: new Date("2025-10-31T00:00:00Z"), pct: 12, rowId: "a" }, { period: "2026-01-31", date: new Date("2026-01-31T00:00:00Z"), pct: 25, rowId: "b" },
+    { period: "2026-04-30", date: new Date("2026-04-30T00:00:00Z"), pct: 30, rowId: "d" }, { period: "2026-07-31", date: new Date("2026-07-31T00:00:00Z"), pct: 22, rowId: "e" },
+  ]);
+  // Two dated periods and odd labels are still not a trend.
+  expect(receivablesConcentration([rows[0]!, rows[1]!, ...rows.filter((row) => ["quarter", "year", "ongoing", "month13"].includes(row.id))], "FOCUS")).toEqual([]);
+  // Two points are not a trend.
+  expect(receivablesConcentration(rows.slice(1, 4), "FOCUS")).toEqual([]);
+  expect(receivablesConcentration(rows, null)).toEqual([]);
+});
+
+test("a numbered listing reads by its company's name, a ticker that is a word by itself", () => {
+  // Filed under its code or the exchange's short name, a Hong Kong line takes its listing's name.
+  expect(focusCompanyName("0700:HKEX", "0700:HKEX", "Tencent Holdings Limited")).toBe("Tencent Holdings Limited");
+  expect(focusCompanyName("MEITUAN-W", "3690:HKEX", "Meituan")).toBe("Meituan");
+  expect(focusCompanyLabel("0700:HKEX", "Tencent Holdings Limited")).toBe("Tencent Holdings");
+  // With no name at hand the code stays, and a word ticker keeps both its filed name and its symbol.
+  expect(focusCompanyName("0700:HKEX", "0700:HKEX", null)).toBe("0700:HKEX");
+  expect(focusCompanyLabel("1211:HKEX", null)).toBe("1211:HKEX");
+  expect(focusCompanyName("Apple Inc.", "AAPL", "Apple Inc")).toBe("Apple Inc.");
+  expect(focusCompanyLabel("AAPL", "Apple Inc.")).toBe("AAPL");
+});

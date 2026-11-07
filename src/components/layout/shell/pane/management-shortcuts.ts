@@ -1,0 +1,201 @@
+import { useState } from "react";
+import { useShortcut } from "../../../../react/input";
+import { useKeybindings } from "../../../../app/keybindings";
+import type { WindowEditMode } from "../../../../plugins/registry";
+import { createOneShots } from "../../../../utils/one-shot";
+import { useDoubleEscapeClose } from "../../double-escape-close";
+import {
+  inputCaptureAllowsPaneManagementShortcut,
+  resolvePaneManagementShortcut,
+} from "../shortcuts";
+
+interface ShellPaneManagementShortcutOptions {
+  askAboutFocusedPane(): boolean;
+  cancelActiveDrag(): void;
+  closeAllFloatingPanes(): boolean;
+  /** `focusNextFloating`: the top floating pane left takes the focus, for closing them one after another. */
+  closeFocusedPane(options?: { focusNextFloating?: boolean }): boolean;
+  copyFocusedPaneScreenshot(): boolean;
+  exportFocusedPaneCsv(): boolean;
+  focusedPaneId: string | null;
+  gridlockVisiblePanes(): boolean;
+  hasActiveDrag(): boolean;
+  inputCaptured: boolean;
+  openFocusedPaneMenu(): boolean;
+  openFocusedPaneSettings(): boolean;
+  openLayoutGallery(): void;
+  overlayOpen: boolean;
+  popOutFocusedPane(): boolean;
+  shareFocusedPane(): boolean;
+  startWindowMode(paneId?: string, mode?: WindowEditMode): void;
+  toggleFocusedPaneFullscreen(): boolean;
+  toggleFocusedPaneFloating(): boolean;
+  toggleFocusedPaneNewLayout(): boolean;
+}
+
+export function useShellPaneManagementShortcuts({
+  askAboutFocusedPane,
+  cancelActiveDrag,
+  closeAllFloatingPanes,
+  closeFocusedPane,
+  copyFocusedPaneScreenshot,
+  exportFocusedPaneCsv,
+  focusedPaneId,
+  gridlockVisiblePanes,
+  hasActiveDrag,
+  inputCaptured,
+  openFocusedPaneMenu,
+  openFocusedPaneSettings,
+  openLayoutGallery,
+  overlayOpen,
+  popOutFocusedPane,
+  shareFocusedPane,
+  startWindowMode,
+  toggleFocusedPaneFullscreen,
+  toggleFocusedPaneFloating,
+  toggleFocusedPaneNewLayout,
+}: ShellPaneManagementShortcutOptions): void {
+  // A key held down, or a trigger with no repeat flag, runs each action once.
+  const [shots] = useState(createOneShots);
+  const keybindings = useKeybindings();
+
+  // Esc Esc closes the focused pane and hands the focus to the next floating one.
+  useDoubleEscapeClose({
+    targetId: focusedPaneId,
+    overlayOpen,
+    editing: inputCaptured,
+    dragging: hasActiveDrag,
+    close: () => closeFocusedPane({ focusNextFloating: true }),
+  });
+
+  useShortcut((event) => {
+    const shortcut = resolvePaneManagementShortcut(event, keybindings);
+    if (shortcut === "toggle-fullscreen" && !overlayOpen) {
+      if (!inputCaptured || inputCaptureAllowsPaneManagementShortcut(shortcut, event)) {
+        if (shots.get(shortcut).refuses(event)) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        if (hasActiveDrag()) {
+          cancelActiveDrag();
+        }
+        if (toggleFocusedPaneFullscreen()) {
+          shots.get(shortcut).end();
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+      }
+    }
+
+    // Ask Gloom is a modifier chord no pane binds, so it goes ahead of the
+    // panes, whichever mounted last: one that read a plain `a` without
+    // checking modifiers would otherwise take Alt+A.
+    if (shortcut === "ask" && !overlayOpen && !hasActiveDrag()) {
+      if (!inputCaptured || inputCaptureAllowsPaneManagementShortcut(shortcut, event)) {
+        // A held Alt+A hands the pane over once: its repeats reach this handler as plain presses.
+        if (shots.get(shortcut).refuses(event)) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        if (askAboutFocusedPane()) {
+          shots.get(shortcut).end();
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+      }
+    }
+
+    if ((event.name === "escape" || event.name === "esc") && hasActiveDrag()) {
+      cancelActiveDrag();
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }, { phase: "before" });
+
+  // The pane menu key is a fallback too: a pane that binds "." keeps it,
+  // however late it mounted.
+  useShortcut((event) => {
+    if (resolvePaneManagementShortcut(event, keybindings) !== "menu") return;
+    if (hasActiveDrag() || overlayOpen || inputCaptured) return;
+    if (shots.get("menu").refuses(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (!openFocusedPaneMenu()) return;
+    shots.get("menu").end();
+    event.preventDefault();
+    event.stopPropagation();
+  }, { phase: "idle" });
+
+  useShortcut((event) => {
+    const shortcut = resolvePaneManagementShortcut(event, keybindings);
+    if (!shortcut || hasActiveDrag() || overlayOpen) return;
+    if (inputCaptured && !inputCaptureAllowsPaneManagementShortcut(shortcut, event)) return;
+    if (shortcut === "menu") return;
+    const shot = shots.get(shortcut);
+    if (shot.refuses(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    let handled = false;
+    switch (shortcut) {
+      case "close":
+        handled = closeFocusedPane();
+        break;
+      case "close-all-floating":
+        handled = closeAllFloatingPanes();
+        break;
+      case "settings":
+        handled = openFocusedPaneSettings();
+        break;
+      case "toggle-fullscreen":
+        handled = toggleFocusedPaneFullscreen();
+        break;
+      case "toggle-floating":
+        handled = toggleFocusedPaneFloating();
+        break;
+      case "new-layout":
+        handled = toggleFocusedPaneNewLayout();
+        break;
+      case "pop-out":
+        handled = popOutFocusedPane();
+        break;
+      case "copy-screenshot":
+        handled = copyFocusedPaneScreenshot();
+        break;
+      case "export-csv":
+        handled = exportFocusedPaneCsv();
+        break;
+      case "share":
+        handled = shareFocusedPane();
+        break;
+      case "layout-gallery":
+        openLayoutGallery();
+        handled = true;
+        break;
+      case "gridlock-all":
+        handled = gridlockVisiblePanes();
+        break;
+      case "window-mode":
+        startWindowMode(undefined, "move");
+        handled = true;
+        break;
+      case "window-resize-mode":
+        startWindowMode(undefined, "resize");
+        handled = true;
+        break;
+    }
+
+    if (!handled) return;
+    shot.end();
+    event.preventDefault();
+    event.stopPropagation();
+  });
+}

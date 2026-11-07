@@ -1,0 +1,358 @@
+import type { ChoiceDialogChoice } from "../../../components";
+import type { AccountProfile, PublicPortfolioAnalytics } from "../../../api-client";
+import type { Portfolio, TickerRecord } from "../../../types/ticker";
+import { formatNumber } from "../../../utils/format";
+import { t, tf } from "../../../i18n";
+import { compoundReturns } from "../analytics/risk-math";
+
+export type AccountFieldKey =
+  | "username"
+  | "name"
+  | "company"
+  | "title"
+  | "bio"
+  | "profilePublic"
+  | "publicEmail"
+  | "xAccount"
+  | "acceptUnknownDms"
+  | "showLocalTime"
+  | "showDesks"
+  | "desks"
+  | "sharedPortfolioId"
+  | "weeklyRoundupEnabled"
+  | "positionAlertsEnabled"
+  | "chatEmailNotificationsEnabled"
+  | "emailAlertsOffAction"
+  | "upgradeAction"
+  | "cancelTrialAction"
+  | "assistantsAction"
+  | "passwordAction"
+  | "deleteAccountAction";
+
+export interface AccountDraft {
+  username: string;
+  name: string;
+  company: string;
+  title: string;
+  bio: string;
+  profilePublic: boolean;
+  publicEmail: string;
+  xAccount: string;
+  sharedPortfolioId: string;
+  acceptUnknownDms: boolean;
+  /** Chat shows your local time on your card. */
+  showLocalTime: boolean;
+  /** Chat shows what you trade: off until you turn it on. */
+  showDesks: boolean;
+  /** The desks to show, pre-filled from your answer to "What do you trade most?". */
+  desks: string[];
+  weeklyRoundupEnabled: boolean;
+  positionAlertsEnabled: boolean;
+  chatEmailNotificationsEnabled: boolean;
+}
+
+interface ProfileAnalyticsPreviewMetric {
+  id: string;
+  label: string;
+  value: string;
+  detail?: string;
+  tone?: "positive" | "negative" | "muted";
+}
+
+export interface ProfileAnalyticsPreview {
+  status: "off" | "missing" | "empty" | "pending" | "ready";
+  title: string;
+  subtitle: string;
+  metrics: ProfileAnalyticsPreviewMetric[];
+  publicAnalytics: PublicPortfolioAnalytics | null;
+}
+
+export const NO_PORTFOLIO_VALUE = "__none__";
+
+export function profileToDraft(profile: AccountProfile | null): AccountDraft {
+  return {
+    username: profile?.username ?? "",
+    name: profile?.name ?? "",
+    company: profile?.company ?? "",
+    title: profile?.title ?? "",
+    bio: profile?.bio ?? "",
+    profilePublic: profile?.profilePublic === true,
+    publicEmail: profile?.publicEmail ?? "",
+    xAccount: profile?.xAccount ?? "",
+    sharedPortfolioId: profile?.sharedPortfolioId ?? "",
+    acceptUnknownDms: profile?.acceptUnknownDms === true,
+    showLocalTime: profile?.showLocalTime !== false,
+    showDesks: (profile?.chatDesks?.length ?? 0) > 0,
+    desks: profile?.chatDesks?.length ? [...profile.chatDesks] : [...(profile?.onboardingDesks ?? [])],
+    weeklyRoundupEnabled: profile?.weeklyRoundupEnabled === false ? false : true,
+    positionAlertsEnabled: profile?.positionAlertsEnabled === false ? false : true,
+    chatEmailNotificationsEnabled: profile?.chatEmailNotificationsEnabled === false ? false : true,
+  };
+}
+
+/**
+ * What a save sends for chat's card. Nothing for a server that predates the
+ * settings; desks only while showing them is on and some are picked.
+ */
+export function chatCardUpdate(
+  profile: AccountProfile | null,
+  draft: Pick<AccountDraft, "showLocalTime" | "showDesks" | "desks">,
+): { showLocalTime?: boolean; chatDesks?: string[] | null } {
+  if (profile?.showLocalTime === undefined) return {};
+  return {
+    showLocalTime: draft.showLocalTime,
+    chatDesks: draft.showDesks && draft.desks.length > 0 ? [...draft.desks] : null,
+  };
+}
+
+export function emptyToNull(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+export function formatPlan(plan: AccountProfile["plan"] | null | undefined): string {
+  return plan === "pro" ? t("Pro") : t("Free");
+}
+
+export function countPortfolioHoldings(tickers: ReadonlyMap<string, TickerRecord>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const record of tickers.values()) {
+    for (const portfolioId of record.metadata.portfolios) {
+      counts[portfolioId] = (counts[portfolioId] ?? 0) + 1;
+    }
+  }
+  return counts;
+}
+
+export function buildPortfolioChoices(portfolios: Portfolio[], holdingCounts: Record<string, number>): ChoiceDialogChoice[] {
+  return [
+    { id: NO_PORTFOLIO_VALUE, label: t("None"), detail: t("Off"), description: t("Do not show portfolio analytics on your public profile.") },
+    ...portfolios.map((portfolio) => ({
+      id: portfolio.id,
+      label: portfolio.name,
+      detail: tf("{count} tickers", { count: holdingCounts[portfolio.id] ?? 0 }),
+      description: t("Shares this portfolio's 1Y return and SPY Beta on your public profile."),
+    })),
+  ];
+}
+
+export function portfolioOptionIds(portfolios: Portfolio[]): string[] {
+  return [NO_PORTFOLIO_VALUE, ...portfolios.map((portfolio) => portfolio.id)];
+}
+
+function signedReturn(value: number): string {
+  const percent = value * 100;
+  return `${percent >= 0 ? "+" : ""}${formatNumber(percent, 2)}%`;
+}
+
+function signedTone(value: number | null | undefined): ProfileAnalyticsPreviewMetric["tone"] {
+  if (value == null || !Number.isFinite(value)) return "muted";
+  if (value > 0) return "positive";
+  if (value < 0) return "negative";
+  return "muted";
+}
+
+function finiteMetric(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizePublicAnalytics(analytics: PublicPortfolioAnalytics | null | undefined): PublicPortfolioAnalytics | null {
+  const normalized: PublicPortfolioAnalytics = {
+    oneYearReturn: finiteMetric(analytics?.oneYearReturn),
+    spyBeta: finiteMetric(analytics?.spyBeta),
+    basis: analytics?.basis === "account" || analytics?.basis === "holdings" ? analytics.basis : null,
+  };
+  return normalized.oneYearReturn != null || normalized.spyBeta != null ? normalized : null;
+}
+
+function buildPublicAnalyticsMetrics(analytics: PublicPortfolioAnalytics): ProfileAnalyticsPreviewMetric[] {
+  const metrics: ProfileAnalyticsPreviewMetric[] = [];
+  if (analytics.oneYearReturn != null) {
+    metrics.push({
+      id: "one-year",
+      label: analytics.basis === "holdings" ? "1Y est." : "1Y",
+      value: signedReturn(analytics.oneYearReturn),
+      tone: signedTone(analytics.oneYearReturn),
+    });
+  }
+  if (analytics.spyBeta != null) {
+    metrics.push({
+      id: "beta",
+      label: "SPY Beta",
+      value: formatNumber(analytics.spyBeta, 2),
+    });
+  }
+  return metrics;
+}
+
+/** Compounds the series, skipping gaps; null when there is nothing to compound. */
+export function computeCumulativeReturn(returns: ReadonlyArray<{ value: number }>): number | null {
+  if (returns.length === 0) return null;
+  const value = compoundReturns(returns.map((point) => point.value).filter(Number.isFinite));
+  return Number.isFinite(value) ? value : null;
+}
+
+export function buildProfileAnalyticsPreview({
+  beta,
+  portfolio,
+  portfolioTickers,
+  selectedPortfolioId,
+  oneYearReturn,
+  basis = "holdings",
+}: {
+  beta: number | null;
+  portfolio: Portfolio | null;
+  portfolioTickers: TickerRecord[];
+  selectedPortfolioId: string;
+  oneYearReturn: number | null;
+  basis?: "account" | "holdings";
+}): ProfileAnalyticsPreview {
+  if (!selectedPortfolioId) {
+    return {
+      status: "off",
+      title: t("No public portfolio analytics"),
+      subtitle: t("Choose a portfolio to preview the public profile metrics."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (!portfolio) {
+    return {
+      status: "missing",
+      title: t("Portfolio not found"),
+      subtitle: selectedPortfolioId,
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (portfolioTickers.length === 0) {
+    return {
+      status: "empty",
+      title: portfolio.name,
+      subtitle: t("No positions to preview yet."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  const publicAnalytics: PublicPortfolioAnalytics = {
+    oneYearReturn: finiteMetric(oneYearReturn),
+    spyBeta: finiteMetric(beta),
+    basis,
+  };
+  const hasSharedMetric = publicAnalytics.oneYearReturn != null || publicAnalytics.spyBeta != null;
+
+  return {
+    status: "ready",
+    title: portfolio.name,
+    subtitle: "",
+    publicAnalytics: hasSharedMetric ? publicAnalytics : null,
+    metrics: [
+      {
+        id: "one-year",
+        label: basis === "holdings" ? "1Y est." : "1Y",
+        value: oneYearReturn == null ? t("Pending") : signedReturn(oneYearReturn),
+        detail: oneYearReturn == null ? t("needs price history") : undefined,
+        tone: signedTone(oneYearReturn),
+      },
+      {
+        id: "beta",
+        label: "SPY Beta",
+        value: beta == null ? t("Pending") : formatNumber(beta, 2),
+        detail: beta == null ? t("needs SPY overlap") : undefined,
+        tone: beta == null ? "muted" : undefined,
+      },
+    ],
+  };
+}
+
+export function buildPublishedProfileAnalyticsPreview({
+  analytics,
+  draftProfilePublic,
+  portfolio,
+  profileLoaded,
+  savedProfilePublic,
+  savedSharedPortfolioId,
+  selectedPortfolioId,
+  syncing,
+}: {
+  analytics: PublicPortfolioAnalytics | null | undefined;
+  draftProfilePublic: boolean;
+  portfolio: Portfolio | null;
+  profileLoaded: boolean;
+  savedProfilePublic: boolean;
+  savedSharedPortfolioId: string;
+  selectedPortfolioId: string;
+  syncing: boolean;
+}): ProfileAnalyticsPreview {
+  if (!selectedPortfolioId) {
+    return {
+      status: "off",
+      title: t("No public portfolio analytics"),
+      subtitle: t("Choose a portfolio to publish 1Y return and SPY Beta."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (!portfolio) {
+    return {
+      status: "missing",
+      title: t("Portfolio not found"),
+      subtitle: selectedPortfolioId,
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (!profileLoaded) {
+    return {
+      status: "pending",
+      title: portfolio.name,
+      subtitle: t("Loading published metrics."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (draftProfilePublic !== savedProfilePublic || selectedPortfolioId !== savedSharedPortfolioId) {
+    return {
+      status: "pending",
+      title: portfolio.name,
+      subtitle: t("Save profile to update published metrics."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  if (!savedProfilePublic) {
+    return {
+      status: "off",
+      title: t("No public portfolio analytics"),
+      subtitle: t("Public profile is off."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  const publicAnalytics = normalizePublicAnalytics(analytics);
+  if (!publicAnalytics) {
+    return {
+      status: "pending",
+      title: portfolio.name,
+      subtitle: syncing ? t("Syncing published metrics.") : t("Waiting for published metrics."),
+      metrics: [],
+      publicAnalytics: null,
+    };
+  }
+
+  return {
+    status: "ready",
+    title: portfolio.name,
+    subtitle: "",
+    metrics: buildPublicAnalyticsMetrics(publicAnalytics),
+    publicAnalytics,
+  };
+}
