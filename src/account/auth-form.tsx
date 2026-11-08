@@ -1,3 +1,5 @@
+import { cloudAccountUiEnabled } from "./availability";
+import { EmptyState } from "../components/ui/status";
 /**
  * Email/password auth form body, without any surrounding chrome. The dialog
  * wraps it in a `DialogFrame`; the hosted-terminal sign-in gate wraps it in its
@@ -52,7 +54,7 @@ export interface AuthFormProps {
   footer?: ReactNode;
 }
 
-export function AuthForm({
+function EnabledAuthForm({
   initialMode,
   onSignedIn,
   onEscape,
@@ -278,4 +280,11 @@ export function authFormTitle(mode: AccountMode): string {
   return mode === "login"
     ? t("Log in to Gloom Cloud")
     : t("Create your free Gloom Cloud account");
+}
+
+
+export function AuthForm(props: AuthFormProps) {
+  return cloudAccountUiEnabled()
+    ? <EnabledAuthForm {...props} />
+    : <EmptyState title="Account sign-in is unavailable in this web app." />;
 }

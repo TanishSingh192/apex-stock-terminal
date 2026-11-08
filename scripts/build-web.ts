@@ -83,6 +83,7 @@ async function buildPage(
     keepNames,
     define: {
       __GLOOMBERB_API_URL__: "location.origin",
+      __GLOOMBERB_ACCOUNT_UI_ENABLED__: "false",
       // Vercel cannot relay socket upgrades; use the existing HTTP refreshes.
       __GLOOMBERB_WEBSOCKETS_ENABLED__: JSON.stringify(process.env.VERCEL !== "1"),
       // The upstream analytics endpoint only accepts its own hosted origins.

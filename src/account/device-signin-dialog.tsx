@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "./availability";
 /**
  * QR sign-in UI: the hook and panel every QR surface shares, the full-screen
  * dialog, and the request bridge that lets the command bar open it. Commands
@@ -173,7 +174,7 @@ const dialogRequestListeners = new Set<(request: DeviceSignInDialogRequest) => v
 
 /** Returns false when no dialog host is mounted, so callers can surface an error. */
 export function requestDeviceSignInDialog(request: DeviceSignInDialogRequest = {}): boolean {
-  if (dialogRequestListeners.size === 0) return false;
+  if (!cloudAccountUiEnabled() || dialogRequestListeners.size === 0) return false;
   for (const listener of dialogRequestListeners) listener(request);
   return true;
 }

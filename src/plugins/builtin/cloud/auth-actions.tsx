@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "../../../account/availability";
 /**
  * The account gates panes share.
  *
@@ -68,7 +69,7 @@ export interface InlineAuthActionsProps {
   variant?: "buttons" | "plain";
 }
 
-export function InlineAuthActions({ showSignup = true, needsVerification = false, variant = "buttons" }: InlineAuthActionsProps) {
+function EnabledInlineAuthActions({ showSignup = true, needsVerification = false, variant = "buttons" }: InlineAuthActionsProps) {
   const { openCommandBar } = usePluginAppActions();
   const authenticate = (mode: AccountMode) => openAuth(openCommandBar, mode);
   const logIn = () => authenticate("login");
@@ -120,7 +121,7 @@ export interface SignInWallProps {
 }
 
 /** The account wall for a pane body that cannot render until the account is right. */
-export function SignInWall({ placement, action, needsVerification = false, hint, width = 0, height = 0, symbol, exchange }: SignInWallProps) {
+function EnabledSignInWall({ placement, action, needsVerification = false, hint, width = 0, height = 0, symbol, exchange }: SignInWallProps) {
   const { openCommandBar } = usePluginAppActions();
   const { nativePaneChrome } = useUiCapabilities();
   const title = needsVerification
@@ -166,7 +167,7 @@ export interface ProWallProps {
 }
 
 /** The upgrade wall for a pane body that needs Pro; Manage account covers a plan the account already has. */
-export function ProWall({ placement, title, message, width, height, symbol, exchange }: ProWallProps) {
+function EnabledProWall({ placement, title, message, width, height, symbol, exchange }: ProWallProps) {
   const openUpgrade = useCloudUpgradeAction(placement);
   const openPlan = useCloudPlanAction();
   // The status body carries the pane inset that a bare EmptyState lacks.
@@ -183,4 +184,21 @@ export function ProWall({ placement, title, message, width, height, symbol, exch
       />
     </WallTeaser>
   );
+}
+
+
+function AccountFeatureUnavailable() {
+  return <PaneStatusBody empty emptyTitle="Unavailable in this web app" emptyMessage="This feature requires a connected provider account." />;
+}
+
+export function InlineAuthActions(props: InlineAuthActionsProps) {
+  return cloudAccountUiEnabled() ? <EnabledInlineAuthActions {...props} /> : null;
+}
+
+export function SignInWall(props: SignInWallProps) {
+  return cloudAccountUiEnabled() ? <EnabledSignInWall {...props} /> : <AccountFeatureUnavailable />;
+}
+
+export function ProWall(props: ProWallProps) {
+  return cloudAccountUiEnabled() ? <EnabledProWall {...props} /> : <AccountFeatureUnavailable />;
 }

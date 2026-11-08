@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "./account/availability";
 import { Box, ContextMenuProvider, useNativeRenderer, useRendererHost, useUiHost } from "./ui";
 import { ToastViewport, useToastHost } from "./ui/toast";
 import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore, type Dispatch, type ReactNode } from "react";
@@ -659,7 +660,7 @@ export function App({
     sync();
     return apiClient.subscribeCurrentUser(sync);
   }, [requireSignIn]);
-  const signInGateActive = requireSignIn && !signedIn;
+  const signInGateActive = cloudAccountUiEnabled() && requireSignIn && !signedIn;
   const shareHandoff = isPaneShareHandoff();
   // Setup runs in the main window only.
   const [showOnboarding, setShowOnboarding] = useState(() => (

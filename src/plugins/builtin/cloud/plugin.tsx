@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "../../../account/availability";
 import type { GloomPlugin } from "../../../types/plugin";
 import { apiClient } from "../../../api-client";
 import { createGloomberbCloudCapabilities, createGloomberbCloudProvider } from "../../../sources/gloomberb-cloud";
@@ -55,16 +56,17 @@ function createCloudDataModule(): PluginModule {
  */
 const cloudAccountModule: PluginModule = {
   slots: {
-    "status:widget": () => (
+    "status:widget": () => cloudAccountUiEnabled() ? (
       <>
         <CloudVerificationStatusWidget />
         <CloudUpgradeStatusWidget />
         <TrialOfferStatusWidget />
         <OneTapPrompt />
       </>
-    ),
+    ) : null,
   },
   setup: (ctx) => {
+    if (!cloudAccountUiEnabled()) return;
     registerCloudAuthCommands(ctx);
     registerCloudUpgradeCommand(ctx);
     registerTrialOfferCommand(ctx);

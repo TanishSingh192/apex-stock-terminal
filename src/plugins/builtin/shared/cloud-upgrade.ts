@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "../../../account/availability";
 import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { apiClient } from "../../../api-client";
@@ -172,6 +173,7 @@ async function openCheckoutWithHandoff(
  * under `placement` rather than the UI that published it.
  */
 export function openCloudUpgradeUrl(placement: string): boolean {
+  if (!cloudAccountUiEnabled()) return false;
   const opener = [...cloudUpgradeOpeners].at(-1);
   if (!opener) return false;
   opener({ placement });
@@ -213,6 +215,7 @@ export function useCloudUpgradeAction(placement: string): (options?: unknown) =>
   const viewportWidthRef = useRef(viewport.width);
   viewportWidthRef.current = viewport.width;
   const openUpgrade = useCallback(async (options?: unknown) => {
+    if (!cloudAccountUiEnabled()) return;
     const checkout: CloudUpgradeOptions = { placement, ...(isCloudUpgradeOptions(options) ? options : {}) };
     const openCheckout = async (resolved: CloudUpgradeOptions) => {
       if (resolved.recordIntent !== false) recordUpgradeIntent(resolved.placement);
@@ -340,7 +343,7 @@ export function useCloudAccessFooter({
   const openPlan = useCloudPlanAction();
 
   const showTrial = access.isTrialActive;
-  const showUpgrade = !showTrial && !access.hasProAccess && degraded;
+  const showUpgrade = cloudAccountUiEnabled() && !showTrial && !access.hasProAccess && degraded;
 
   const segment = useMemo<PaneFooterSegment | null>(() => {
     if (showTrial) {

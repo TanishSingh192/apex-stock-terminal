@@ -47,6 +47,8 @@ The build regenerates `middleware.js` from `scripts/vercel-middleware.ts`. It fo
 
 Market data, account services, and certain premium features currently use **Gloom Cloud**, an external service. This repository does not contain that service's proprietary backend. Provider accounts, availability, and subscription requirements still apply; free market data is delayed.
 
+The web app opens without provider login or signup screens. Features requiring a connected account remain unavailable; removing login does not unlock paid data.
+
 The Vercel build uses periodic HTTP refreshes because this deployment does not relay WebSocket upgrades. Features that require live WebSocket streams need a compatible backend before they can be enabled. Anonymous plugin proxy requests are disabled until a shared rate limiter is configured. Upstream research analytics are disabled on Vercel.
 
 The codebase also includes terminal and desktop clients. The desktop SDK must be installed with `bun run desktop:sync` before desktop development. Apex desktop release feeds and signing credentials need separate setup; desktop packages have not been validated in this deployment.

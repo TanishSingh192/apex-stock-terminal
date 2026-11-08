@@ -1,3 +1,4 @@
+import { cloudAccountUiEnabled } from "./availability";
 /**
  * Shared email/password auth dialog plus the request bridge that lets commands
  * (which run outside the React tree) open it. `AuthDialogHost` is mounted by
@@ -50,7 +51,7 @@ let openAuthDialogs = 0;
 
 /** Returns false when no dialog host is mounted, so callers can fall back. */
 export function requestAuthDialog(request: AuthDialogRequest = {}): boolean {
-  if (authDialogListeners.size === 0) return false;
+  if (!cloudAccountUiEnabled() || authDialogListeners.size === 0) return false;
   for (const listener of authDialogListeners) listener(request);
   return true;
 }
